@@ -1,0 +1,606 @@
+/* Observer Ward -- Tron neon dark theme */
+
+:root {
+  --bg-deep: #0a0a0f;
+  --bg-surface: #0d1117;
+  --cyan: #00fff0;
+  --cyan-dim: rgba(0, 255, 240, 0.15);
+  --cyan-glow: rgba(0, 255, 240, 0.5);
+  --pink: #ff2d6f;
+  --pink-glow: rgba(255, 45, 111, 0.5);
+  --amber: #ffb800;
+  --amber-glow: rgba(255, 184, 0, 0.5);
+  --green: #00ff88;
+  --green-glow: rgba(0, 255, 136, 0.5);
+  --text-label: #b0fbff;
+  --text-value: #ffffff;
+  --text-muted: #4a5568;
+  --font-mono:
+    "JetBrains Mono", "SF Mono", "Menlo", monospace;
+  --border: 1px solid var(--cyan-dim);
+  --radius: 4px;
+}
+
+/* ── Reset ─────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ── Base ──────────────────────────────────── */
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  background:
+    linear-gradient(
+      180deg,
+      var(--bg-deep) 0%,
+      var(--bg-surface) 100%
+    );
+  color: var(--text-label);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── Scrollbar ─────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--cyan-dim);
+  border-radius: 2px;
+}
+
+/* ── Layout ────────────────────────────────── */
+
+.container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 12px;
+}
+
+/* ── Header ────────────────────────────────── */
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 10px;
+  border-bottom: var(--border);
+  flex-shrink: 0;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-icon {
+  color: var(--cyan);
+  font-size: 14px;
+  text-shadow: 0 0 8px var(--cyan-glow);
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--cyan);
+  text-shadow: 0 0 10px var(--cyan-glow);
+}
+
+.header-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.btn-icon {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--cyan);
+  font-size: 16px;
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  transition: all 0.2s ease;
+}
+
+.btn-icon:hover {
+  border-color: var(--cyan-dim);
+  background: rgba(0, 255, 240, 0.05);
+  text-shadow: 0 0 8px var(--cyan-glow);
+}
+
+/* ── Server List ───────────────────────────── */
+
+.server-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+/* ── Empty State ───────────────────────────── */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  gap: 12px;
+}
+
+.empty-state-icon {
+  font-size: 28px;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.empty-state-text {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* ── Server Card ───────────────────────────── */
+
+.server-card {
+  padding: 10px 8px;
+  border-bottom: var(--border);
+  transition: background 0.2s ease;
+}
+
+.server-card:last-child {
+  border-bottom: none;
+}
+
+.server-card:hover {
+  background: rgba(0, 255, 240, 0.02);
+}
+
+.server-card.offline {
+  opacity: 0.5;
+}
+
+.server-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot.online {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green-glow);
+}
+
+.status-dot.offline {
+  background: var(--pink);
+  box-shadow: 0 0 6px var(--pink-glow);
+  animation: pulse-pink 2s ease-in-out infinite;
+}
+
+.status-dot.pending {
+  background: var(--text-muted);
+  box-shadow: none;
+}
+
+.server-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-value);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-type-badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--cyan);
+  background: rgba(0, 255, 240, 0.08);
+  border: 1px solid var(--cyan-dim);
+  border-radius: 3px;
+  padding: 1px 6px;
+  flex-shrink: 0;
+}
+
+.offline-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--pink);
+  flex-shrink: 0;
+}
+
+/* ── Metric Rows ───────────────────────────── */
+
+.metric-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-left: 16px;
+}
+
+.metric-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.metric-label {
+  width: 32px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.metric-bar-track {
+  flex: 1;
+  height: 6px;
+  background: rgba(0, 255, 240, 0.06);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.metric-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  width: 0%;
+  transition:
+    width 0.5s ease,
+    background 0.3s ease,
+    box-shadow 0.3s ease;
+  position: relative;
+}
+
+.metric-bar-fill.level-ok {
+  background: linear-gradient(90deg, #005f5a, var(--cyan));
+  box-shadow:
+    0 0 4px var(--cyan-glow),
+    inset 0 0 2px rgba(0, 255, 240, 0.3);
+}
+
+.metric-bar-fill.level-warn {
+  background: linear-gradient(90deg, #665200, var(--amber));
+  box-shadow:
+    0 0 4px var(--amber-glow),
+    inset 0 0 2px rgba(255, 184, 0, 0.3);
+}
+
+.metric-bar-fill.level-crit {
+  background: linear-gradient(90deg, #660025, var(--pink));
+  box-shadow:
+    0 0 4px var(--pink-glow),
+    inset 0 0 2px rgba(255, 45, 111, 0.3);
+}
+
+.metric-bar-fill::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 3px;
+  height: 100%;
+  border-radius: 0 3px 3px 0;
+  animation: bar-pulse 1.5s ease-in-out infinite;
+}
+
+.metric-bar-fill.level-ok::after {
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan);
+}
+
+.metric-bar-fill.level-warn::after {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
+.metric-bar-fill.level-crit::after {
+  background: var(--pink);
+  box-shadow: 0 0 6px var(--pink);
+}
+
+.metric-value {
+  width: 32px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-value);
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ── Network Row ───────────────────────────── */
+
+.net-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 16px;
+  margin-top: 2px;
+}
+
+.net-label {
+  width: 32px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.net-values {
+  display: flex;
+  gap: 12px;
+  font-size: 10px;
+}
+
+.net-up {
+  color: var(--cyan);
+}
+
+.net-down {
+  color: var(--amber);
+}
+
+.net-arrow {
+  font-size: 9px;
+}
+
+/* ── Pending metrics ───────────────────────── */
+
+.metrics-pending {
+  padding-left: 16px;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ── Add Form ──────────────────────────────── */
+
+.add-form-panel {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+  flex-shrink: 0;
+}
+
+.add-form-panel.open {
+  max-height: 500px;
+}
+
+.add-form-inner {
+  padding: 12px 0;
+  border-bottom: var(--border);
+}
+
+.form-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--cyan);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+}
+
+.form-group {
+  margin-bottom: 8px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+  text-transform: uppercase;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-value);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--cyan-dim);
+  border-radius: var(--radius);
+  outline: none;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+
+.form-group input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.form-group select option {
+  background: var(--bg-deep);
+  color: var(--text-label);
+}
+
+.form-group.hidden {
+  display: none;
+}
+
+.form-error {
+  color: var(--pink);
+  font-size: 10px;
+  margin-bottom: 8px;
+  min-height: 14px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.btn {
+  flex: 1;
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+  border: 1px solid;
+}
+
+.btn-primary {
+  background: rgba(0, 255, 240, 0.1);
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.btn-primary:hover {
+  background: rgba(0, 255, 240, 0.2);
+  box-shadow: 0 0 8px var(--cyan-glow);
+}
+
+.btn-cancel {
+  background: transparent;
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+.btn-cancel:hover {
+  border-color: var(--text-label);
+  color: var(--text-label);
+}
+
+/* ── Footer ────────────────────────────────── */
+
+.footer {
+  padding-top: 10px;
+  border-top: var(--border);
+  display: flex;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.btn-settings {
+  background: none;
+  border: 1px solid var(--cyan-dim);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  padding: 5px 16px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+}
+
+.btn-settings:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+
+/* ── Context Menu ──────────────────────────── */
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-surface);
+  border: 1px solid var(--cyan-dim);
+  border-radius: var(--radius);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.6),
+    0 0 8px var(--cyan-glow);
+  padding: 4px 0;
+  min-width: 120px;
+  display: none;
+}
+
+.context-menu.visible {
+  display: block;
+}
+
+.context-menu-item {
+  padding: 6px 14px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-label);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.context-menu-item:hover {
+  background: rgba(0, 255, 240, 0.08);
+  color: var(--cyan);
+}
+
+.context-menu-item.danger {
+  color: var(--pink);
+}
+
+.context-menu-item.danger:hover {
+  background: rgba(255, 45, 111, 0.1);
+}
+
+/* ── Animations ────────────────────────────── */
+
+@keyframes bar-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+@keyframes pulse-pink {
+  0%, 100% { box-shadow: 0 0 4px var(--pink-glow); }
+  50% { box-shadow: 0 0 10px var(--pink-glow); }
+}

@@ -4,62 +4,114 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Observer Ward</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: "JetBrains Mono", "SF Mono", "Menlo", monospace;
-      background: #0a0a0f;
-      color: #b0fbff;
-      overflow: hidden;
-      user-select: none;
-      -webkit-user-select: none;
-    }
-    .container {
-      padding: 12px;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 10px;
-      border-bottom: 1px solid rgba(0, 255, 240, 0.15);
-    }
-    .title {
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 2px;
-      color: #00fff0;
-      text-shadow: 0 0 10px rgba(0, 255, 240, 0.5);
-    }
-    .server-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 8px 0;
-    }
-    .empty-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 200px;
-      color: #4a5568;
-      font-size: 12px;
-    }
-  </style>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="container">
+
+    <!-- Header -->
     <div class="header">
-      <span class="title">OBSERVER WARD</span>
-    </div>
-    <div class="server-list">
-      <div class="empty-state">
-        <p>No servers configured</p>
+      <div class="header-left">
+        <span class="header-icon">&#x25C8;</span>
+        <span class="title">OBSERVER WARD</span>
+      </div>
+      <div class="header-actions">
+        <button id="btn-open-add" class="btn-icon"
+                title="Add server">&#x2295;</button>
       </div>
     </div>
+
+    <!-- Add Server Form (hidden by default) -->
+    <div id="add-form-panel" class="add-form-panel">
+      <div class="add-form-inner">
+        <div class="form-title">Add Server</div>
+        <form id="add-form" autocomplete="off">
+          <div class="form-group">
+            <label for="field-name">Name</label>
+            <input id="field-name" type="text"
+                   placeholder="e.g. prod-cluster" required>
+          </div>
+          <div class="form-group">
+            <label for="field-type">Type</label>
+            <select id="field-type">
+              <option value="k8s">Kubernetes</option>
+              <option value="ssh">SSH</option>
+            </select>
+          </div>
+
+          <!-- K8s-specific fields -->
+          <div class="form-group field-k8s">
+            <label for="field-context">Context</label>
+            <input id="field-context" type="text"
+                   placeholder="e.g. prod-ctx">
+          </div>
+          <div class="form-group field-k8s">
+            <label for="field-kubeconfig">
+              Kubeconfig path (optional)
+            </label>
+            <input id="field-kubeconfig" type="text"
+                   placeholder="~/.kube/config">
+          </div>
+
+          <!-- SSH-specific fields -->
+          <div class="form-group field-ssh hidden">
+            <label for="field-host">Host</label>
+            <input id="field-host" type="text"
+                   placeholder="e.g. 10.0.1.50">
+          </div>
+          <div class="form-group field-ssh hidden">
+            <label for="field-port">Port</label>
+            <input id="field-port" type="number"
+                   value="22" min="1" max="65535">
+          </div>
+          <div class="form-group field-ssh hidden">
+            <label for="field-user">User</label>
+            <input id="field-user" type="text"
+                   placeholder="e.g. admin">
+          </div>
+          <div class="form-group field-ssh hidden">
+            <label for="field-keypath">Key path</label>
+            <input id="field-keypath" type="text"
+                   placeholder="~/.ssh/id_ed25519">
+          </div>
+
+          <div id="form-error" class="form-error"></div>
+          <div class="form-actions">
+            <button type="submit" id="btn-add"
+                    class="btn btn-primary">Add</button>
+            <button type="button" id="btn-cancel"
+                    class="btn btn-cancel">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Server List -->
+    <div id="server-list" class="server-list">
+      <div class="empty-state">
+        <div class="empty-state-icon">&#x25C8;</div>
+        <div class="empty-state-text">
+          No servers configured<br>
+          Click + to add one
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <button class="btn-settings" id="btn-settings">
+        &#x2699; Settings
+      </button>
+    </div>
+
   </div>
+
+  <!-- Context Menu (hidden) -->
+  <div id="context-menu" class="context-menu">
+    <div id="ctx-remove"
+         class="context-menu-item danger">Remove</div>
+  </div>
+
+  <script src="app.js"></script>
 </body>
 </html>

@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for Observer Ward",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "positioner:default"
+  ]
+}

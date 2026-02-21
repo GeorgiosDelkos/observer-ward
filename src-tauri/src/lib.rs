@@ -1,4 +1,5 @@
 mod config;
+mod metrics;
 
 use std::sync::Mutex;
 use tauri::{

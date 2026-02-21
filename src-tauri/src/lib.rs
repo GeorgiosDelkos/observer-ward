@@ -42,11 +42,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let app = tray.app_handle();
                         if let Some(window) = app.get_webview_window("main") {
                             if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
+                                if let Err(e) = window.hide() {
+                                    tracing::warn!("failed to hide window: {e}");
+                                }
                             } else {
-                                let _ = window.move_window(Position::TrayCenter);
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                if let Err(e) = window.move_window(Position::TrayCenter) {
+                                    tracing::warn!("failed to position window: {e}");
+                                }
+                                if let Err(e) = window.show() {
+                                    tracing::warn!("failed to show window: {e}");
+                                }
+                                if let Err(e) = window.set_focus() {
+                                    tracing::warn!("failed to focus window: {e}");
+                                }
                             }
                         }
                     }

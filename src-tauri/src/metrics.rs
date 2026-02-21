@@ -25,10 +25,7 @@ pub enum ServerStatus {
 /// Event payload sent to the frontend via `app.emit("metrics-update", ...)`.
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "used by later tasks (poll loop, frontend)"
-    )
+    expect(dead_code, reason = "used by later tasks (poll loop, frontend)")
 )]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsUpdate {
@@ -82,8 +79,7 @@ mod tests {
             net_tx_bytes_per_sec: 524_288,
         };
         let json = serde_json::to_string(&m).expect("serialize");
-        let v: serde_json::Value =
-            serde_json::from_str(&json).expect("parse");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
         assert_eq!(v["server_name"], "web-1");
         assert_eq!(v["server_type"], "ssh");
@@ -104,8 +100,7 @@ mod tests {
             (ServerStatus::Error, "error"),
         ];
         for (status, expected) in cases {
-            let json =
-                serde_json::to_string(&status).expect("serialize status");
+            let json = serde_json::to_string(&status).expect("serialize status");
             assert_eq!(json, format!("\"{expected}\""));
         }
     }
@@ -119,16 +114,14 @@ mod tests {
             ("\"error\"", ServerStatus::Error),
         ];
         for (json, expected) in cases {
-            let status: ServerStatus =
-                serde_json::from_str(json).expect("deserialize status");
+            let status: ServerStatus = serde_json::from_str(json).expect("deserialize status");
             assert_eq!(status, expected);
         }
     }
 
     #[test]
     fn deserialize_unknown_status_fails() {
-        let result: Result<ServerStatus, _> =
-            serde_json::from_str("\"unknown\"");
+        let result: Result<ServerStatus, _> = serde_json::from_str("\"unknown\"");
         assert!(result.is_err());
     }
 
@@ -159,8 +152,7 @@ mod tests {
             ],
         };
         let json = serde_json::to_string(&update).expect("serialize");
-        let v: serde_json::Value =
-            serde_json::from_str(&json).expect("parse");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
         let servers = v["servers"].as_array().expect("servers is array");
         assert_eq!(servers.len(), 2);
@@ -184,10 +176,8 @@ mod tests {
                 net_tx_bytes_per_sec: 111_111,
             }],
         };
-        let json =
-            serde_json::to_string(&original).expect("serialize");
-        let restored: MetricsUpdate =
-            serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: MetricsUpdate = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(restored.servers.len(), 1);
         let s = &restored.servers[0];
@@ -217,8 +207,7 @@ mod tests {
                 }
             ]
         }"#;
-        let update: MetricsUpdate =
-            serde_json::from_str(json).expect("deserialize");
+        let update: MetricsUpdate = serde_json::from_str(json).expect("deserialize");
 
         assert_eq!(update.servers.len(), 1);
         let s = &update.servers[0];
@@ -233,8 +222,7 @@ mod tests {
             servers: Vec::new(),
         };
         let json = serde_json::to_string(&update).expect("serialize");
-        let v: serde_json::Value =
-            serde_json::from_str(&json).expect("parse");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
         let servers = v["servers"].as_array().expect("servers is array");
         assert!(servers.is_empty());

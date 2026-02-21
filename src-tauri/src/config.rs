@@ -47,8 +47,7 @@ fn default_ssh_port() -> u16 {
 impl ServerConfig {
     pub fn name(&self) -> &str {
         match self {
-            ServerConfig::K8s { name, .. }
-            | ServerConfig::Ssh { name, .. } => name,
+            ServerConfig::K8s { name, .. } | ServerConfig::Ssh { name, .. } => name,
         }
     }
 
@@ -66,8 +65,8 @@ impl ServerConfig {
 
 /// Returns the config file path: `~/.config/observer-ward/config.json`
 fn config_path() -> Result<PathBuf, String> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| "could not determine config directory".to_string())?;
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
     Ok(config_dir.join("observer-ward").join("config.json"))
 }
 
@@ -76,26 +75,26 @@ pub fn load_config() -> Result<AppConfig, String> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read config: {e}"))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("failed to parse config: {e}"))
+    let contents =
+        std::fs::read_to_string(&path).map_err(|e| format!("failed to read config: {e}"))?;
+    serde_json::from_str(&contents).map_err(|e| format!("failed to parse config: {e}"))
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {e}"))?;
     }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("failed to serialize config: {e}"))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("failed to write config: {e}"))
+    std::fs::write(&path, json).map_err(|e| format!("failed to write config: {e}"))
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "panicking on failure is standard in tests")]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -114,10 +113,8 @@ mod tests {
             kubeconfig: Some("/home/user/.kube/config".to_string()),
             context: "prod".to_string(),
         };
-        let json = serde_json::to_string(&server)
-            .expect("serialize k8s server");
-        let parsed: serde_json::Value = serde_json::from_str(&json)
-            .expect("parse json");
+        let json = serde_json::to_string(&server).expect("serialize k8s server");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse json");
 
         assert_eq!(parsed["type"], "k8s");
         assert_eq!(parsed["name"], "prod-cluster");
@@ -134,10 +131,8 @@ mod tests {
             user: "deploy".to_string(),
             key_path: "/home/user/.ssh/id_ed25519".to_string(),
         };
-        let json = serde_json::to_string(&server)
-            .expect("serialize ssh server");
-        let parsed: serde_json::Value = serde_json::from_str(&json)
-            .expect("parse json");
+        let json = serde_json::to_string(&server).expect("serialize ssh server");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse json");
 
         assert_eq!(parsed["type"], "ssh");
         assert_eq!(parsed["name"], "web-box");
@@ -155,8 +150,7 @@ mod tests {
             "kubeconfig": null,
             "context": "staging-ctx"
         }"#;
-        let server: ServerConfig = serde_json::from_str(json)
-            .expect("deserialize k8s server");
+        let server: ServerConfig = serde_json::from_str(json).expect("deserialize k8s server");
 
         assert_eq!(server.name(), "staging");
         assert_eq!(server.server_type(), "k8s");
@@ -181,8 +175,8 @@ mod tests {
             "user": "admin",
             "key_path": "/root/.ssh/id_rsa"
         }"#;
-        let server: ServerConfig = serde_json::from_str(json)
-            .expect("deserialize ssh server with default port");
+        let server: ServerConfig =
+            serde_json::from_str(json).expect("deserialize ssh server with default port");
 
         assert_eq!(server.name(), "bastion");
         assert_eq!(server.server_type(), "ssh");
@@ -212,8 +206,7 @@ mod tests {
                 }
             ]
         }"#;
-        let config: AppConfig = serde_json::from_str(json)
-            .expect("deserialize full config");
+        let config: AppConfig = serde_json::from_str(json).expect("deserialize full config");
 
         assert_eq!(config.poll_interval_secs, 60);
         assert_eq!(config.servers.len(), 2);
@@ -224,8 +217,7 @@ mod tests {
     #[test]
     fn deserialize_empty_json_uses_defaults() {
         let json = "{}";
-        let config: AppConfig = serde_json::from_str(json)
-            .expect("deserialize empty json");
+        let config: AppConfig = serde_json::from_str(json).expect("deserialize empty json");
 
         assert_eq!(config.poll_interval_secs, 30);
         assert!(config.servers.is_empty());
@@ -251,10 +243,8 @@ mod tests {
             ],
         };
 
-        let json = serde_json::to_string_pretty(&config)
-            .expect("serialize config");
-        let deserialized: AppConfig = serde_json::from_str(&json)
-            .expect("deserialize config");
+        let json = serde_json::to_string_pretty(&config).expect("serialize config");
+        let deserialized: AppConfig = serde_json::from_str(&json).expect("deserialize config");
 
         assert_eq!(deserialized.poll_interval_secs, config.poll_interval_secs);
         assert_eq!(deserialized.servers.len(), config.servers.len());
@@ -263,8 +253,7 @@ mod tests {
 
     #[test]
     fn save_and_load_config_from_disk() {
-        let dir = tempfile::tempdir()
-            .expect("create temp dir");
+        let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("config.json");
 
         let config = AppConfig {
@@ -278,14 +267,11 @@ mod tests {
             }],
         };
 
-        let json = serde_json::to_string_pretty(&config)
-            .expect("serialize");
+        let json = serde_json::to_string_pretty(&config).expect("serialize");
         fs::write(&path, &json).expect("write config");
 
-        let contents = fs::read_to_string(&path)
-            .expect("read config");
-        let loaded: AppConfig = serde_json::from_str(&contents)
-            .expect("parse config");
+        let contents = fs::read_to_string(&path).expect("read config");
+        let loaded: AppConfig = serde_json::from_str(&contents).expect("parse config");
 
         assert_eq!(loaded.poll_interval_secs, 15);
         assert_eq!(loaded.servers.len(), 1);
@@ -294,8 +280,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_default() {
-        let dir = tempfile::tempdir()
-            .expect("create temp dir");
+        let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("nonexistent.json");
 
         assert!(!path.exists());

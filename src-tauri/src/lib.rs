@@ -155,6 +155,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .build(app)?;
 
+            if let Some(window) = app.get_webview_window("main") {
+                let w = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(false) = event {
+                        if let Err(e) = w.hide() {
+                            tracing::warn!("failed to hide window on blur: {e}");
+                        }
+                    }
+                });
+            }
+
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 

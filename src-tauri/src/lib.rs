@@ -1,8 +1,70 @@
+mod config;
+
+use std::sync::Mutex;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Manager, State,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
+
+struct ConfigState(Mutex<config::AppConfig>);
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State parameters"
+)]
+fn get_config(
+    state: State<'_, ConfigState>,
+) -> Result<config::AppConfig, String> {
+    let config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    Ok(config.clone())
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State and deserialized parameters"
+)]
+fn save_config_cmd(
+    state: State<'_, ConfigState>,
+    new_config: config::AppConfig,
+) -> Result<(), String> {
+    config::save_config(&new_config)?;
+    let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    *config = new_config;
+    Ok(())
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State and deserialized parameters"
+)]
+fn add_server(
+    state: State<'_, ConfigState>,
+    server: config::ServerConfig,
+) -> Result<config::AppConfig, String> {
+    let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    config.servers.push(server);
+    config::save_config(&config)?;
+    Ok(config.clone())
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State and deserialized parameters"
+)]
+fn remove_server(
+    state: State<'_, ConfigState>,
+    name: String,
+) -> Result<config::AppConfig, String> {
+    let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    config.servers.retain(|s| s.name() != name);
+    config::save_config(&config)?;
+    Ok(config.clone())
+}
 
 /// Run the Observer Ward application.
 ///
@@ -18,8 +80,17 @@ use tauri_plugin_positioner::{Position, WindowExt};
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    let initial_config = config::load_config().unwrap_or_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
+        .manage(ConfigState(Mutex::new(initial_config)))
+        .invoke_handler(tauri::generate_handler![
+            get_config,
+            save_config_cmd,
+            add_server,
+            remove_server,
+        ])
         .setup(|app| {
             let icon = app
                 .default_window_icon()

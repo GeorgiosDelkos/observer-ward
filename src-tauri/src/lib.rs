@@ -14,9 +14,7 @@ struct ConfigState(Mutex<config::AppConfig>);
     clippy::needless_pass_by_value,
     reason = "tauri::command macro requires owned State parameters"
 )]
-fn get_config(
-    state: State<'_, ConfigState>,
-) -> Result<config::AppConfig, String> {
+fn get_config(state: State<'_, ConfigState>) -> Result<config::AppConfig, String> {
     let config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
     Ok(config.clone())
 }
@@ -30,8 +28,8 @@ fn save_config_cmd(
     state: State<'_, ConfigState>,
     new_config: config::AppConfig,
 ) -> Result<(), String> {
-    config::save_config(&new_config)?;
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    config::save_config(&new_config)?;
     *config = new_config;
     Ok(())
 }
@@ -46,6 +44,9 @@ fn add_server(
     server: config::ServerConfig,
 ) -> Result<config::AppConfig, String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    if config.servers.iter().any(|s| s.name() == server.name()) {
+        return Err(format!("server '{}' already exists", server.name()));
+    }
     config.servers.push(server);
     config::save_config(&config)?;
     Ok(config.clone())
@@ -56,10 +57,7 @@ fn add_server(
     clippy::needless_pass_by_value,
     reason = "tauri::command macro requires owned State and deserialized parameters"
 )]
-fn remove_server(
-    state: State<'_, ConfigState>,
-    name: String,
-) -> Result<config::AppConfig, String> {
+fn remove_server(state: State<'_, ConfigState>, name: String) -> Result<config::AppConfig, String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
     config.servers.retain(|s| s.name() != name);
     config::save_config(&config)?;

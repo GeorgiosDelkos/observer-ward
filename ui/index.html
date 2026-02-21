@@ -97,6 +97,37 @@
       </div>
     </div>
 
+    <!-- Settings Panel (hidden by default) -->
+    <div id="settings-panel" class="settings-panel">
+      <div class="settings-header">
+        <span class="settings-title">SETTINGS</span>
+        <button id="btn-close-settings"
+                class="btn-icon">&times;</button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-row">
+          <label for="poll-interval">
+            Poll interval (seconds)
+          </label>
+          <input type="number" id="poll-interval"
+                 min="5" max="300" value="30">
+        </div>
+        <div class="settings-row">
+          <label for="autostart-toggle">
+            Launch at login
+          </label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="autostart-toggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="settings-actions">
+          <button id="btn-save-settings"
+                  class="btn btn-primary">SAVE</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Footer -->
     <div class="footer">
       <button class="btn-settings" id="btn-settings">

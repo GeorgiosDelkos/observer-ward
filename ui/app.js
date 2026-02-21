@@ -306,6 +306,62 @@ async function handleRemoveServer() {
   }
 }
 
+// ── Settings Panel ────────────────────────────
+
+const settingsPanel = document.getElementById("settings-panel");
+const pollIntervalInput = document.getElementById("poll-interval");
+const autostartToggle = document.getElementById("autostart-toggle");
+
+async function openSettings() {
+  try {
+    const config = await invoke("get_config");
+    pollIntervalInput.value = config.poll_interval_secs ?? 30;
+  } catch (err) {
+    console.error("Failed to load config for settings:", err);
+  }
+
+  try {
+    const enabled = await invoke("plugin:autostart|is_enabled");
+    autostartToggle.checked = enabled;
+  } catch (err) {
+    console.error("Failed to check autostart status:", err);
+    autostartToggle.checked = false;
+  }
+
+  settingsPanel.classList.add("open");
+}
+
+function closeSettings() {
+  settingsPanel.classList.remove("open");
+}
+
+async function saveSettings() {
+  const interval = parseInt(pollIntervalInput.value, 10);
+  if (isNaN(interval) || interval < 5 || interval > 300) {
+    return;
+  }
+
+  try {
+    const config = await invoke("get_config");
+    config.poll_interval_secs = interval;
+    await invoke("save_config_cmd", { newConfig: config });
+  } catch (err) {
+    console.error("Failed to save settings:", err);
+  }
+
+  try {
+    if (autostartToggle.checked) {
+      await invoke("plugin:autostart|enable");
+    } else {
+      await invoke("plugin:autostart|disable");
+    }
+  } catch (err) {
+    console.error("Failed to update autostart:", err);
+  }
+
+  closeSettings();
+}
+
 // ── Metrics Event Listener ────────────────────
 
 function handleMetricsUpdate(event) {
@@ -365,6 +421,15 @@ typeSelect.addEventListener("change", toggleTypeFields);
 document.getElementById("ctx-remove")
   .addEventListener("click", handleRemoveServer);
 
+document.getElementById("btn-settings")
+  .addEventListener("click", openSettings);
+
+document.getElementById("btn-close-settings")
+  .addEventListener("click", closeSettings);
+
+document.getElementById("btn-save-settings")
+  .addEventListener("click", saveSettings);
+
 serverListEl.addEventListener("contextmenu", (e) => {
   const card = e.target.closest(".server-card");
   if (!card) {
@@ -386,6 +451,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     hideContextMenu();
     closeAddForm();
+    closeSettings();
   }
 });
 

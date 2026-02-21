@@ -9,6 +9,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, State,
 };
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_positioner::{Position, WindowExt};
 
 struct ConfigState(Arc<Mutex<config::AppConfig>>);
@@ -89,6 +90,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_arc = Arc::new(Mutex::new(initial_config));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_positioner::init())
         .manage(ConfigState(Arc::clone(&config_arc)))
         .invoke_handler(tauri::generate_handler![

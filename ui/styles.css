@@ -520,6 +520,137 @@ body {
   color: var(--text-label);
 }
 
+/* ── Settings Panel ────────────────────────── */
+
+.settings-panel {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+  flex-shrink: 0;
+}
+
+.settings-panel.open {
+  max-height: 300px;
+}
+
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0 8px;
+  border-bottom: var(--border);
+}
+
+.settings-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--cyan);
+  text-shadow: 0 0 10px var(--cyan-glow);
+}
+
+.settings-body {
+  padding: 10px 0;
+}
+
+.settings-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.settings-row label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-label);
+  letter-spacing: 0.5px;
+}
+
+.settings-row input[type="number"] {
+  width: 72px;
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-value);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--cyan-dim);
+  border-radius: var(--radius);
+  outline: none;
+  text-align: center;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.settings-row input[type="number"]:focus {
+  border-color: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+
+.settings-actions {
+  display: flex;
+  margin-top: 6px;
+}
+
+.settings-actions .btn {
+  flex: none;
+  padding: 6px 24px;
+}
+
+/* ── Toggle Switch ────────────────────────── */
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--cyan-dim);
+  border-radius: 10px;
+  transition: all 0.3s ease;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  bottom: 2px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  transition: all 0.3s ease;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background: rgba(0, 255, 240, 0.15);
+  border-color: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+  background: var(--cyan);
+  box-shadow: 0 0 4px var(--cyan-glow);
+}
+
 /* ── Footer ────────────────────────────────── */
 
 .footer {

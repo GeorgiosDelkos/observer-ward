@@ -309,21 +309,28 @@ async function handleRemoveServer() {
 // ── Metrics Event Listener ────────────────────
 
 function handleMetricsUpdate(event) {
-  const data = event.payload;
-  if (!data || !data.server_name) {
+  const payload = event.payload;
+  if (!payload || !Array.isArray(payload.servers)) {
     return;
   }
 
-  if (data.error) {
-    metricsCache[data.server_name] = { error: data.error };
-  } else {
-    metricsCache[data.server_name] = {
-      cpu: data.cpu ?? 0,
-      mem: data.mem ?? 0,
-      disk: data.disk ?? 0,
-      net_tx: data.net_tx ?? 0,
-      net_rx: data.net_rx ?? 0,
-    };
+  for (const entry of payload.servers) {
+    const name = entry.server_name;
+    if (!name) {
+      continue;
+    }
+
+    if (entry.status === "offline" || entry.status === "error") {
+      metricsCache[name] = { error: entry.status };
+    } else {
+      metricsCache[name] = {
+        cpu: entry.cpu_percent ?? 0,
+        mem: entry.memory_percent ?? 0,
+        disk: entry.disk_percent ?? 0,
+        net_tx: entry.net_tx_bytes_per_sec ?? 0,
+        net_rx: entry.net_rx_bytes_per_sec ?? 0,
+      };
+    }
   }
 
   renderServerList(servers);

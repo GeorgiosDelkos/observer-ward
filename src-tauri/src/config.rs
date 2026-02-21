@@ -51,10 +51,6 @@ impl ServerConfig {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by later tasks (poll loop, frontend)")
-    )]
     pub fn server_type(&self) -> &str {
         match self {
             ServerConfig::K8s { .. } => "k8s",

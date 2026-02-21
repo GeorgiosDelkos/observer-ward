@@ -99,18 +99,18 @@ impl K8sBackend {
         }
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
     pub async fn connect(&mut self) -> Result<(), String> {
         let kubeconfig = match &self.kubeconfig {
             Some(path) => kube::config::Kubeconfig::read_from(path)
-                .map_err(|e| format!(
-                    "failed to read kubeconfig '{path}': {e}"
-                ))?,
+                .map_err(|e| format!("failed to read kubeconfig '{path}': {e}"))?,
             None => kube::config::Kubeconfig::read()
-                .map_err(|e| format!(
-                    "failed to read default kubeconfig: {e}"
-                ))?,
+                .map_err(|e| format!("failed to read default kubeconfig: {e}"))?,
         };
 
         let options = kube::config::KubeConfigOptions {
@@ -118,18 +118,17 @@ impl K8sBackend {
             ..Default::default()
         };
 
-        let config = Config::from_custom_kubeconfig(
-            kubeconfig,
-            &options,
-        )
-        .await
-        .map_err(|e| format!(
-            "failed to build kube config for context '{}': {e}",
-            self.context
-        ))?;
+        let config = Config::from_custom_kubeconfig(kubeconfig, &options)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to build kube config for context '{}': {e}",
+                    self.context
+                )
+            })?;
 
-        let client = Client::try_from(config)
-            .map_err(|e| format!("failed to create kube client: {e}"))?;
+        let client =
+            Client::try_from(config).map_err(|e| format!("failed to create kube client: {e}"))?;
 
         self.client = Some(client);
         Ok(())
@@ -142,47 +141,36 @@ impl K8sBackend {
         reason = "byte/nanosecond sums fit comfortably in f64 \
                   mantissa for percentage and rate calculations"
     )]
-    pub async fn collect_metrics(
-        &mut self,
-        server_name: &str,
-    ) -> Result<ServerMetrics, String> {
+    pub async fn collect_metrics(&mut self, server_name: &str) -> Result<ServerMetrics, String> {
         let client = self
             .client
             .as_ref()
             .ok_or_else(|| "k8s client not connected".to_string())?
             .clone();
 
-        let (cpu_pct, mem_pct) =
-            fetch_cpu_memory(&client).await?;
-        let (disk_pct, total_rx, total_tx) =
-            fetch_disk_network(&client).await?;
+        let (cpu_pct, mem_pct) = fetch_cpu_memory(&client).await?;
+        let (disk_pct, total_rx, total_tx) = fetch_disk_network(&client).await?;
 
         let now = Instant::now();
-        let (rx_per_sec, tx_per_sec) =
-            match (self.prev_net_bytes, self.prev_poll_time) {
-                (Some((prev_rx, prev_tx)), Some(prev_time)) => {
-                    let elapsed =
-                        now.duration_since(prev_time).as_secs_f64();
-                    if elapsed > 0.0 {
-                        let rx_rate =
-                            total_rx.saturating_sub(prev_rx) as f64
-                                / elapsed;
-                        let tx_rate =
-                            total_tx.saturating_sub(prev_tx) as f64
-                                / elapsed;
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "rates from byte deltas are \
+        let (rx_per_sec, tx_per_sec) = match (self.prev_net_bytes, self.prev_poll_time) {
+            (Some((prev_rx, prev_tx)), Some(prev_time)) => {
+                let elapsed = now.duration_since(prev_time).as_secs_f64();
+                if elapsed > 0.0 {
+                    let rx_rate = total_rx.saturating_sub(prev_rx) as f64 / elapsed;
+                    let tx_rate = total_tx.saturating_sub(prev_tx) as f64 / elapsed;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "rates from byte deltas are \
                                       always small positive"
-                        )]
-                        (rx_rate as u64, tx_rate as u64)
-                    } else {
-                        (0, 0)
-                    }
+                    )]
+                    (rx_rate as u64, tx_rate as u64)
+                } else {
+                    (0, 0)
                 }
-                _ => (0, 0),
-            };
+            }
+            _ => (0, 0),
+        };
 
         self.prev_net_bytes = Some((total_rx, total_tx));
         self.prev_poll_time = Some(now);
@@ -202,17 +190,17 @@ impl K8sBackend {
 
 /// Fetch CPU and memory percentages by comparing metrics API
 /// usage against allocatable resources from the Node API.
-async fn fetch_cpu_memory(
-    client: &Client,
-) -> Result<(f64, f64), String> {
+async fn fetch_cpu_memory(client: &Client) -> Result<(f64, f64), String> {
     let metrics_api: Api<NodeMetrics> = Api::all(client.clone());
     let node_metrics = metrics_api
         .list(&ListParams::default())
         .await
-        .map_err(|e| format!(
-            "failed to list node metrics (is metrics-server \
+        .map_err(|e| {
+            format!(
+                "failed to list node metrics (is metrics-server \
              installed?): {e}"
-        ))?;
+            )
+        })?;
 
     let nodes_api: Api<Node> = Api::all(client.clone());
     let nodes = nodes_api
@@ -236,16 +224,14 @@ async fn fetch_cpu_memory(
             .status
             .as_ref()
             .and_then(|s| s.allocatable.as_ref())
-            .ok_or_else(|| {
-                "node missing allocatable resources".to_string()
-            })?;
+            .ok_or_else(|| "node missing allocatable resources".to_string())?;
 
-        let cpu_q = alloc.get("cpu").ok_or_else(|| {
-            "node allocatable missing 'cpu'".to_string()
-        })?;
-        let mem_q = alloc.get("memory").ok_or_else(|| {
-            "node allocatable missing 'memory'".to_string()
-        })?;
+        let cpu_q = alloc
+            .get("cpu")
+            .ok_or_else(|| "node allocatable missing 'cpu'".to_string())?;
+        let mem_q = alloc
+            .get("memory")
+            .ok_or_else(|| "node allocatable missing 'memory'".to_string())?;
 
         total_cpu_allocatable += parse_cpu_quantity(cpu_q)?;
         total_mem_allocatable += parse_memory_quantity(mem_q)?;
@@ -272,9 +258,7 @@ async fn fetch_cpu_memory(
 
 /// Fetch disk and network stats from the kubelet stats summary
 /// API on each node, aggregating across all nodes.
-async fn fetch_disk_network(
-    client: &Client,
-) -> Result<(f64, u64, u64), String> {
+async fn fetch_disk_network(client: &Client) -> Result<(f64, u64, u64), String> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let nodes = nodes_api
         .list(&ListParams::default())
@@ -295,10 +279,8 @@ async fn fetch_disk_network(
         let summary = fetch_node_stats(client, name).await?;
 
         if let Some(fs) = &summary.node.fs {
-            total_disk_used +=
-                fs.used_bytes.unwrap_or(0);
-            total_disk_capacity +=
-                fs.capacity_bytes.unwrap_or(0);
+            total_disk_used += fs.used_bytes.unwrap_or(0);
+            total_disk_capacity += fs.capacity_bytes.unwrap_or(0);
         }
         if let Some(net) = &summary.node.network {
             total_rx += net.rx_bytes.unwrap_or(0);
@@ -321,27 +303,20 @@ async fn fetch_disk_network(
 
 /// Fetch the kubelet stats summary for a single node via the
 /// node proxy API.
-async fn fetch_node_stats(
-    client: &Client,
-    node_name: &str,
-) -> Result<StatsSummary, String> {
-    let url = format!(
-        "/api/v1/nodes/{node_name}/proxy/stats/summary"
-    );
+async fn fetch_node_stats(client: &Client, node_name: &str) -> Result<StatsSummary, String> {
+    let url = format!("/api/v1/nodes/{node_name}/proxy/stats/summary");
 
-    let request = http::Request::get(&url)
-        .body(Vec::new())
-        .map_err(|e| format!(
+    let request = http::Request::get(&url).body(Vec::new()).map_err(|e| {
+        format!(
             "failed to build stats request for node \
              '{node_name}': {e}"
-        ))?;
+        )
+    })?;
 
     client
         .request::<StatsSummary>(request)
         .await
-        .map_err(|e| format!(
-            "failed to fetch stats for node '{node_name}': {e}"
-        ))
+        .map_err(|e| format!("failed to fetch stats for node '{node_name}': {e}"))
 }
 
 // -- Quantity parsers --
@@ -423,8 +398,7 @@ mod tests {
 
     #[test]
     fn cpu_nanocores_one_core() {
-        let result =
-            parse_cpu_quantity(&q("1000000000n")).unwrap();
+        let result = parse_cpu_quantity(&q("1000000000n")).unwrap();
         assert_f64_near(result, 1.0, 1e-9);
     }
 
@@ -456,9 +430,7 @@ mod tests {
     fn cpu_invalid_value() {
         let result = parse_cpu_quantity(&q("abcm"));
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("invalid cpu quantity")
-        );
+        assert!(result.unwrap_err().contains("invalid cpu quantity"));
     }
 
     #[test]
@@ -515,11 +487,7 @@ mod tests {
     fn memory_invalid_value() {
         let result = parse_memory_quantity(&q("badMi"));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("invalid memory quantity")
-        );
+        assert!(result.unwrap_err().contains("invalid memory quantity"));
     }
 
     #[test]
@@ -544,8 +512,7 @@ mod tests {
                 }
             }
         }"#;
-        let summary: StatsSummary =
-            serde_json::from_str(json).expect("parse stats");
+        let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
 
         let fs = summary.node.fs.expect("fs present");
         assert_eq!(fs.used_bytes, Some(50_000_000_000));
@@ -567,8 +534,7 @@ mod tests {
                 "network": null
             }
         }"#;
-        let summary: StatsSummary =
-            serde_json::from_str(json).expect("parse stats");
+        let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
 
         let fs = summary.node.fs.expect("fs present");
         assert_eq!(fs.used_bytes, None);
@@ -579,8 +545,7 @@ mod tests {
     #[test]
     fn parse_stats_summary_no_fs_no_network() {
         let json = r#"{"node": {}}"#;
-        let summary: StatsSummary =
-            serde_json::from_str(json).expect("parse stats");
+        let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
 
         assert!(summary.node.fs.is_none());
         assert!(summary.node.network.is_none());
@@ -610,8 +575,7 @@ mod tests {
                 "systemContainers": []
             }
         }"#;
-        let summary: StatsSummary =
-            serde_json::from_str(json).expect("parse stats");
+        let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
 
         let fs = summary.node.fs.expect("fs present");
         assert_eq!(fs.used_bytes, Some(10_000_000_000));
@@ -634,8 +598,7 @@ mod tests {
                 }
             }
         }"#;
-        let summary: StatsSummary =
-            serde_json::from_str(json).expect("parse stats");
+        let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
 
         let fs = summary.node.fs.expect("fs present");
         assert_eq!(fs.used_bytes, Some(5_000_000_000));
@@ -659,13 +622,9 @@ mod tests {
                 "memory": "1024Mi"
             }
         }"#;
-        let nm: NodeMetrics =
-            serde_json::from_str(json).expect("parse node metrics");
+        let nm: NodeMetrics = serde_json::from_str(json).expect("parse node metrics");
 
-        assert_eq!(
-            nm.metadata.name.as_deref(),
-            Some("worker-1")
-        );
+        assert_eq!(nm.metadata.name.as_deref(), Some("worker-1"));
         assert_eq!(nm.usage.cpu.0, "250m");
         assert_eq!(nm.usage.memory.0, "1024Mi");
     }

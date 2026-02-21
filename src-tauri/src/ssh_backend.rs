@@ -57,6 +57,10 @@ impl SshBackend {
         }
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.session.is_some()
+    }
+
     /// Establish an SSH connection and authenticate with a key.
     pub async fn connect(&mut self) -> Result<(), String> {
         let key = load_secret_key(&self.key_path, None)

@@ -1,18 +1,17 @@
 mod config;
-mod metrics;
-#[expect(dead_code, reason = "used by later tasks (poll loop, frontend)")]
-mod ssh_backend;
-#[expect(dead_code, reason = "used by later tasks (poll loop, frontend)")]
 mod k8s_backend;
+mod metrics;
+mod poller;
+mod ssh_backend;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager, State,
 };
 use tauri_plugin_positioner::{Position, WindowExt};
 
-struct ConfigState(Mutex<config::AppConfig>);
+struct ConfigState(Arc<Mutex<config::AppConfig>>);
 
 #[tauri::command]
 #[expect(
@@ -27,7 +26,8 @@ fn get_config(state: State<'_, ConfigState>) -> Result<config::AppConfig, String
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "tauri::command macro requires owned State and deserialized parameters"
+    reason = "tauri::command macro requires owned State \
+              and deserialized parameters"
 )]
 fn save_config_cmd(
     state: State<'_, ConfigState>,
@@ -42,7 +42,8 @@ fn save_config_cmd(
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "tauri::command macro requires owned State and deserialized parameters"
+    reason = "tauri::command macro requires owned State \
+              and deserialized parameters"
 )]
 fn add_server(
     state: State<'_, ConfigState>,
@@ -60,7 +61,8 @@ fn add_server(
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "tauri::command macro requires owned State and deserialized parameters"
+    reason = "tauri::command macro requires owned State \
+              and deserialized parameters"
 )]
 fn remove_server(state: State<'_, ConfigState>, name: String) -> Result<config::AppConfig, String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -84,17 +86,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let initial_config = config::load_config().unwrap_or_default();
+    let config_arc = Arc::new(Mutex::new(initial_config));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
-        .manage(ConfigState(Mutex::new(initial_config)))
+        .manage(ConfigState(Arc::clone(&config_arc)))
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config_cmd,
             add_server,
             remove_server,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let icon = app
                 .default_window_icon()
                 .ok_or("no default icon configured")?
@@ -117,17 +120,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(window) = app.get_webview_window("main") {
                             if window.is_visible().unwrap_or(false) {
                                 if let Err(e) = window.hide() {
-                                    tracing::warn!("failed to hide window: {e}");
+                                    tracing::warn!(
+                                        "failed to hide \
+                                         window: {e}"
+                                    );
                                 }
                             } else {
                                 if let Err(e) = window.move_window(Position::TrayCenter) {
-                                    tracing::warn!("failed to position window: {e}");
+                                    tracing::warn!(
+                                        "failed to position \
+                                         window: {e}"
+                                    );
                                 }
                                 if let Err(e) = window.show() {
-                                    tracing::warn!("failed to show window: {e}");
+                                    tracing::warn!(
+                                        "failed to show \
+                                         window: {e}"
+                                    );
                                 }
                                 if let Err(e) = window.set_focus() {
-                                    tracing::warn!("failed to focus window: {e}");
+                                    tracing::warn!(
+                                        "failed to focus \
+                                         window: {e}"
+                                    );
                                 }
                             }
                         }
@@ -137,6 +152,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let handle = app.handle().clone();
+            let config_for_poller = Arc::clone(&config_arc);
+            tokio::spawn(async move {
+                let mut poller = poller::Poller::new(handle, config_for_poller);
+                poller.run().await;
+            });
 
             Ok(())
         })

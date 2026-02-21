@@ -23,10 +23,6 @@ pub enum ServerStatus {
 }
 
 /// Event payload sent to the frontend via `app.emit("metrics-update", ...)`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by later tasks (poll loop, frontend)")
-)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsUpdate {
     pub servers: Vec<ServerMetrics>,

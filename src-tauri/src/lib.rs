@@ -2,6 +2,8 @@ mod config;
 mod metrics;
 #[expect(dead_code, reason = "used by later tasks (poll loop, frontend)")]
 mod ssh_backend;
+#[expect(dead_code, reason = "used by later tasks (poll loop, frontend)")]
+mod k8s_backend;
 
 use std::sync::Mutex;
 use tauri::{

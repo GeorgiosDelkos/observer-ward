@@ -3,21 +3,31 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
+    #[serde(default = "default_foreground_poll", alias = "poll_interval_secs")]
+    pub foreground_poll_secs: u64,
+    #[serde(default = "default_background_poll")]
+    pub background_poll_secs: u64,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
+    #[serde(default)]
+    pub notifications_enabled: bool,
 }
 
-fn default_poll_interval() -> u64 {
-    30
+fn default_foreground_poll() -> u64 {
+    10
+}
+
+fn default_background_poll() -> u64 {
+    300
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            poll_interval_secs: default_poll_interval(),
+            foreground_poll_secs: default_foreground_poll(),
+            background_poll_secs: default_background_poll(),
             servers: Vec::new(),
+            notifications_enabled: false,
         }
     }
 }
@@ -29,6 +39,7 @@ pub enum ServerConfig {
         name: String,
         kubeconfig: Option<String>,
         context: String,
+        namespace: String,
     },
     Ssh {
         name: String,
@@ -83,7 +94,9 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
     }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("failed to serialize config: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write config: {e}"))
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("failed to write config: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("failed to rename config: {e}"))
 }
 
 #[cfg(test)]
@@ -98,7 +111,8 @@ mod tests {
     #[test]
     fn default_config_has_expected_values() {
         let config = AppConfig::default();
-        assert_eq!(config.poll_interval_secs, 30);
+        assert_eq!(config.foreground_poll_secs, 10);
+        assert_eq!(config.background_poll_secs, 300);
         assert!(config.servers.is_empty());
     }
 
@@ -108,6 +122,7 @@ mod tests {
             name: "prod-cluster".to_string(),
             kubeconfig: Some("/home/user/.kube/config".to_string()),
             context: "prod".to_string(),
+            namespace: "default".to_string(),
         };
         let json = serde_json::to_string(&server).expect("serialize k8s server");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse json");
@@ -116,6 +131,7 @@ mod tests {
         assert_eq!(parsed["name"], "prod-cluster");
         assert_eq!(parsed["kubeconfig"], "/home/user/.kube/config");
         assert_eq!(parsed["context"], "prod");
+        assert_eq!(parsed["namespace"], "default");
     }
 
     #[test]
@@ -144,7 +160,8 @@ mod tests {
             "type": "k8s",
             "name": "staging",
             "kubeconfig": null,
-            "context": "staging-ctx"
+            "context": "staging-ctx",
+            "namespace": "kube-system"
         }"#;
         let server: ServerConfig = serde_json::from_str(json).expect("deserialize k8s server");
 
@@ -154,11 +171,13 @@ mod tests {
             name,
             kubeconfig,
             context,
+            namespace,
         } = &server
         {
             assert_eq!(name, "staging");
             assert!(kubeconfig.is_none());
             assert_eq!(context, "staging-ctx");
+            assert_eq!(namespace, "kube-system");
         }
     }
 
@@ -184,13 +203,15 @@ mod tests {
     #[test]
     fn deserialize_full_config() {
         let json = r#"{
-            "poll_interval_secs": 60,
+            "foreground_poll_secs": 15,
+            "background_poll_secs": 120,
             "servers": [
                 {
                     "type": "k8s",
                     "name": "prod",
                     "kubeconfig": "/etc/kube/config",
-                    "context": "prod-ctx"
+                    "context": "prod-ctx",
+                    "namespace": "default"
                 },
                 {
                     "type": "ssh",
@@ -204,7 +225,8 @@ mod tests {
         }"#;
         let config: AppConfig = serde_json::from_str(json).expect("deserialize full config");
 
-        assert_eq!(config.poll_interval_secs, 60);
+        assert_eq!(config.foreground_poll_secs, 15);
+        assert_eq!(config.background_poll_secs, 120);
         assert_eq!(config.servers.len(), 2);
         assert_eq!(config.servers[0].name(), "prod");
         assert_eq!(config.servers[1].name(), "db-host");
@@ -215,19 +237,31 @@ mod tests {
         let json = "{}";
         let config: AppConfig = serde_json::from_str(json).expect("deserialize empty json");
 
-        assert_eq!(config.poll_interval_secs, 30);
+        assert_eq!(config.foreground_poll_secs, 10);
+        assert_eq!(config.background_poll_secs, 300);
         assert!(config.servers.is_empty());
+    }
+
+    #[test]
+    fn deserialize_legacy_poll_interval_secs_alias() {
+        let json = r#"{ "poll_interval_secs": 60 }"#;
+        let config: AppConfig = serde_json::from_str(json).expect("deserialize legacy alias");
+
+        assert_eq!(config.foreground_poll_secs, 60);
+        assert_eq!(config.background_poll_secs, 300);
     }
 
     #[test]
     fn roundtrip_config_through_json() {
         let config = AppConfig {
-            poll_interval_secs: 45,
+            foreground_poll_secs: 15,
+            background_poll_secs: 120,
             servers: vec![
                 ServerConfig::K8s {
                     name: "test-k8s".to_string(),
                     kubeconfig: None,
                     context: "default".to_string(),
+                    namespace: "default".to_string(),
                 },
                 ServerConfig::Ssh {
                     name: "test-ssh".to_string(),
@@ -237,12 +271,20 @@ mod tests {
                     key_path: "/root/.ssh/id_ed25519".to_string(),
                 },
             ],
+            ..AppConfig::default()
         };
 
         let json = serde_json::to_string_pretty(&config).expect("serialize config");
         let deserialized: AppConfig = serde_json::from_str(&json).expect("deserialize config");
 
-        assert_eq!(deserialized.poll_interval_secs, config.poll_interval_secs);
+        assert_eq!(
+            deserialized.foreground_poll_secs,
+            config.foreground_poll_secs
+        );
+        assert_eq!(
+            deserialized.background_poll_secs,
+            config.background_poll_secs
+        );
         assert_eq!(deserialized.servers.len(), config.servers.len());
         assert_eq!(deserialized.servers, config.servers);
     }
@@ -253,7 +295,8 @@ mod tests {
         let path = dir.path().join("config.json");
 
         let config = AppConfig {
-            poll_interval_secs: 15,
+            foreground_poll_secs: 15,
+            background_poll_secs: 60,
             servers: vec![ServerConfig::Ssh {
                 name: "local".to_string(),
                 host: "127.0.0.1".to_string(),
@@ -261,6 +304,7 @@ mod tests {
                 user: "test".to_string(),
                 key_path: "/tmp/key".to_string(),
             }],
+            ..AppConfig::default()
         };
 
         let json = serde_json::to_string_pretty(&config).expect("serialize");
@@ -269,7 +313,8 @@ mod tests {
         let contents = fs::read_to_string(&path).expect("read config");
         let loaded: AppConfig = serde_json::from_str(&contents).expect("parse config");
 
-        assert_eq!(loaded.poll_interval_secs, 15);
+        assert_eq!(loaded.foreground_poll_secs, 15);
+        assert_eq!(loaded.background_poll_secs, 60);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].name(), "local");
     }
@@ -282,7 +327,8 @@ mod tests {
         assert!(!path.exists());
         // Simulates load_config behavior: missing file -> default
         let config = AppConfig::default();
-        assert_eq!(config.poll_interval_secs, 30);
+        assert_eq!(config.foreground_poll_secs, 10);
+        assert_eq!(config.background_poll_secs, 300);
         assert!(config.servers.is_empty());
     }
 
@@ -292,6 +338,7 @@ mod tests {
             name: "alpha".to_string(),
             kubeconfig: None,
             context: "ctx".to_string(),
+            namespace: "default".to_string(),
         };
         let ssh = ServerConfig::Ssh {
             name: "beta".to_string(),
@@ -311,6 +358,7 @@ mod tests {
             name: "a".to_string(),
             kubeconfig: None,
             context: "c".to_string(),
+            namespace: "default".to_string(),
         };
         let ssh = ServerConfig::Ssh {
             name: "b".to_string(),

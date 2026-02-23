@@ -1,3 +1,17 @@
-/src-tauri/target
+# Build artifacts
+/src-tauri/target/
 /src-tauri/gen/schemas/
+
+# macOS
 .DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.*

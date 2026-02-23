@@ -10,6 +10,28 @@ pub struct ServerMetrics {
     pub disk_percent: f64,
     pub net_rx_bytes_per_sec: u64,
     pub net_tx_bytes_per_sec: u64,
+    #[serde(default)]
+    pub cpu_millicores: f64,
+    #[serde(default)]
+    pub memory_bytes: u64,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default)]
+    pub start_time: String,
+    #[serde(default)]
+    pub pod_status: String,
+    #[serde(default)]
+    pub pvc_used_bytes: u64,
+    #[serde(default)]
+    pub pvc_capacity_bytes: u64,
+    #[serde(default)]
+    pub last_event: String,
+    #[serde(default)]
+    pub disk_used_bytes: u64,
+    #[serde(default)]
+    pub disk_capacity_bytes: u64,
+    #[serde(default)]
+    pub node_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -20,6 +42,33 @@ pub enum ServerStatus {
     Online,
     Offline,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetricLevel {
+    Ok,
+    Warn,
+    Crit,
+}
+
+pub fn classify_level(percent: f64) -> MetricLevel {
+    if percent >= 85.0 {
+        MetricLevel::Crit
+    } else if percent >= 60.0 {
+        MetricLevel::Warn
+    } else {
+        MetricLevel::Ok
+    }
+}
+
+pub fn worst_level(metrics: &[ServerMetrics]) -> MetricLevel {
+    metrics
+        .iter()
+        .filter(|m| m.status == ServerStatus::Online)
+        .flat_map(|m| [m.cpu_percent, m.memory_percent, m.disk_percent])
+        .map(classify_level)
+        .max()
+        .unwrap_or(MetricLevel::Ok)
 }
 
 /// Event payload sent to the frontend via `app.emit("metrics-update", ...)`.
@@ -55,6 +104,17 @@ mod tests {
         assert_f64_eq(m.disk_percent, 0.0);
         assert_eq!(m.net_rx_bytes_per_sec, 0);
         assert_eq!(m.net_tx_bytes_per_sec, 0);
+        assert_f64_eq(m.cpu_millicores, 0.0);
+        assert_eq!(m.memory_bytes, 0);
+        assert_eq!(m.restart_count, 0);
+        assert_eq!(m.start_time, "");
+        assert_eq!(m.pod_status, "");
+        assert_eq!(m.pvc_used_bytes, 0);
+        assert_eq!(m.pvc_capacity_bytes, 0);
+        assert_eq!(m.last_event, "");
+        assert_eq!(m.disk_used_bytes, 0);
+        assert_eq!(m.disk_capacity_bytes, 0);
+        assert_eq!(m.node_count, 0);
     }
 
     #[test]
@@ -73,6 +133,7 @@ mod tests {
             disk_percent: 78.0,
             net_rx_bytes_per_sec: 1_048_576,
             net_tx_bytes_per_sec: 524_288,
+            ..ServerMetrics::default()
         };
         let json = serde_json::to_string(&m).expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -134,16 +195,13 @@ mod tests {
                     disk_percent: 30.0,
                     net_rx_bytes_per_sec: 100,
                     net_tx_bytes_per_sec: 200,
+                    ..ServerMetrics::default()
                 },
                 ServerMetrics {
                     server_name: "node-b".to_string(),
                     server_type: "ssh".to_string(),
                     status: ServerStatus::Offline,
-                    cpu_percent: 0.0,
-                    memory_percent: 0.0,
-                    disk_percent: 0.0,
-                    net_rx_bytes_per_sec: 0,
-                    net_tx_bytes_per_sec: 0,
+                    ..ServerMetrics::default()
                 },
             ],
         };
@@ -170,6 +228,7 @@ mod tests {
                 disk_percent: 77.7,
                 net_rx_bytes_per_sec: 999_999,
                 net_tx_bytes_per_sec: 111_111,
+                ..ServerMetrics::default()
             }],
         };
         let json = serde_json::to_string(&original).expect("serialize");
@@ -213,6 +272,32 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_old_json_without_new_fields() {
+        let json = r#"{
+            "server_name": "legacy-node",
+            "server_type": "ssh",
+            "status": "online",
+            "cpu_percent": 42.0,
+            "memory_percent": 60.0,
+            "disk_percent": 30.0,
+            "net_rx_bytes_per_sec": 100,
+            "net_tx_bytes_per_sec": 200
+        }"#;
+        let m: ServerMetrics = serde_json::from_str(json).expect("deserialize");
+
+        assert_eq!(m.server_name, "legacy-node");
+        assert_eq!(m.restart_count, 0);
+        assert_eq!(m.start_time, "");
+        assert_eq!(m.pod_status, "");
+        assert_eq!(m.pvc_used_bytes, 0);
+        assert_eq!(m.pvc_capacity_bytes, 0);
+        assert_eq!(m.last_event, "");
+        assert_eq!(m.disk_used_bytes, 0);
+        assert_eq!(m.disk_capacity_bytes, 0);
+        assert_eq!(m.node_count, 0);
+    }
+
+    #[test]
     fn empty_metrics_update_serializes() {
         let update = MetricsUpdate {
             servers: Vec::new(),
@@ -222,5 +307,62 @@ mod tests {
 
         let servers = v["servers"].as_array().expect("servers is array");
         assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn classify_level_thresholds() {
+        assert_eq!(classify_level(0.0), MetricLevel::Ok);
+        assert_eq!(classify_level(59.9), MetricLevel::Ok);
+        assert_eq!(classify_level(60.0), MetricLevel::Warn);
+        assert_eq!(classify_level(84.9), MetricLevel::Warn);
+        assert_eq!(classify_level(85.0), MetricLevel::Crit);
+        assert_eq!(classify_level(100.0), MetricLevel::Crit);
+    }
+
+    #[test]
+    fn worst_level_picks_highest() {
+        let metrics = vec![
+            ServerMetrics {
+                status: ServerStatus::Online,
+                cpu_percent: 50.0,
+                memory_percent: 30.0,
+                disk_percent: 20.0,
+                ..ServerMetrics::default()
+            },
+            ServerMetrics {
+                status: ServerStatus::Online,
+                cpu_percent: 70.0,
+                memory_percent: 40.0,
+                disk_percent: 10.0,
+                ..ServerMetrics::default()
+            },
+        ];
+        assert_eq!(worst_level(&metrics), MetricLevel::Warn);
+    }
+
+    #[test]
+    fn worst_level_skips_offline() {
+        let metrics = vec![
+            ServerMetrics {
+                status: ServerStatus::Offline,
+                cpu_percent: 95.0,
+                memory_percent: 95.0,
+                disk_percent: 95.0,
+                ..ServerMetrics::default()
+            },
+            ServerMetrics {
+                status: ServerStatus::Online,
+                cpu_percent: 10.0,
+                memory_percent: 10.0,
+                disk_percent: 10.0,
+                ..ServerMetrics::default()
+            },
+        ];
+        assert_eq!(worst_level(&metrics), MetricLevel::Ok);
+    }
+
+    #[test]
+    fn worst_level_empty_is_ok() {
+        assert_eq!(worst_level(&[]), MetricLevel::Ok);
     }
 }

@@ -30,17 +30,56 @@ pub struct SshBackend {
     prev_poll_time: Option<Instant>,
 }
 
-struct SshHandler;
+struct SshHandler {
+    host: String,
+    port: u16,
+}
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
+    /// Verify the server's host key using TOFU (Trust On First
+    /// Use). Known keys are checked against `~/.ssh/known_hosts`.
+    /// Unknown hosts are learned automatically on first
+    /// connection; changed keys are rejected.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all host keys for now
-        Ok(true)
+        use russh::keys::known_hosts::{check_known_hosts, learn_known_hosts};
+
+        match check_known_hosts(&self.host, self.port, server_public_key) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                tracing::warn!("host key not recognized for {}:{}", self.host, self.port);
+                Ok(false)
+            }
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                tracing::error!(
+                    "HOST KEY CHANGED for {}:{} \
+                     (known_hosts line {line})",
+                    self.host,
+                    self.port
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                tracing::info!(
+                    "no known_hosts entry for {}:{} ({e}), \
+                     learning key (TOFU)",
+                    self.host,
+                    self.port
+                );
+                if let Err(e) = learn_known_hosts(&self.host, self.port, server_public_key) {
+                    tracing::warn!(
+                        "failed to save host key for {}:{}: {e}",
+                        self.host,
+                        self.port
+                    );
+                }
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -61,6 +100,10 @@ impl SshBackend {
         self.session.is_some()
     }
 
+    pub fn matches_config(&self, host: &str, port: u16, user: &str, key_path: &str) -> bool {
+        self.host == host && self.port == port && self.user == user && self.key_path == key_path
+    }
+
     /// Establish an SSH connection and authenticate with a key.
     pub async fn connect(&mut self) -> Result<(), String> {
         let key = load_secret_key(&self.key_path, None)
@@ -69,7 +112,12 @@ impl SshBackend {
         let config = Arc::new(client::Config::default());
         let addr = format!("{}:{}", self.host, self.port);
 
-        let mut handle = client::connect(config, &addr, SshHandler)
+        let handler = SshHandler {
+            host: self.host.clone(),
+            port: self.port,
+        };
+
+        let mut handle = client::connect(config, &addr, handler)
             .await
             .map_err(|e| format!("SSH connection to {addr} failed: {e}"))?;
 
@@ -147,6 +195,7 @@ impl SshBackend {
             disk_percent: disk,
             net_rx_bytes_per_sec: rx_per_sec,
             net_tx_bytes_per_sec: tx_per_sec,
+            ..ServerMetrics::default()
         })
     }
 

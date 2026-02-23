@@ -9,12 +9,14 @@
     "beforeBuildCommand": ""
   },
   "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "Observer Ward",
         "width": 380,
-        "height": 500,
+        "height": 120,
         "resizable": false,
         "decorations": false,
         "visible": false,

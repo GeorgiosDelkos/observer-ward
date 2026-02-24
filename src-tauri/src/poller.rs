@@ -12,7 +12,8 @@ use tokio::time::sleep;
 use crate::config::{AppConfig, ServerConfig};
 use crate::k8s_backend::K8sBackend;
 use crate::metrics::{
-    classify_level, worst_level, MetricLevel, MetricsUpdate, ServerMetrics, ServerStatus,
+    classify_level, has_restarts, worst_level, MetricLevel, MetricsUpdate, ServerMetrics,
+    ServerStatus,
 };
 use crate::ssh_backend::SshBackend;
 use crate::TrayState;
@@ -246,6 +247,7 @@ impl Poller {
 
     fn update_tray_icon(&self, metrics: &[ServerMetrics]) {
         let level = worst_level(metrics);
+        let restarts = has_restarts(metrics);
         let Some(state) = self.app_handle.try_state::<TrayState>() else {
             return;
         };
@@ -253,46 +255,62 @@ impl Poller {
             return;
         };
 
-        let tooltip = match level {
-            MetricLevel::Ok => "Observer Ward — all clear",
-            MetricLevel::Warn => "Observer Ward — warning",
-            MetricLevel::Crit => "Observer Ward — critical",
+        let tooltip = if restarts {
+            "Observer Ward — restart detected"
+        } else {
+            match level {
+                MetricLevel::Ok => "Observer Ward — all clear",
+                MetricLevel::Warn => "Observer Ward — warning",
+                MetricLevel::Crit => "Observer Ward — critical",
+            }
         };
 
         if let Err(e) = tray.set_tooltip(Some(tooltip)) {
             tracing::warn!("failed to set tray tooltip: {e}");
         }
 
-        match level {
-            MetricLevel::Ok => {
-                if let Some(icon) = self.app_handle.default_window_icon() {
-                    if let Err(e) = tray.set_icon(Some(icon.clone())) {
-                        tracing::warn!("failed to set tray icon: {e}");
-                    }
-                    if let Err(e) = tray.set_icon_as_template(true) {
-                        tracing::warn!("failed to set icon as template: {e}");
-                    }
+        if restarts {
+            let icon = Image::from_bytes(include_bytes!("../icons/tray-restart.png"));
+            if let Ok(img) = icon {
+                if let Err(e) = tray.set_icon(Some(img)) {
+                    tracing::warn!("failed to set restart tray icon: {e}");
+                }
+                if let Err(e) = tray.set_icon_as_template(false) {
+                    tracing::warn!("failed to unset icon template: {e}");
                 }
             }
-            MetricLevel::Warn => {
-                let icon = Image::from_bytes(include_bytes!("../icons/tray-warn.png"));
-                if let Ok(img) = icon {
-                    if let Err(e) = tray.set_icon(Some(img)) {
-                        tracing::warn!("failed to set warn tray icon: {e}");
-                    }
-                    if let Err(e) = tray.set_icon_as_template(false) {
-                        tracing::warn!("failed to unset icon template: {e}");
+        } else {
+            match level {
+                MetricLevel::Ok => {
+                    if let Some(icon) = self.app_handle.default_window_icon() {
+                        if let Err(e) = tray.set_icon(Some(icon.clone())) {
+                            tracing::warn!("failed to set tray icon: {e}");
+                        }
+                        if let Err(e) = tray.set_icon_as_template(true) {
+                            tracing::warn!("failed to set icon as template: {e}");
+                        }
                     }
                 }
-            }
-            MetricLevel::Crit => {
-                let icon = Image::from_bytes(include_bytes!("../icons/tray-crit.png"));
-                if let Ok(img) = icon {
-                    if let Err(e) = tray.set_icon(Some(img)) {
-                        tracing::warn!("failed to set crit tray icon: {e}");
+                MetricLevel::Warn => {
+                    let icon = Image::from_bytes(include_bytes!("../icons/tray-warn.png"));
+                    if let Ok(img) = icon {
+                        if let Err(e) = tray.set_icon(Some(img)) {
+                            tracing::warn!("failed to set warn tray icon: {e}");
+                        }
+                        if let Err(e) = tray.set_icon_as_template(false) {
+                            tracing::warn!("failed to unset icon template: {e}");
+                        }
                     }
-                    if let Err(e) = tray.set_icon_as_template(false) {
-                        tracing::warn!("failed to unset icon template: {e}");
+                }
+                MetricLevel::Crit => {
+                    let icon = Image::from_bytes(include_bytes!("../icons/tray-crit.png"));
+                    if let Ok(img) = icon {
+                        if let Err(e) = tray.set_icon(Some(img)) {
+                            tracing::warn!("failed to set crit tray icon: {e}");
+                        }
+                        if let Err(e) = tray.set_icon_as_template(false) {
+                            tracing::warn!("failed to unset icon template: {e}");
+                        }
                     }
                 }
             }

@@ -71,6 +71,13 @@ pub fn worst_level(metrics: &[ServerMetrics]) -> MetricLevel {
         .unwrap_or(MetricLevel::Ok)
 }
 
+pub fn has_restarts(metrics: &[ServerMetrics]) -> bool {
+    metrics
+        .iter()
+        .filter(|m| m.status == ServerStatus::Online)
+        .any(|m| m.restart_count > 0)
+}
+
 /// Event payload sent to the frontend via `app.emit("metrics-update", ...)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsUpdate {
@@ -364,5 +371,54 @@ mod tests {
     #[test]
     fn worst_level_empty_is_ok() {
         assert_eq!(worst_level(&[]), MetricLevel::Ok);
+    }
+
+    #[test]
+    fn has_restarts_true_when_restart_count_nonzero() {
+        let metrics = vec![
+            ServerMetrics {
+                status: ServerStatus::Online,
+                restart_count: 0,
+                ..ServerMetrics::default()
+            },
+            ServerMetrics {
+                status: ServerStatus::Online,
+                restart_count: 2,
+                ..ServerMetrics::default()
+            },
+        ];
+        assert!(has_restarts(&metrics));
+    }
+
+    #[test]
+    fn has_restarts_false_when_all_zero() {
+        let metrics = vec![
+            ServerMetrics {
+                status: ServerStatus::Online,
+                restart_count: 0,
+                ..ServerMetrics::default()
+            },
+            ServerMetrics {
+                status: ServerStatus::Online,
+                restart_count: 0,
+                ..ServerMetrics::default()
+            },
+        ];
+        assert!(!has_restarts(&metrics));
+    }
+
+    #[test]
+    fn has_restarts_skips_offline() {
+        let metrics = vec![ServerMetrics {
+            status: ServerStatus::Offline,
+            restart_count: 5,
+            ..ServerMetrics::default()
+        }];
+        assert!(!has_restarts(&metrics));
+    }
+
+    #[test]
+    fn has_restarts_empty_is_false() {
+        assert!(!has_restarts(&[]));
     }
 }

@@ -6,6 +6,7 @@ mod ssh_backend;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, Manager, State};
@@ -217,10 +218,7 @@ fn setup_tray_and_window(
     is_visible: &Arc<AtomicBool>,
     wake: &Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = app
-        .default_window_icon()
-        .ok_or("no default icon configured")?
-        .clone();
+    let icon = Image::from_bytes(include_bytes!("../icons/tray-default.png"))?;
 
     let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
     let tray_menu = MenuBuilder::new(app).item(&quit_item).build()?;
@@ -255,6 +253,14 @@ fn setup_tray_and_window(
                         tray_visible.store(false, Ordering::Relaxed);
                         tray_wake.notify_one();
                     } else {
+                        // Reset tray icon to default on window open
+                        if let Ok(img) =
+                            Image::from_bytes(include_bytes!("../icons/tray-default.png"))
+                        {
+                            let _ = tray.set_icon(Some(img));
+                            let _ = tray.set_icon_as_template(true);
+                            let _ = tray.set_tooltip(Some("Observer Ward"));
+                        }
                         if let Err(e) = window.move_window(Position::TrayCenter) {
                             tracing::warn!("failed to position window: {e}");
                         }

@@ -282,8 +282,9 @@ impl Poller {
         } else {
             match level {
                 MetricLevel::Ok => {
-                    if let Some(icon) = self.app_handle.default_window_icon() {
-                        if let Err(e) = tray.set_icon(Some(icon.clone())) {
+                    let icon = Image::from_bytes(include_bytes!("../icons/tray-default.png"));
+                    if let Ok(img) = icon {
+                        if let Err(e) = tray.set_icon(Some(img)) {
                             tracing::warn!("failed to set tray icon: {e}");
                         }
                         if let Err(e) = tray.set_icon_as_template(true) {

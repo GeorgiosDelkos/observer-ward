@@ -183,10 +183,7 @@ struct VolumeStats {
 }
 
 #[derive(Debug, Deserialize)]
-struct PvcRef {
-    #[serde(rename = "name")]
-    _name: String,
-}
+struct PvcRef {}
 
 // -- K8s backend --
 
@@ -258,21 +255,15 @@ impl K8sBackend {
         Ok(())
     }
 
-    /// Fetch kubelet stats summaries from all cluster nodes.
+    /// Fetch kubelet stats summaries from the given cluster nodes.
     ///
     /// Nodes are fetched concurrently. Individual node failures
     /// are logged and skipped rather than aborting the entire
     /// operation.
-    pub async fn fetch_all_node_stats(client: &Client) -> Result<Vec<StatsSummary>, String> {
-        let nodes_api: Api<Node> = Api::all(client.clone());
-        let nodes = nodes_api
-            .list(&ListParams::default())
-            .await
-            .map_err(|e| format!("failed to list nodes: {e}"))?;
-
+    pub async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Vec<StatsSummary> {
         let mut tasks = JoinSet::new();
 
-        for node in &nodes {
+        for node in nodes {
             let name = node.metadata.name.as_deref().unwrap_or("");
             if name.is_empty() {
                 continue;
@@ -282,7 +273,7 @@ impl K8sBackend {
             tasks.spawn(async move { fetch_node_stats(&client, &name).await });
         }
 
-        let mut summaries = Vec::with_capacity(nodes.items.len());
+        let mut summaries = Vec::with_capacity(nodes.len());
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok(Ok(summary)) => summaries.push(summary),
@@ -295,7 +286,7 @@ impl K8sBackend {
             }
         }
 
-        Ok(summaries)
+        summaries
     }
 
     /// Fetch recent K8s events for pods in a namespace.
@@ -468,21 +459,22 @@ impl K8sBackend {
             .clone();
 
         let metrics_api: Api<PodMetrics> = Api::namespaced(client.clone(), namespace);
-        let pod_metrics_list = metrics_api
-            .list(&ListParams::default())
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to list pod metrics in namespace \
-                     '{namespace}': {e}"
-                )
-            })?;
-
         let pods_api: Api<Pod> = Api::namespaced(client, namespace);
-        let pod_specs = pods_api.list(&ListParams::default()).await.map_err(|e| {
+        let params = ListParams::default();
+
+        let (pod_metrics_result, pod_specs_result) =
+            tokio::join!(metrics_api.list(&params), pods_api.list(&params),);
+
+        let pod_metrics_list = pod_metrics_result.map_err(|e| {
+            format!(
+                "failed to list pod metrics in namespace \
+                 '{namespace}': {e}"
+            )
+        })?;
+        let pod_specs = pod_specs_result.map_err(|e| {
             format!(
                 "failed to list pods in namespace \
-                     '{namespace}': {e}"
+                 '{namespace}': {e}"
             )
         })?;
 
@@ -498,7 +490,7 @@ impl K8sBackend {
         let mut results = Vec::with_capacity(pod_metrics_list.items.len());
 
         for pm in &pod_metrics_list {
-            let m = build_pod_server_metrics(
+            match build_pod_server_metrics(
                 pm,
                 &pod_index,
                 cluster_name,
@@ -506,8 +498,13 @@ impl K8sBackend {
                 cluster_mem,
                 &pvc_map,
                 events,
-            )?;
-            results.push(m);
+            ) {
+                Ok(m) => results.push(m),
+                Err(e) => {
+                    let name = pm.metadata.name.as_deref().unwrap_or("unknown");
+                    tracing::warn!("skipping pod {name}: {e}");
+                }
+            }
         }
 
         let now = Instant::now();
@@ -547,6 +544,9 @@ impl K8sBackend {
     /// Collect all metrics for a K8s cluster: node-level
     /// aggregates plus per-pod metrics. Fetches allocatable
     /// totals once and reuses them for both calculations.
+    ///
+    /// Resets the internal client on connection-level failures
+    /// so the next poll attempt creates a fresh connection.
     pub async fn collect_all(
         &mut self,
         server_name: &str,
@@ -560,14 +560,23 @@ impl K8sBackend {
             .client()
             .ok_or_else(|| "k8s client not connected".to_string())?;
 
-        let (alloc_cpu, alloc_mem) = fetch_allocatable_totals(&client).await?;
+        let nodes = match fetch_nodes(&client).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.client = None;
+                return Err(e);
+            }
+        };
 
-        let stats = Self::fetch_all_node_stats(&client)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("failed to fetch node stats for {server_name}: {e}");
-                Vec::new()
-            });
+        let (alloc_cpu, alloc_mem) = match sum_allocatable(&nodes) {
+            Ok(totals) => totals,
+            Err(e) => {
+                self.client = None;
+                return Err(e);
+            }
+        };
+
+        let stats = Self::fetch_all_node_stats(&client, &nodes).await;
 
         let events = Self::fetch_pod_events(&client, namespace)
             .await
@@ -579,9 +588,16 @@ impl K8sBackend {
                 HashMap::new()
             });
 
-        let node_metrics = self
+        let node_metrics = match self
             .collect_metrics(server_name, &stats, alloc_cpu, alloc_mem)
-            .await?;
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                self.client = None;
+                return Err(e);
+            }
+        };
 
         let pod_metrics = self
             .collect_pod_metrics(
@@ -789,19 +805,23 @@ fn container_override_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> 
     None
 }
 
-/// Sum allocatable CPU (fractional cores) and memory (bytes)
-/// across all cluster nodes.
-async fn fetch_allocatable_totals(client: &Client) -> Result<(f64, u64), String> {
+/// Fetch all cluster nodes from the API.
+async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, String> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let nodes = nodes_api
         .list(&ListParams::default())
         .await
         .map_err(|e| format!("failed to list nodes: {e}"))?;
+    Ok(nodes.items)
+}
 
+/// Sum allocatable CPU (fractional cores) and memory (bytes)
+/// from the provided node list.
+fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), String> {
     let mut total_cpu = 0.0_f64;
     let mut total_mem = 0_u64;
 
-    for node in &nodes {
+    for node in nodes {
         let Some(alloc) = node.status.as_ref().and_then(|s| s.allocatable.as_ref()) else {
             let name = node.metadata.name.as_deref().unwrap_or("unknown");
             tracing::warn!("node {name} missing allocatable resources, skipping");
@@ -1058,12 +1078,24 @@ fn parse_memory_quantity(q: &Quantity) -> Result<u64, String> {
             .map(|n| n * 1024 * 1024 * 1024 * 1024)
             .map_err(err);
     }
+    if let Some(v) = s.strip_suffix("Pi") {
+        return v
+            .parse::<u64>()
+            .map(|n| n * 1024 * 1024 * 1024 * 1024 * 1024)
+            .map_err(err);
+    }
+    if let Some(v) = s.strip_suffix("Ei") {
+        return v
+            .parse::<u64>()
+            .map(|n| n * 1024 * 1024 * 1024 * 1024 * 1024 * 1024)
+            .map_err(err);
+    }
 
     // Decimal suffixes — parse as f64 to support fractional
     // values like "1.5G"
     let ferr = |e| format!("invalid memory quantity '{s}': {e}");
     if let Some(v) = s.strip_suffix('k') {
-        return v.parse::<u64>().map(|n| n * 1000).map_err(err);
+        return v.parse::<f64>().map(|n| (n * 1000.0) as u64).map_err(ferr);
     }
     if let Some(v) = s.strip_suffix('M') {
         return v
@@ -1081,6 +1113,18 @@ fn parse_memory_quantity(q: &Quantity) -> Result<u64, String> {
         return v
             .parse::<f64>()
             .map(|n| (n * 1_000_000_000_000.0) as u64)
+            .map_err(ferr);
+    }
+    if let Some(v) = s.strip_suffix('P') {
+        return v
+            .parse::<f64>()
+            .map(|n| (n * 1_000_000_000_000_000.0) as u64)
+            .map_err(ferr);
+    }
+    if let Some(v) = s.strip_suffix('E') {
+        return v
+            .parse::<f64>()
+            .map(|n| (n * 1_000_000_000_000_000_000.0) as u64)
             .map_err(ferr);
     }
 

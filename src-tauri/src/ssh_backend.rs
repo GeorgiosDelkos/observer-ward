@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use russh::client;
 use russh::keys::key::PrivateKeyWithHashAlg;
@@ -9,6 +9,7 @@ use russh::{Channel, ChannelMsg, Disconnect};
 use crate::metrics::{ServerMetrics, ServerStatus};
 
 const SEPARATOR: &str = "---SEPARATOR---";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 
 const METRICS_COMMAND: &str = "\
     top -bn1 | head -5; \
@@ -200,6 +201,9 @@ impl SshBackend {
     }
 
     /// Execute a command over SSH and return stdout.
+    ///
+    /// Applies an internal per-command timeout and explicitly
+    /// closes the channel to prevent resource leaks.
     async fn exec_command(&self, cmd: &str) -> Result<String, String> {
         let session = self
             .session
@@ -216,19 +220,9 @@ impl SshBackend {
             .await
             .map_err(|e| format!("failed to exec command: {e}"))?;
 
-        let mut stdout = Vec::new();
-
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                ChannelMsg::Data { data } => {
-                    stdout.extend_from_slice(&data);
-                }
-                ChannelMsg::Eof | ChannelMsg::Close => break,
-                _ => {}
-            }
-        }
-
-        String::from_utf8(stdout).map_err(|e| format!("non-UTF-8 command output: {e}"))
+        let result = read_channel_output(&mut channel).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
+        result
     }
 
     /// Close the SSH session.
@@ -239,6 +233,30 @@ impl SshBackend {
                 .await;
         }
     }
+}
+
+/// Read all stdout data from an SSH channel with a timeout.
+///
+/// Returns an error if the channel does not send EOF/Close
+/// within [`COMMAND_TIMEOUT`].
+async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+    let mut stdout = Vec::new();
+
+    loop {
+        match tokio::time::timeout_at(deadline, channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) => {
+                stdout.extend_from_slice(&data);
+            }
+            Ok(Some(ChannelMsg::Eof | ChannelMsg::Close) | None) => break,
+            Ok(Some(_)) => {}
+            Err(_) => {
+                return Err("SSH command timed out".to_string());
+            }
+        }
+    }
+
+    String::from_utf8(stdout).map_err(|e| format!("non-UTF-8 command output: {e}"))
 }
 
 /// Extract CPU usage from `top -bn1` output.

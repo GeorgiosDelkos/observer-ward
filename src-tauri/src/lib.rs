@@ -16,7 +16,10 @@ use tokio::sync::Notify;
 
 struct ConfigState(Arc<Mutex<config::AppConfig>>);
 struct WakeState(Arc<Notify>);
-pub struct TrayState(pub Mutex<tauri::tray::TrayIcon>);
+pub struct TrayState {
+    pub icon: Mutex<tauri::tray::TrayIcon>,
+    pub icon_reset: AtomicBool,
+}
 
 #[tauri::command]
 #[expect(
@@ -82,7 +85,11 @@ fn remove_server(
     name: String,
 ) -> Result<config::AppConfig, String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    let before = config.servers.len();
     config.servers.retain(|s| s.name() != name);
+    if config.servers.len() == before {
+        return Err(format!("server '{name}' not found"));
+    }
     config::save_config(&config)?;
     let result = config.clone();
     drop(config);
@@ -107,10 +114,9 @@ fn validate_shell_safe(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{field} is empty"));
     }
-    if !value
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '@' | ':' | '~' | '+'))
-    {
+    if !value.chars().all(|c| {
+        c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '@' | ':' | '~' | '+' | ' ')
+    }) {
         return Err(format!("{field} contains unsafe characters"));
     }
     Ok(())
@@ -125,23 +131,38 @@ fn run_in_terminal(cmd: &str) -> Result<(), String> {
 }
 
 fn run_in_warp(cmd: &str) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!("ow-cmd-{}.sh", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!(
+        "ow-cmd-{}-{}.sh",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    ));
     std::fs::write(&tmp, format!("#!/bin/bash\n{cmd}\n"))
         .map_err(|e| format!("failed to write temp script: {e}"))?;
     std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .map_err(|e| format!("failed to chmod temp script: {e}"))?;
+    let path_str = tmp
+        .to_str()
+        .ok_or_else(|| "temp path is not valid UTF-8".to_string())?;
     std::process::Command::new("open")
-        .args(["-a", "Warp", tmp.to_str().unwrap_or("")])
+        .args(["-a", "Warp", path_str])
         .spawn()
         .map_err(|e| format!("failed to open Warp: {e}"))?;
+    let cleanup_path = tmp.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_file(&cleanup_path);
+    });
     Ok(())
 }
 
 fn run_in_terminal_app(cmd: &str) -> Result<(), String> {
+    let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "tell application \"Terminal\"\n\
          activate\n\
-         do script \"{cmd}\"\n\
+         do script \"{escaped}\"\n\
          end tell"
     );
     std::process::Command::new("osascript")
@@ -166,7 +187,7 @@ fn open_ssh_terminal(
     validate_shell_safe(&host, "host")?;
     validate_shell_safe(&user, "user")?;
     validate_shell_safe(&key_path, "key_path")?;
-    let cmd = format!("ssh {user}@{host} -p {port} -i {key_path}");
+    let cmd = format!("ssh '{user}'@'{host}' -p {port} -i '{key_path}'");
     run_in_terminal(&cmd)
 }
 
@@ -189,13 +210,13 @@ fn open_pod_logs(
     }
     let cmd = if let Some(kc) = &kubeconfig {
         format!(
-            "kubectl logs -f {pod_name} -n {namespace} \
-             --context {context} --kubeconfig {kc}"
+            "kubectl logs -f '{pod_name}' -n '{namespace}' \
+             --context '{context}' --kubeconfig '{kc}'"
         )
     } else {
         format!(
-            "kubectl logs -f {pod_name} -n {namespace} \
-             --context {context}"
+            "kubectl logs -f '{pod_name}' -n '{namespace}' \
+             --context '{context}'"
         )
     };
     run_in_terminal(&cmd)
@@ -250,7 +271,7 @@ fn setup_tray_and_window(
                         if let Err(e) = window.hide() {
                             tracing::warn!("failed to hide window: {e}");
                         }
-                        tray_visible.store(false, Ordering::Relaxed);
+                        tray_visible.store(false, Ordering::Release);
                         tray_wake.notify_one();
                     } else {
                         // Reset tray icon to default on window open
@@ -261,6 +282,9 @@ fn setup_tray_and_window(
                             let _ = tray.set_icon_as_template(true);
                             let _ = tray.set_tooltip(Some("Observer Ward"));
                         }
+                        if let Some(state) = app.try_state::<TrayState>() {
+                            state.icon_reset.store(true, Ordering::Release);
+                        }
                         if let Err(e) = window.move_window(Position::TrayCenter) {
                             tracing::warn!("failed to position window: {e}");
                         }
@@ -270,7 +294,7 @@ fn setup_tray_and_window(
                         if let Err(e) = window.set_focus() {
                             tracing::warn!("failed to focus window: {e}");
                         }
-                        tray_visible.store(true, Ordering::Relaxed);
+                        tray_visible.store(true, Ordering::Release);
                         tray_wake.notify_one();
                     }
                 }
@@ -278,7 +302,10 @@ fn setup_tray_and_window(
         })
         .build(app)?;
 
-    app.manage(TrayState(Mutex::new(tray)));
+    app.manage(TrayState {
+        icon: Mutex::new(tray),
+        icon_reset: AtomicBool::new(false),
+    });
 
     let blur_visible = Arc::clone(is_visible);
     let blur_wake = Arc::clone(wake);
@@ -289,7 +316,7 @@ fn setup_tray_and_window(
                 if let Err(e) = w.hide() {
                     tracing::warn!("failed to hide window on blur: {e}");
                 }
-                blur_visible.store(false, Ordering::Relaxed);
+                blur_visible.store(false, Ordering::Release);
                 blur_wake.notify_one();
             }
         });

@@ -4,7 +4,7 @@ mod metrics;
 mod poller;
 mod ssh_backend;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -19,6 +19,11 @@ struct WakeState(Arc<Notify>);
 pub struct TrayState {
     pub icon: Mutex<tauri::tray::TrayIcon>,
     pub icon_reset: AtomicBool,
+    /// Millisecond timestamp of the last tray-click window show.
+    /// The blur handler skips hide events within a short grace
+    /// period to prevent the tray click from immediately
+    /// dismissing the window on macOS.
+    pub last_tray_show_ms: AtomicU64,
 }
 
 #[tauri::command]
@@ -284,6 +289,12 @@ fn setup_tray_and_window(
                         }
                         if let Some(state) = app.try_state::<TrayState>() {
                             state.icon_reset.store(true, Ordering::Release);
+                            state.last_tray_show_ms.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs().saturating_mul(1000)),
+                                Ordering::Release,
+                            );
                         }
                         if let Err(e) = window.move_window(Position::TrayCenter) {
                             tracing::warn!("failed to position window: {e}");
@@ -305,14 +316,29 @@ fn setup_tray_and_window(
     app.manage(TrayState {
         icon: Mutex::new(tray),
         icon_reset: AtomicBool::new(false),
+        last_tray_show_ms: AtomicU64::new(0),
     });
 
+    let blur_handle = app.handle().clone();
     let blur_visible = Arc::clone(is_visible);
     let blur_wake = Arc::clone(wake);
     if let Some(window) = app.get_webview_window("main") {
         let w = window.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(false) = event {
+                // On macOS, clicking the tray icon causes the window to
+                // lose focus immediately after being shown. Skip the
+                // blur-to-hide if the window was just opened via tray
+                // click (within 500 ms grace period).
+                if let Some(state) = blur_handle.try_state::<TrayState>() {
+                    let shown_at = state.last_tray_show_ms.load(Ordering::Acquire);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs().saturating_mul(1000));
+                    if now.saturating_sub(shown_at) < 500 {
+                        return;
+                    }
+                }
                 if let Err(e) = w.hide() {
                     tracing::warn!("failed to hide window on blur: {e}");
                 }

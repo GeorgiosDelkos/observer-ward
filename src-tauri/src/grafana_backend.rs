@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use crate::config::GrafanaConfig;
 use crate::metrics::{Alert, AlertSeverity, AlertState};
 
 /// Keychain service name under which Grafana tokens are stored, keyed by
@@ -103,6 +104,99 @@ fn to_alert(raw: GettableAlert) -> Alert {
 pub fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
     let raw: Vec<GettableAlert> = serde_json::from_str(body).map_err(GrafanaError::Parse)?;
     Ok(raw.into_iter().map(to_alert).collect())
+}
+
+/// Read the stored API token for the connection named `name` from the OS
+/// keychain.
+///
+/// # Errors
+///
+/// Returns [`GrafanaError::MissingToken`] if no token has been stored for
+/// this connection, or [`GrafanaError::Keychain`] if the platform
+/// keychain cannot be accessed.
+pub fn read_token(name: &str) -> Result<String, GrafanaError> {
+    let entry = keyring_core::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)?;
+    match entry.get_password() {
+        Ok(token) => Ok(token),
+        Err(keyring_core::Error::NoEntry) => Err(GrafanaError::MissingToken {
+            name: name.to_string(),
+        }),
+        Err(source) => Err(GrafanaError::Keychain(source)),
+    }
+}
+
+/// HTTP client bound to one Grafana instance. Owns its `reqwest::Client`,
+/// base URL, and the token (held in memory only, loaded from the keychain
+/// at construction). Cached in the `Poller` and reused across cycles.
+pub struct GrafanaBackend {
+    base_url: String,
+    verify_tls: bool,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl GrafanaBackend {
+    /// Build a client for `config` using the already-resolved `token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrafanaError::Client`] if the HTTP client cannot be built
+    /// (e.g. the TLS backend fails to initialize).
+    pub fn new(config: &GrafanaConfig, token: String) -> Result<Self, GrafanaError> {
+        let client = reqwest::Client::builder()
+            // verify_tls == false opts out of certificate validation for a
+            // trusted self-signed instance; default config keeps it on.
+            .danger_accept_invalid_certs(!config.verify_tls)
+            .build()
+            .map_err(GrafanaError::Client)?;
+        Ok(Self {
+            base_url: config.url.clone(),
+            verify_tls: config.verify_tls,
+            token,
+            client,
+        })
+    }
+
+    /// True if this backend was built for the same endpoint as `config`.
+    /// The token is intentionally excluded: a token change is handled by
+    /// rebuilding from the keychain, not compared here.
+    #[must_use]
+    pub fn matches_config(&self, config: &GrafanaConfig) -> bool {
+        self.base_url == config.url && self.verify_tls == config.verify_tls
+    }
+
+    fn alerts_url(&self) -> String {
+        format!(
+            "{}/api/alertmanager/grafana/api/v2/alerts",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    /// Fetch the currently active alerts from Grafana.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrafanaError::Http`] on transport failure,
+    /// [`GrafanaError::Status`] on a non-2xx response (e.g. 401 for a bad
+    /// token), or [`GrafanaError::Parse`] if the body is not valid
+    /// Alertmanager v2 JSON.
+    pub async fn fetch_alerts(&self) -> Result<Vec<Alert>, GrafanaError> {
+        let response = self
+            .client
+            .get(self.alerts_url())
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(GrafanaError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(GrafanaError::Status {
+                code: status.as_u16(),
+            });
+        }
+        let body = response.text().await.map_err(GrafanaError::Http)?;
+        parse_alerts(&body)
+    }
 }
 
 #[cfg(test)]
@@ -210,5 +304,38 @@ mod tests {
         assert_eq!(alerts[1].fingerprint, "fp2");
         assert_eq!(alerts[1].severity, AlertSeverity::Warning);
         assert_eq!(alerts[1].state, AlertState::Suppressed);
+    }
+
+    #[test]
+    fn backend_builds_and_matches_config() {
+        let cfg = GrafanaConfig {
+            name: "home".to_string(),
+            url: "https://grafana.internal".to_string(),
+            verify_tls: true,
+            enabled: true,
+        };
+        let backend = GrafanaBackend::new(&cfg, "token".to_string()).expect("build");
+        assert!(backend.matches_config(&cfg));
+
+        let changed = GrafanaConfig {
+            url: "https://other.internal".to_string(),
+            ..cfg.clone()
+        };
+        assert!(!backend.matches_config(&changed));
+    }
+
+    #[test]
+    fn alerts_url_has_no_double_slash() {
+        let cfg = GrafanaConfig {
+            name: "home".to_string(),
+            url: "https://grafana.internal/".to_string(),
+            verify_tls: true,
+            enabled: true,
+        };
+        let backend = GrafanaBackend::new(&cfg, "token".to_string()).expect("build");
+        assert_eq!(
+            backend.alerts_url(),
+            "https://grafana.internal/api/alertmanager/grafana/api/v2/alerts"
+        );
     }
 }

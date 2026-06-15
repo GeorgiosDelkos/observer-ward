@@ -138,7 +138,12 @@ impl Poller {
                 if let Err(e) = self.app_handle.emit("alerts-update", &alerts_update) {
                     tracing::warn!("failed to emit alerts-update: {e}");
                 }
-                self.notify_new_alerts(notifications_enabled, &alerts_update.alerts);
+                // On a transient fetch error the alert list is empty but
+                // *unknown*, not "all clear" — skip the notify/dedup update so
+                // recovery does not replay every still-firing alert as new.
+                if alerts_update.source_error.is_none() {
+                    self.notify_new_alerts(notifications_enabled, &alerts_update.alerts);
+                }
                 alerts_update.alerts
             } else {
                 Vec::new()

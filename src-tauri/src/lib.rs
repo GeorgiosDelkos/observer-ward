@@ -1,4 +1,5 @@
 mod config;
+mod error;
 mod k8s_backend;
 mod metrics;
 mod poller;
@@ -48,7 +49,7 @@ fn save_config_cmd(
     new_config: config::AppConfig,
 ) -> Result<(), String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
-    config::save_config(&new_config)?;
+    config::save_config(&new_config).map_err(|e| error::error_chain(&e))?;
     *config = new_config;
     drop(config);
     wake.0.notify_one();
@@ -71,7 +72,7 @@ fn add_server(
         return Err(format!("server '{}' already exists", server.name()));
     }
     config.servers.push(server);
-    config::save_config(&config)?;
+    config::save_config(&config).map_err(|e| error::error_chain(&e))?;
     let result = config.clone();
     drop(config);
     wake.0.notify_one();
@@ -95,7 +96,7 @@ fn remove_server(
     if config.servers.len() == before {
         return Err(format!("server '{name}' not found"));
     }
-    config::save_config(&config)?;
+    config::save_config(&config).map_err(|e| error::error_chain(&e))?;
     let result = config.clone();
     drop(config);
     wake.0.notify_one();
@@ -135,18 +136,35 @@ fn run_in_terminal(cmd: &str) -> Result<(), String> {
     }
 }
 
+/// Monotonic per-process counter making each temp-script filename unique.
+/// Combined with pid + millis it prevents `create_new` from spuriously
+/// failing when two terminal launches land in the same millisecond.
+static SCRIPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn run_in_warp(cmd: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!(
-        "ow-cmd-{}-{}.sh",
+        "ow-cmd-{}-{}-{}.sh",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis())
+            .map_or(0, |d| d.as_millis()),
+        SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, format!("#!/bin/bash\n{cmd}\n"))
-        .map_err(|e| format!("failed to write temp script: {e}"))?;
-    std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .map_err(|e| format!("failed to chmod temp script: {e}"))?;
+    // Create the script exclusively (O_EXCL via create_new) so a symlink
+    // pre-planted at this predictable path cannot redirect the write, and
+    // with mode 0o700 so only the owner can read/execute it.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&tmp)
+            .map_err(|e| format!("failed to create temp script: {e}"))?;
+        file.write_all(format!("#!/bin/bash\n{cmd}\n").as_bytes())
+            .map_err(|e| format!("failed to write temp script: {e}"))?;
+    }
     let path_str = tmp
         .to_str()
         .ok_or_else(|| "temp path is not valid UTF-8".to_string())?;

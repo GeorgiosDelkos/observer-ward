@@ -70,33 +70,95 @@ impl ServerConfig {
     }
 }
 
+/// Failure categories for config persistence. Each variant carries the
+/// underlying cause in its source chain rather than a `format!`-built
+/// string (axioms `rust_quality_57`/`60`/`63`), so the Tauri command
+/// boundary can render it however it likes while callers keep the option
+/// to inspect the specific failure.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    #[error("could not determine the user config directory")]
+    NoConfigDir,
+    #[error("failed to read config file {path}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create config directory {path}")]
+    CreateDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write config file {path}")]
+    Write {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse config file")]
+    Parse(#[source] serde_json::Error),
+    #[error("failed to serialize config")]
+    Serialize(#[source] serde_json::Error),
+    #[error("failed to rename config file into place: {path}")]
+    Rename {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Returns the config file path: `~/.config/observer-ward/config.json`
-fn config_path() -> Result<PathBuf, String> {
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| "could not determine config directory".to_string())?;
+fn config_path() -> Result<PathBuf, ConfigError> {
+    let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
     Ok(config_dir.join("observer-ward").join("config.json"))
 }
 
-pub fn load_config() -> Result<AppConfig, String> {
+/// Load the persisted config, or the default when no file exists yet.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if the config directory cannot be resolved,
+/// the file cannot be read, or its contents are not valid config JSON.
+pub fn load_config() -> Result<AppConfig, ConfigError> {
     let path = config_path()?;
     if !path.exists() {
         return Ok(AppConfig::default());
     }
-    let contents =
-        std::fs::read_to_string(&path).map_err(|e| format!("failed to read config: {e}"))?;
-    serde_json::from_str(&contents).map_err(|e| format!("failed to parse config: {e}"))
+    let contents = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    serde_json::from_str(&contents).map_err(ConfigError::Parse)
 }
 
-pub fn save_config(config: &AppConfig) -> Result<(), String> {
+/// Persist `config` atomically (write to a temp file, then rename).
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if the config directory cannot be resolved or
+/// created, the config cannot be serialized, or the temp file cannot be
+/// written or renamed into place.
+pub fn save_config(config: &AppConfig) -> Result<(), ConfigError> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("failed to serialize config: {e}"))?;
+    let json = serde_json::to_string_pretty(config).map_err(ConfigError::Serialize)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).map_err(|e| format!("failed to write config: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("failed to rename config: {e}"))
+    std::fs::write(&tmp, &json).map_err(|source| ConfigError::Write {
+        path: tmp.display().to_string(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| ConfigError::Rename {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,18 @@
+# cargo-deny configuration for the supply-chain CI gate.
+# Run with: cargo deny check advisories
+
+[advisories]
+version = 2
+# Only flag UNMAINTAINED crates we depend on directly. The unmaintained
+# warnings in this tree (gtk3 bindings, glib, unic-*, proc-macro-error)
+# are transitive deps of Tauri's Linux backend and are not compiled on
+# this macOS-targeted app; we cannot upgrade them independently.
+unmaintained = "workspace"
+ignore = [
+    # rsa "Marvin" timing side-channel. No fixed release exists in the
+    # ecosystem yet; rsa is pulled transitively by russh for RSA SSH key
+    # support. Impact requires a network-adjacent timing attacker against
+    # RSA host-key/auth. Re-evaluate (and remove this ignore) once the
+    # rsa crate ships a mitigated release.
+    "RUSTSEC-2023-0071",
+]

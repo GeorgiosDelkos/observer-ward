@@ -2,6 +2,8 @@
 name = "observer-ward"
 version = "0.1.0"
 edition = "2021"
+# MSRV floor: poller.rs uses Duration::from_mins, stabilized in Rust 1.91.
+rust-version = "1.91"
 
 [lib]
 name = "observer_ward_lib"
@@ -17,8 +19,11 @@ tauri-plugin-positioner = { version = "2.3", features = ["tray-icon"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "6.0"
-tokio = { version = "1", features = ["full"] }
-russh = "0.57"
+# Only the features this crate uses directly: Notify (sync), JoinSet (rt),
+# sleep/timeout/Instant (time), select!/join! (macros). Transitive crates
+# (tauri, kube) pull in their own tokio features via Cargo feature unification.
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+russh = "0.60.3"
 kube = { version = "3.0", features = ["client", "config", "rustls-tls"] }
 k8s-openapi = { version = "0.27", features = ["v1_31"] }
 http = "1"
@@ -26,9 +31,11 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3.25"
+proptest = "1"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

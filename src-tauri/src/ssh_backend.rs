@@ -11,6 +11,12 @@ use crate::metrics::{ServerMetrics, ServerStatus};
 const SEPARATOR: &str = "---SEPARATOR---";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Hard ceiling on bytes buffered from a single SSH command. The metrics
+/// command emits a few KB; this cap bounds memory if a compromised or
+/// misbehaving server streams unbounded output within the command
+/// timeout (boundary-validation, axiom `rust_api_axiom_25`).
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
 const METRICS_COMMAND: &str = "\
     top -bn1 | head -5; \
     echo '---SEPARATOR---'; \
@@ -19,6 +25,87 @@ const METRICS_COMMAND: &str = "\
     df -B1 /; \
     echo '---SEPARATOR---'; \
     cat /proc/net/dev";
+
+/// Failure categories for the SSH backend. Each variant preserves its
+/// underlying cause in the source chain (axiom `rust_quality_57`); the
+/// poller flattens the chain only when logging.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SshError {
+    #[error("failed to load SSH key {path}")]
+    LoadKey {
+        path: String,
+        #[source]
+        source: russh::keys::Error,
+    },
+    #[error("SSH connection to {addr} failed")]
+    Connect {
+        addr: String,
+        #[source]
+        source: russh::Error,
+    },
+    #[error("SSH authentication failed")]
+    Auth(#[source] russh::Error),
+    #[error("SSH authentication rejected for user {user}")]
+    AuthRejected { user: String },
+    #[error("SSH session is not connected")]
+    NotConnected,
+    #[error("failed to open SSH channel")]
+    OpenChannel(#[source] russh::Error),
+    #[error("failed to execute SSH command")]
+    Exec(#[source] russh::Error),
+    #[error("SSH command timed out")]
+    Timeout,
+    #[error("SSH command output exceeded {limit} bytes")]
+    OutputTooLarge { limit: usize },
+    #[error("SSH command output was not valid UTF-8")]
+    NonUtf8(#[source] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Parse(#[from] MetricsParseError),
+}
+
+/// Failure categories for parsing the remote metrics command output.
+/// Carries the offending field and underlying numeric-parse cause as
+/// typed fields rather than a formatted string (axiom `rust_quality_63`).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MetricsParseError {
+    #[error("expected {expected} sections in metrics output, got {got}")]
+    SectionCount { expected: usize, got: usize },
+    #[error("no Cpu line found in top output")]
+    NoCpuLine,
+    #[error("Cpu line found but no idle value")]
+    NoCpuIdle,
+    #[error("failed to parse CPU idle value")]
+    CpuIdle(#[source] std::num::ParseFloatError),
+    #[error("no Mem line found in free output")]
+    NoMemLine,
+    #[error("Mem line has too few columns")]
+    MemColumns,
+    #[error("failed to parse memory {what} value")]
+    MemValue {
+        what: &'static str,
+        #[source]
+        source: std::num::ParseFloatError,
+    },
+    #[error("memory total is zero or negative")]
+    MemTotalZero,
+    #[error("df output has fewer than 2 lines")]
+    DiskLines,
+    #[error("no percentage column found in df output")]
+    DiskNoPercent,
+    #[error("failed to parse disk percentage")]
+    DiskPercent(#[source] std::num::ParseFloatError),
+    #[error("no non-loopback interfaces found in /proc/net/dev")]
+    NoInterfaces,
+    #[error("failed to parse {what} bytes for interface {iface}")]
+    NetValue {
+        what: &'static str,
+        iface: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
 
 /// SSH backend that collects metrics from a single remote server.
 pub struct SshBackend {
@@ -43,6 +130,11 @@ impl client::Handler for SshHandler {
     /// Use). Known keys are checked against `~/.ssh/known_hosts`.
     /// Unknown hosts are learned automatically on first
     /// connection; changed keys are rejected.
+    ///
+    /// Security note: the first key seen for a host is trusted without
+    /// out-of-band verification, so a man-in-the-middle present at the
+    /// very first connection would be learned as legitimate. Every
+    /// subsequent key change for that host is rejected.
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKey,
@@ -106,9 +198,16 @@ impl SshBackend {
     }
 
     /// Establish an SSH connection and authenticate with a key.
-    pub async fn connect(&mut self) -> Result<(), String> {
-        let key = load_secret_key(&self.key_path, None)
-            .map_err(|e| format!("failed to load SSH key '{}': {e}", self.key_path))?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshError`] if the private key cannot be loaded, the TCP
+    /// connection or SSH handshake fails, or authentication is rejected.
+    pub async fn connect(&mut self) -> Result<(), SshError> {
+        let key = load_secret_key(&self.key_path, None).map_err(|source| SshError::LoadKey {
+            path: self.key_path.clone(),
+            source,
+        })?;
 
         let config = Arc::new(client::Config::default());
         let addr = format!("{}:{}", self.host, self.port);
@@ -120,20 +219,19 @@ impl SshBackend {
 
         let mut handle = client::connect(config, &addr, handler)
             .await
-            .map_err(|e| format!("SSH connection to {addr} failed: {e}"))?;
+            .map_err(|source| SshError::Connect { addr, source })?;
 
         let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), None);
 
         let auth_result = handle
             .authenticate_publickey(&self.user, key_with_alg)
             .await
-            .map_err(|e| format!("SSH authentication failed: {e}"))?;
+            .map_err(SshError::Auth)?;
 
         if !auth_result.success() {
-            return Err(format!(
-                "SSH authentication rejected for user '{}'",
-                self.user
-            ));
+            return Err(SshError::AuthRejected {
+                user: self.user.clone(),
+            });
         }
 
         self.session = Some(handle);
@@ -146,16 +244,15 @@ impl SshBackend {
         reason = "byte deltas fit comfortably in f64 \
                   mantissa for rate calculation"
     )]
-    pub async fn collect_metrics(&mut self, server_name: &str) -> Result<ServerMetrics, String> {
+    pub async fn collect_metrics(&mut self, server_name: &str) -> Result<ServerMetrics, SshError> {
         let output = self.exec_command(METRICS_COMMAND).await?;
         let sections: Vec<&str> = output.split(SEPARATOR).collect();
 
         if sections.len() < 4 {
-            return Err(format!(
-                "expected 4 sections in metrics output, \
-                 got {}",
-                sections.len()
-            ));
+            return Err(SshError::Parse(MetricsParseError::SectionCount {
+                expected: 4,
+                got: sections.len(),
+            }));
         }
 
         let cpu = parse_cpu(sections[0])?;
@@ -204,21 +301,15 @@ impl SshBackend {
     ///
     /// Applies an internal per-command timeout and explicitly
     /// closes the channel to prevent resource leaks.
-    async fn exec_command(&self, cmd: &str) -> Result<String, String> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| "SSH session not connected".to_string())?;
+    async fn exec_command(&self, cmd: &str) -> Result<String, SshError> {
+        let session = self.session.as_ref().ok_or(SshError::NotConnected)?;
 
         let mut channel: Channel<client::Msg> = session
             .channel_open_session()
             .await
-            .map_err(|e| format!("failed to open channel: {e}"))?;
+            .map_err(SshError::OpenChannel)?;
 
-        channel
-            .exec(true, cmd)
-            .await
-            .map_err(|e| format!("failed to exec command: {e}"))?;
+        channel.exec(true, cmd).await.map_err(SshError::Exec)?;
 
         let result = read_channel_output(&mut channel).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
@@ -237,32 +328,40 @@ impl SshBackend {
 
 /// Read all stdout data from an SSH channel with a timeout.
 ///
-/// Returns an error if the channel does not send EOF/Close
-/// within [`COMMAND_TIMEOUT`].
-async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<String, String> {
+/// Returns [`SshError::Timeout`] if the channel does not send EOF/Close
+/// within [`COMMAND_TIMEOUT`], or [`SshError::OutputTooLarge`] if the
+/// server streams more than [`MAX_OUTPUT_BYTES`]. The size check runs
+/// before each append so a hostile server cannot grow the buffer past
+/// the cap between the check and the copy.
+async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<String, SshError> {
     let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
     let mut stdout = Vec::new();
 
     loop {
         match tokio::time::timeout_at(deadline, channel.wait()).await {
             Ok(Some(ChannelMsg::Data { data })) => {
+                if stdout.len().saturating_add(data.len()) > MAX_OUTPUT_BYTES {
+                    return Err(SshError::OutputTooLarge {
+                        limit: MAX_OUTPUT_BYTES,
+                    });
+                }
                 stdout.extend_from_slice(&data);
             }
             Ok(Some(ChannelMsg::Eof | ChannelMsg::Close) | None) => break,
             Ok(Some(_)) => {}
             Err(_) => {
-                return Err("SSH command timed out".to_string());
+                return Err(SshError::Timeout);
             }
         }
     }
 
-    String::from_utf8(stdout).map_err(|e| format!("non-UTF-8 command output: {e}"))
+    String::from_utf8(stdout).map_err(SshError::NonUtf8)
 }
 
 /// Extract CPU usage from `top -bn1` output.
 ///
 /// Looks for the `%Cpu(s):` line and computes 100 - idle%.
-fn parse_cpu(top_output: &str) -> Result<f64, String> {
+fn parse_cpu(top_output: &str) -> Result<f64, MetricsParseError> {
     for line in top_output.lines() {
         let trimmed = line.trim();
         if !trimmed.contains("Cpu") {
@@ -275,24 +374,24 @@ fn parse_cpu(top_output: &str) -> Result<f64, String> {
                 let idle: f64 = part
                     .split_whitespace()
                     .next()
-                    .ok_or_else(|| "no idle value in Cpu line".to_string())?
+                    .ok_or(MetricsParseError::NoCpuIdle)?
                     .parse()
-                    .map_err(|e| format!("failed to parse CPU idle: {e}"))?;
+                    .map_err(MetricsParseError::CpuIdle)?;
                 return Ok(100.0 - idle);
             }
         }
 
-        return Err("Cpu line found but no idle value".to_string());
+        return Err(MetricsParseError::NoCpuIdle);
     }
 
-    Err("no Cpu line found in top output".to_string())
+    Err(MetricsParseError::NoCpuLine)
 }
 
 /// Extract memory usage percentage from `free -b` output.
 ///
 /// Parses the "Mem:" line, taking total (col 1) and used
 /// (col 2).
-fn parse_memory(free_output: &str) -> Result<f64, String> {
+fn parse_memory(free_output: &str) -> Result<f64, MetricsParseError> {
     for line in free_output.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("Mem:") {
@@ -301,47 +400,51 @@ fn parse_memory(free_output: &str) -> Result<f64, String> {
 
         let cols: Vec<&str> = trimmed.split_whitespace().collect();
         if cols.len() < 3 {
-            return Err("Mem line has too few columns".to_string());
+            return Err(MetricsParseError::MemColumns);
         }
 
         let total: f64 = cols[1]
             .parse()
-            .map_err(|e| format!("failed to parse memory total: {e}"))?;
+            .map_err(|source| MetricsParseError::MemValue {
+                what: "total",
+                source,
+            })?;
         let used: f64 = cols[2]
             .parse()
-            .map_err(|e| format!("failed to parse memory used: {e}"))?;
+            .map_err(|source| MetricsParseError::MemValue {
+                what: "used",
+                source,
+            })?;
 
         if total <= 0.0 {
-            return Err("memory total is zero or negative".to_string());
+            return Err(MetricsParseError::MemTotalZero);
         }
 
         return Ok(used / total * 100.0);
     }
 
-    Err("no Mem line found in free output".to_string())
+    Err(MetricsParseError::NoMemLine)
 }
 
 /// Extract disk usage percentage from `df -B1 /` output.
 ///
 /// Parses the second line and extracts the `Use%` column.
-fn parse_disk(df_output: &str) -> Result<f64, String> {
+fn parse_disk(df_output: &str) -> Result<f64, MetricsParseError> {
     let lines: Vec<&str> = df_output.lines().filter(|l| !l.trim().is_empty()).collect();
 
     if lines.len() < 2 {
-        return Err("df output has fewer than 2 lines".to_string());
+        return Err(MetricsParseError::DiskLines);
     }
 
     let data_line = lines[1];
     for part in data_line.split_whitespace() {
         if let Some(pct) = part.strip_suffix('%') {
-            let val: f64 = pct
-                .parse()
-                .map_err(|e| format!("failed to parse disk percentage: {e}"))?;
+            let val: f64 = pct.parse().map_err(MetricsParseError::DiskPercent)?;
             return Ok(val);
         }
     }
 
-    Err("no percentage column found in df output".to_string())
+    Err(MetricsParseError::DiskNoPercent)
 }
 
 /// Extract total (rx, tx) byte counts from
@@ -349,7 +452,7 @@ fn parse_disk(df_output: &str) -> Result<f64, String> {
 ///
 /// Sums `rx_bytes` (col 1) and `tx_bytes` (col 9) across
 /// all non-loopback interfaces.
-fn parse_network(proc_net_dev: &str) -> Result<(u64, u64), String> {
+fn parse_network(proc_net_dev: &str) -> Result<(u64, u64), MetricsParseError> {
     let mut total_rx: u64 = 0;
     let mut total_tx: u64 = 0;
     let mut found_interface = false;
@@ -372,10 +475,18 @@ fn parse_network(proc_net_dev: &str) -> Result<(u64, u64), String> {
 
         let rx: u64 = cols[0]
             .parse()
-            .map_err(|e| format!("failed to parse rx bytes for {iface}: {e}"))?;
+            .map_err(|source| MetricsParseError::NetValue {
+                what: "rx",
+                iface: iface.to_string(),
+                source,
+            })?;
         let tx: u64 = cols[8]
             .parse()
-            .map_err(|e| format!("failed to parse tx bytes for {iface}: {e}"))?;
+            .map_err(|source| MetricsParseError::NetValue {
+                what: "tx",
+                iface: iface.to_string(),
+                source,
+            })?;
 
         total_rx = total_rx.saturating_add(rx);
         total_tx = total_tx.saturating_add(tx);
@@ -383,9 +494,7 @@ fn parse_network(proc_net_dev: &str) -> Result<(u64, u64), String> {
     }
 
     if !found_interface {
-        return Err("no non-loopback interfaces found in \
-             /proc/net/dev"
-            .to_string());
+        return Err(MetricsParseError::NoInterfaces);
     }
 
     Ok((total_rx, total_tx))
@@ -453,7 +562,7 @@ MiB Swap:   2048.0 total,   2048.0 free,      0.0 used.   7864.2 avail Mem";
     fn parse_cpu_no_cpu_line() {
         let input = "some random output\nno cpu here\n";
         let err = parse_cpu(input).unwrap_err();
-        assert!(err.contains("no Cpu line"), "{err}");
+        assert!(matches!(err, MetricsParseError::NoCpuLine), "{err:?}");
     }
 
     // --- Memory parsing ---
@@ -489,14 +598,14 @@ Swap:    2147483648           0  2147483648";
     fn parse_memory_no_mem_line() {
         let input = "Swap:    2147483648   0   2147483648";
         let err = parse_memory(input).unwrap_err();
-        assert!(err.contains("no Mem line"), "{err}");
+        assert!(matches!(err, MetricsParseError::NoMemLine), "{err:?}");
     }
 
     #[test]
     fn parse_memory_too_few_columns() {
         let input = "Mem: 1000";
         let err = parse_memory(input).unwrap_err();
-        assert!(err.contains("too few columns"), "{err}");
+        assert!(matches!(err, MetricsParseError::MemColumns), "{err:?}");
     }
 
     // --- Disk parsing ---
@@ -535,7 +644,7 @@ Filesystem     1B-blocks       Used  Available Use% Mounted on
     fn parse_disk_too_few_lines() {
         let input = "Filesystem     1B-blocks";
         let err = parse_disk(input).unwrap_err();
-        assert!(err.contains("fewer than 2"), "{err}");
+        assert!(matches!(err, MetricsParseError::DiskLines), "{err:?}");
     }
 
     #[test]
@@ -545,7 +654,7 @@ Filesystem     1B-blocks       Used  Available
 /dev/sda1    107374182400 64424509440 42949672960";
 
         let err = parse_disk(input).unwrap_err();
-        assert!(err.contains("no percentage"), "{err}");
+        assert!(matches!(err, MetricsParseError::DiskNoPercent), "{err:?}");
     }
 
     // --- Network parsing ---
@@ -585,7 +694,7 @@ Inter-|   Receive                                                |  Transmit
     lo:  123456    1000    0    0    0     0          0         0   123456    1000    0    0    0     0       0          0";
 
         let err = parse_network(input).unwrap_err();
-        assert!(err.contains("no non-loopback"), "{err}");
+        assert!(matches!(err, MetricsParseError::NoInterfaces), "{err:?}");
     }
 
     #[test]
@@ -595,7 +704,7 @@ Inter-|   Receive                                                |  Transmit
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed";
 
         let err = parse_network(input).unwrap_err();
-        assert!(err.contains("no non-loopback"), "{err}");
+        assert!(matches!(err, MetricsParseError::NoInterfaces), "{err:?}");
     }
 
     #[test]
@@ -624,5 +733,21 @@ Inter-|   Receive                                                |  Transmit
         let (rx, tx) = parse_network(input).expect("parse_network");
         assert_eq!(rx, 18_446_744_073_709_551_000);
         assert_eq!(tx, 18_446_744_073_709_551_000);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // A compromised server can return anything between the
+        // separators; the parsers must never panic on arbitrary input.
+        // The strategy includes newlines (`[\s\S]`, not `.`) so the
+        // line-oriented parse paths past the early guards are exercised.
+        #[test]
+        fn parsers_never_panic(s in "[\\s\\S]{0,256}") {
+            let _ = parse_cpu(&s);
+            let _ = parse_memory(&s);
+            let _ = parse_disk(&s);
+            let _ = parse_network(&s);
+        }
     }
 }

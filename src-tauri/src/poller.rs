@@ -27,7 +27,7 @@ use crate::TrayState;
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
-const BACKOFF_DURATION: Duration = Duration::from_secs(120);
+const BACKOFF_DURATION: Duration = Duration::from_mins(2);
 
 struct FailureState {
     count: u32,
@@ -411,26 +411,34 @@ async fn collect_with_entry(
     mut entry: BackendEntry,
     server: &ServerConfig,
 ) -> (BackendEntry, Result<Vec<ServerMetrics>, String>) {
-    let result = match (&mut entry, server) {
+    // The two backends return distinct typed errors; this internal
+    // boundary flattens each to a chain-rendered String (the only thing
+    // the poll loop does with it is log it / mark the server offline).
+    let result: Result<Vec<ServerMetrics>, String> = match (&mut entry, server) {
         (BackendEntry::Ssh(backend), ServerConfig::Ssh { name, .. }) => {
             if !backend.is_connected() {
                 if let Err(e) = backend.connect().await {
                     backend.disconnect().await;
-                    return (entry, Err(e));
+                    return (entry, Err(crate::error::error_chain(&e)));
                 }
             }
             let result = backend.collect_metrics(name).await;
             if result.is_err() {
                 backend.disconnect().await;
             }
-            result.map(|m| vec![m])
+            result
+                .map(|m| vec![m])
+                .map_err(|e| crate::error::error_chain(&e))
         }
         (
             BackendEntry::K8s(backend),
             ServerConfig::K8s {
                 name, namespace, ..
             },
-        ) => backend.collect_all(name, namespace).await,
+        ) => backend
+            .collect_all(name, namespace)
+            .await
+            .map_err(|e| crate::error::error_chain(&e)),
         _ => Err("backend type mismatch".to_string()),
     };
     (entry, result)

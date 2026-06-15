@@ -8,6 +8,7 @@ Observer Ward lives in your menu bar, polling your infrastructure at configurabl
 
 - **Kubernetes monitoring** -- cluster-level and per-pod metrics via the Metrics API
 - **SSH server monitoring** -- collects CPU, memory, disk, and network stats over SSH
+- **Grafana alerts** -- pulls currently-firing alerts from a self-hosted Grafana and shows them in the tray, with severity-colored rows and native notifications
 - **Tray-native** -- no dock icon, click the tray to open, click away to dismiss
 - **Pod details** -- status badges, restart counts, age, PVC usage, recent events
 - **Failure backoff** -- unreachable servers back off automatically to avoid noise
@@ -89,6 +90,17 @@ Requirements:
 Requirements:
 - Key-based authentication (password auth is not supported)
 - The remote server must have `top`, `free`, `df`, and `/proc/net/dev` available (standard on Linux)
+
+### Connecting Grafana alerts
+
+1. In Grafana, create a service-account token (Administration -> Users and access -> Service accounts) with permission to read alerts.
+2. In Observer Ward, open Settings (gear icon) and enable **Grafana alerts**.
+3. Enter your Grafana **URL** (e.g. `https://grafana.internal`) and paste the **API token**.
+4. Save. Active alerts appear within one poll cycle.
+
+The token is stored in the OS keychain, never in `config.json`. Observer Ward only reads alerts (it never modifies or silences them) and polls outbound, so it works from a laptop that Grafana cannot reach directly. Alerts must be Grafana-managed (the integration reads `/api/alertmanager/grafana/api/v2/alerts`).
+
+To change or rotate the API token later, toggle the Grafana connection off and Save, then on and Save again (or restart the app): the connection's cached client only rebuilds when the URL or enabled state changes, so re-entering the token alone needs the toggle to take effect.
 
 ### Settings
 

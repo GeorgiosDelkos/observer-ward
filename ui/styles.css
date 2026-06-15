@@ -1129,3 +1129,123 @@ body {
   }
 }
 
+/* Grafana Alerts */
+
+.alerts-section {
+  margin: 0 0 8px;
+  padding: 0 12px;
+}
+
+.alerts-section.hidden {
+  display: none;
+}
+
+.alerts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 4px 0;
+}
+
+.alerts-title {
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: rgba(0, 255, 240, 0.7);
+}
+
+.alerts-status {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.alerts-status.error {
+  color: rgba(255, 45, 111, 0.9);
+}
+
+.alerts-empty {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.4);
+  padding: 4px 0;
+}
+
+.alert-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+
+.alert-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.alert-row.suppressed {
+  opacity: 0.5;
+}
+
+.alert-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.alert-row.sev-crit {
+  border-left-color: #ff2d6f;
+}
+.alert-row.sev-crit .alert-dot {
+  background: #ff2d6f;
+}
+.alert-row.sev-warn {
+  border-left-color: #ffb800;
+}
+.alert-row.sev-warn .alert-dot {
+  background: #ffb800;
+}
+.alert-row.sev-info {
+  border-left-color: #00fff0;
+}
+.alert-row.sev-info .alert-dot {
+  background: #00fff0;
+}
+
+.alert-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.alert-name {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.alert-summary {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.alert-age {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  flex-shrink: 0;
+}
+
+.settings-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 8px 0;
+}
+

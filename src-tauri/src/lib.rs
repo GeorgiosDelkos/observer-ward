@@ -303,13 +303,12 @@ fn delete_grafana_token(name: String) -> Result<(), String> {
     reason = "tauri::command macro requires owned parameters"
 )]
 fn open_url(url: String) -> Result<(), String> {
-    // Only http(s) — refuse file://, custom schemes, or app launches.
-    // The URL is passed to `open` as a single argv entry (no shell), so
-    // query-string characters cannot be interpreted as shell syntax;
-    // scheme validation is the only check needed.
-    // Scheme is case-insensitive per RFC 3986; lowercase a copy only for
-    // the guard and pass the original url (path/query case preserved) to
-    // `open`. http(s) only — refuse file://, custom schemes, app launches.
+    // http(s) only — refuse file://, custom schemes, or app launches. The
+    // URL is passed to `open` as a single argv entry (no shell), so
+    // query-string characters cannot be interpreted as shell syntax; scheme
+    // validation is the only check needed. Scheme is case-insensitive per
+    // RFC 3986, so lowercase a copy for the guard while passing the original
+    // url (path/query case preserved) to `open`.
     let scheme_ok = {
         let lower = url.to_ascii_lowercase();
         lower.starts_with("https://") || lower.starts_with("http://")

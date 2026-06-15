@@ -1,7 +1,7 @@
 mod config;
 mod error;
 mod k8s_backend;
-mod metrics;
+pub mod metrics;
 mod poller;
 mod ssh_backend;
 

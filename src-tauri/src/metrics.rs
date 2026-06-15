@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerMetrics {
@@ -51,6 +53,7 @@ pub enum MetricLevel {
     Crit,
 }
 
+#[must_use]
 pub fn classify_level(percent: f64) -> MetricLevel {
     if percent >= 85.0 {
         MetricLevel::Crit
@@ -61,6 +64,7 @@ pub fn classify_level(percent: f64) -> MetricLevel {
     }
 }
 
+#[must_use]
 pub fn worst_level(metrics: &[ServerMetrics]) -> MetricLevel {
     metrics
         .iter()
@@ -71,6 +75,7 @@ pub fn worst_level(metrics: &[ServerMetrics]) -> MetricLevel {
         .unwrap_or(MetricLevel::Ok)
 }
 
+#[must_use]
 pub fn has_restarts(metrics: &[ServerMetrics]) -> bool {
     metrics
         .iter()
@@ -82,6 +87,103 @@ pub fn has_restarts(metrics: &[ServerMetrics]) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsUpdate {
     pub servers: Vec<ServerMetrics>,
+}
+
+/// Severity of a Grafana alert, derived from the conventional
+/// `severity` label. A missing or unrecognized label maps to
+/// `Unknown` so an alert is never silently dropped for lacking the
+/// label.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertSeverity {
+    Critical,
+    Warning,
+    Info,
+    Unknown,
+}
+
+impl AlertSeverity {
+    /// Parse the `severity` label value, case-insensitively.
+    #[must_use]
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value.map(str::to_ascii_lowercase).as_deref() {
+            Some("critical") => AlertSeverity::Critical,
+            Some("warning") => AlertSeverity::Warning,
+            Some("info") => AlertSeverity::Info,
+            _ => AlertSeverity::Unknown,
+        }
+    }
+}
+
+/// Whether an alert is actively firing or suppressed (silenced or
+/// inhibited in Grafana). Suppressed alerts are shown but do not raise
+/// the tray level or fire notifications.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertState {
+    Active,
+    Suppressed,
+}
+
+/// A single Grafana alert as displayed by the app. `fingerprint` is
+/// Grafana's stable per-alert identity, used as the notification dedup
+/// key across poll cycles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Alert {
+    pub fingerprint: String,
+    pub name: String,
+    pub severity: AlertSeverity,
+    pub state: AlertState,
+    pub summary: String,
+    pub description: String,
+    pub starts_at: String,
+    pub labels: BTreeMap<String, String>,
+    pub generator_url: Option<String>,
+}
+
+/// Event payload sent to the frontend via `app.emit("alerts-update", ...)`.
+/// `source_error` is `Some` when the fetch failed, so the UI can show an
+/// "unreachable" state instead of a stale list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsUpdate {
+    pub alerts: Vec<Alert>,
+    pub source_error: Option<String>,
+}
+
+/// Map an alert severity onto the tray-icon metric level so Grafana
+/// alerts and self-collected metrics share one visual scale.
+#[must_use]
+pub fn severity_to_level(severity: AlertSeverity) -> MetricLevel {
+    match severity {
+        AlertSeverity::Critical => MetricLevel::Crit,
+        AlertSeverity::Warning => MetricLevel::Warn,
+        AlertSeverity::Info | AlertSeverity::Unknown => MetricLevel::Ok,
+    }
+}
+
+/// Worst tray level across the active (non-suppressed) alerts.
+#[must_use]
+pub fn worst_alert_level(alerts: &[Alert]) -> MetricLevel {
+    alerts
+        .iter()
+        .filter(|a| a.state == AlertState::Active)
+        .map(|a| severity_to_level(a.severity))
+        .max()
+        .unwrap_or(MetricLevel::Ok)
+}
+
+/// Active alert fingerprints present now but absent from `prev` — the
+/// set that should raise a fresh notification this cycle. Suppressed
+/// alerts never appear here.
+#[must_use]
+pub fn newly_firing<'a, S: BuildHasher>(
+    prev: &std::collections::HashSet<String, S>,
+    alerts: &'a [Alert],
+) -> Vec<&'a Alert> {
+    alerts
+        .iter()
+        .filter(|a| a.state == AlertState::Active && !prev.contains(&a.fingerprint))
+        .collect()
 }
 
 #[cfg(test)]
@@ -420,5 +522,101 @@ mod tests {
     #[test]
     fn has_restarts_empty_is_false() {
         assert!(!has_restarts(&[]));
+    }
+
+    #[test]
+    fn severity_from_label_parses_known_values() {
+        assert_eq!(
+            AlertSeverity::from_label(Some("critical")),
+            AlertSeverity::Critical
+        );
+        assert_eq!(
+            AlertSeverity::from_label(Some("warning")),
+            AlertSeverity::Warning
+        );
+        assert_eq!(AlertSeverity::from_label(Some("info")), AlertSeverity::Info);
+        assert_eq!(
+            AlertSeverity::from_label(Some("CRITICAL")),
+            AlertSeverity::Critical
+        );
+        assert_eq!(
+            AlertSeverity::from_label(Some("page")),
+            AlertSeverity::Unknown
+        );
+        assert_eq!(AlertSeverity::from_label(None), AlertSeverity::Unknown);
+    }
+
+    #[test]
+    fn severity_to_level_maps_to_tray_levels() {
+        assert_eq!(
+            severity_to_level(AlertSeverity::Critical),
+            MetricLevel::Crit
+        );
+        assert_eq!(severity_to_level(AlertSeverity::Warning), MetricLevel::Warn);
+        assert_eq!(severity_to_level(AlertSeverity::Info), MetricLevel::Ok);
+        assert_eq!(severity_to_level(AlertSeverity::Unknown), MetricLevel::Ok);
+    }
+
+    fn make_alert(fingerprint: &str, severity: AlertSeverity, state: AlertState) -> Alert {
+        Alert {
+            fingerprint: fingerprint.to_string(),
+            name: "Test".to_string(),
+            severity,
+            state,
+            summary: String::new(),
+            description: String::new(),
+            starts_at: String::new(),
+            labels: std::collections::BTreeMap::new(),
+            generator_url: None,
+        }
+    }
+
+    #[test]
+    fn worst_alert_level_picks_highest_active() {
+        let alerts = vec![
+            make_alert("a", AlertSeverity::Warning, AlertState::Active),
+            make_alert("b", AlertSeverity::Critical, AlertState::Active),
+        ];
+        assert_eq!(worst_alert_level(&alerts), MetricLevel::Crit);
+    }
+
+    #[test]
+    fn worst_alert_level_skips_suppressed() {
+        let alerts = vec![make_alert(
+            "a",
+            AlertSeverity::Critical,
+            AlertState::Suppressed,
+        )];
+        assert_eq!(worst_alert_level(&alerts), MetricLevel::Ok);
+    }
+
+    #[test]
+    fn worst_alert_level_empty_is_ok() {
+        assert_eq!(worst_alert_level(&[]), MetricLevel::Ok);
+    }
+
+    #[test]
+    fn newly_firing_returns_only_new_active_alerts() {
+        let mut prev = std::collections::HashSet::new();
+        prev.insert("known".to_string());
+        let alerts = vec![
+            make_alert("known", AlertSeverity::Critical, AlertState::Active),
+            make_alert("fresh", AlertSeverity::Warning, AlertState::Active),
+            make_alert("muted", AlertSeverity::Critical, AlertState::Suppressed),
+        ];
+        let fired: Vec<&str> = newly_firing(&prev, &alerts)
+            .iter()
+            .map(|a| a.fingerprint.as_str())
+            .collect();
+        assert_eq!(fired, vec!["fresh"]);
+    }
+
+    #[test]
+    fn alert_serializes_enums_lowercase() {
+        let alert = make_alert("fp", AlertSeverity::Critical, AlertState::Active);
+        let json = serde_json::to_string(&alert).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["severity"], "critical");
+        assert_eq!(v["state"], "active");
     }
 }

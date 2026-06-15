@@ -16,14 +16,15 @@ struct TrayIcons {
     restart: Image<'static>,
 }
 
+use crate::TrayState;
 use crate::config::{AppConfig, ServerConfig};
+use crate::grafana_backend::{GrafanaBackend, read_token};
 use crate::k8s_backend::K8sBackend;
 use crate::metrics::{
-    classify_level, has_restarts, worst_level, MetricLevel, MetricsUpdate, ServerMetrics,
-    ServerStatus,
+    Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel, MetricsUpdate, ServerMetrics,
+    ServerStatus, classify_level, has_restarts, newly_firing, worst_alert_level, worst_level,
 };
 use crate::ssh_backend::SshBackend;
-use crate::TrayState;
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
@@ -48,6 +49,8 @@ pub struct Poller {
     k8s_backends: HashMap<String, K8sBackend>,
     failures: HashMap<String, FailureState>,
     prev_levels: HashMap<String, [MetricLevel; 3]>,
+    grafana_backend: Option<GrafanaBackend>,
+    prev_alert_fingerprints: HashSet<String>,
     tray_icons: Option<TrayIcons>,
     prev_tray_state: Option<(MetricLevel, bool)>,
 }
@@ -69,6 +72,8 @@ impl Poller {
             k8s_backends: HashMap::new(),
             failures: HashMap::new(),
             prev_levels: HashMap::new(),
+            grafana_backend: None,
+            prev_alert_fingerprints: HashSet::new(),
             tray_icons,
             prev_tray_state: None,
         }
@@ -108,6 +113,7 @@ impl Poller {
             let background_interval = config.background_poll_secs.max(30);
             let servers = config.servers;
             let notifications_enabled = config.notifications_enabled;
+            let grafana_cfg = config.grafana.clone();
 
             self.cleanup_removed_backends(&servers);
 
@@ -125,7 +131,19 @@ impl Poller {
             }
 
             self.check_and_notify(notifications_enabled, &update.servers);
-            self.update_tray_icon(&update.servers);
+
+            let alerts = if let Some(alerts_update) = self.poll_grafana(grafana_cfg.as_ref()).await
+            {
+                if let Err(e) = self.app_handle.emit("alerts-update", &alerts_update) {
+                    tracing::warn!("failed to emit alerts-update: {e}");
+                }
+                self.notify_new_alerts(notifications_enabled, &alerts_update.alerts);
+                alerts_update.alerts
+            } else {
+                Vec::new()
+            };
+
+            self.update_tray_icon(&update.servers, &alerts);
 
             let interval = if self.is_visible.load(Ordering::Acquire) {
                 foreground_interval
@@ -277,12 +295,12 @@ impl Poller {
         state.last_attempt = Instant::now();
     }
 
-    fn update_tray_icon(&mut self, metrics: &[ServerMetrics]) {
+    fn update_tray_icon(&mut self, metrics: &[ServerMetrics], alerts: &[Alert]) {
         let Some(icons) = &self.tray_icons else {
             return;
         };
 
-        let level = worst_level(metrics);
+        let level = worst_level(metrics).max(worst_alert_level(alerts));
         let restarts = has_restarts(metrics);
 
         let Some(state) = self.app_handle.try_state::<TrayState>() else {
@@ -388,6 +406,108 @@ impl Poller {
             .show()
         {
             tracing::warn!("failed to send notification for {server_name}: {e}");
+        }
+    }
+
+    /// Poll Grafana for active alerts. Returns `None` when no Grafana
+    /// connection is configured or it is disabled (in which case any
+    /// cached backend and notification state are cleared). Network and
+    /// auth failures are returned as an `AlertsUpdate` carrying a
+    /// `source_error`, never as a panic.
+    async fn poll_grafana(
+        &mut self,
+        grafana: Option<&crate::config::GrafanaConfig>,
+    ) -> Option<AlertsUpdate> {
+        let Some(cfg) = grafana.filter(|c| c.enabled) else {
+            self.grafana_backend = None;
+            self.prev_alert_fingerprints.clear();
+            return None;
+        };
+
+        let needs_rebuild = self
+            .grafana_backend
+            .as_ref()
+            .is_none_or(|b| !b.matches_config(cfg));
+        if needs_rebuild {
+            let token = match read_token(&cfg.name) {
+                Ok(token) => token,
+                Err(e) => {
+                    return Some(AlertsUpdate {
+                        alerts: Vec::new(),
+                        source_error: Some(crate::error::error_chain(&e)),
+                    });
+                }
+            };
+            match GrafanaBackend::new(cfg, token) {
+                Ok(backend) => self.grafana_backend = Some(backend),
+                Err(e) => {
+                    return Some(AlertsUpdate {
+                        alerts: Vec::new(),
+                        source_error: Some(crate::error::error_chain(&e)),
+                    });
+                }
+            }
+        }
+
+        let backend = self.grafana_backend.as_ref()?;
+        match tokio::time::timeout(COLLECT_TIMEOUT, backend.fetch_alerts()).await {
+            Ok(Ok(alerts)) => Some(AlertsUpdate {
+                alerts,
+                source_error: None,
+            }),
+            Ok(Err(e)) => Some(AlertsUpdate {
+                alerts: Vec::new(),
+                source_error: Some(crate::error::error_chain(&e)),
+            }),
+            Err(_) => Some(AlertsUpdate {
+                alerts: Vec::new(),
+                source_error: Some("timed out fetching Grafana alerts".to_string()),
+            }),
+        }
+    }
+
+    fn notify_new_alerts(&mut self, enabled: bool, alerts: &[Alert]) {
+        if enabled {
+            for alert in newly_firing(&self.prev_alert_fingerprints, alerts) {
+                self.send_alert_notification(alert);
+            }
+        }
+        // Track the current active set even when notifications are
+        // disabled, so re-enabling them does not replay the whole backlog
+        // as "new". (Deliberately stronger than check_and_notify, which
+        // resets on recovery.)
+        self.prev_alert_fingerprints = alerts
+            .iter()
+            .filter(|a| a.state == AlertState::Active)
+            .map(|a| a.fingerprint.clone())
+            .collect();
+    }
+
+    fn send_alert_notification(&self, alert: &Alert) {
+        use tauri_plugin_notification::NotificationExt;
+
+        let severity = match alert.severity {
+            AlertSeverity::Critical => "CRITICAL",
+            AlertSeverity::Warning => "WARNING",
+            AlertSeverity::Info => "INFO",
+            AlertSeverity::Unknown => "ALERT",
+        };
+        let title = format!("Grafana {severity}: {}", alert.name);
+        let body = if alert.summary.is_empty() {
+            alert.name.clone()
+        } else {
+            alert.summary.clone()
+        };
+
+        if let Err(e) = self
+            .app_handle
+            .notification()
+            .builder()
+            .title(&title)
+            .body(&body)
+            .show()
+        {
+            tracing::warn!("failed to send alert notification: {e}");
         }
     }
 

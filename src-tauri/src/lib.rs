@@ -1,8 +1,8 @@
 mod config;
 mod error;
-pub mod grafana_backend;
+mod grafana_backend;
 mod k8s_backend;
-pub mod metrics;
+mod metrics;
 mod poller;
 mod ssh_backend;
 

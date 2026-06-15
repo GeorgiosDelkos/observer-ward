@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod grafana_backend;
 mod k8s_backend;
 mod metrics;
 mod poller;
@@ -257,6 +258,71 @@ fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> 
         .map_err(|e| format!("clipboard write failed: {e}"))
 }
 
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned parameters"
+)]
+fn set_grafana_token(name: String, token: String) -> Result<(), String> {
+    let entry = keyring_core::Entry::new(grafana_backend::KEYCHAIN_SERVICE, &name)
+        .map_err(|e| format!("keychain error: {e}"))?;
+    entry
+        .set_password(&token)
+        .map_err(|e| format!("keychain write failed: {e}"))
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned parameters"
+)]
+fn has_grafana_token(name: String) -> bool {
+    // Returns false on any error (missing token or keychain failure); the
+    // UI only needs "is it configured", and never reads the secret back.
+    grafana_backend::read_token(&name).is_ok()
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned parameters"
+)]
+fn delete_grafana_token(name: String) -> Result<(), String> {
+    let entry = keyring_core::Entry::new(grafana_backend::KEYCHAIN_SERVICE, &name)
+        .map_err(|e| format!("keychain error: {e}"))?;
+    match entry.delete_credential() {
+        // Deleting a token that was never stored is a no-op success.
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete failed: {e}")),
+    }
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned parameters"
+)]
+fn open_url(url: String) -> Result<(), String> {
+    // http(s) only — refuse file://, custom schemes, or app launches. The
+    // URL is passed to `open` as a single argv entry (no shell), so
+    // query-string characters cannot be interpreted as shell syntax; scheme
+    // validation is the only check needed. Scheme is case-insensitive per
+    // RFC 3986, so lowercase a copy for the guard while passing the original
+    // url (path/query case preserved) to `open`.
+    let scheme_ok = {
+        let lower = url.to_ascii_lowercase();
+        lower.starts_with("https://") || lower.starts_with("http://")
+    };
+    if !scheme_ok {
+        return Err("url must be http(s)".to_string());
+    }
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("failed to open url: {e}"))?;
+    Ok(())
+}
+
 fn setup_tray_and_window(
     app: &App,
     is_visible: &Arc<AtomicBool>,
@@ -383,6 +449,14 @@ fn setup_tray_and_window(
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // keyring v4 requires a credential store to be registered before any
+    // Entry operation; register the platform-native store (macOS Keychain)
+    // once at startup. A failure here only disables Grafana token storage —
+    // the rest of the app still works — so log and continue.
+    if let Err(e) = keyring::use_native_store(false) {
+        tracing::warn!("failed to initialize keychain store: {e}");
+    }
+
     let initial_config = config::load_config().unwrap_or_default();
     let config_arc = Arc::new(Mutex::new(initial_config));
     let is_window_visible = Arc::new(AtomicBool::new(false));
@@ -407,6 +481,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             open_ssh_terminal,
             open_pod_logs,
             copy_to_clipboard,
+            set_grafana_token,
+            has_grafana_token,
+            delete_grafana_token,
+            open_url,
         ])
         .setup(move |app| {
             setup_tray_and_window(app, &is_window_visible, &poll_wake)?;

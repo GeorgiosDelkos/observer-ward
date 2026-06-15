@@ -890,6 +890,26 @@ const bgIntervalInput = document.getElementById("bg-interval");
 const autostartToggle = document.getElementById("autostart-toggle");
 const notificationsToggle = document.getElementById("notifications-toggle");
 
+const alertsSection = document.getElementById("alerts-section");
+const alertsList = document.getElementById("alerts-list");
+const alertsStatus = document.getElementById("alerts-status");
+const grafanaEnabledToggle = document.getElementById("grafana-enabled");
+const grafanaUrlInput = document.getElementById("grafana-url");
+const grafanaVerifyTlsToggle = document.getElementById("grafana-verify-tls");
+const grafanaTokenInput = document.getElementById("grafana-token");
+
+const GRAFANA_CONN_NAME = "default";
+
+function alertSeverityClass(severity) {
+  if (severity === "critical") {
+    return "sev-crit";
+  }
+  if (severity === "warning") {
+    return "sev-warn";
+  }
+  return "sev-info";
+}
+
 async function openSettings() {
   fgIntervalInput.classList.remove("input-error");
   bgIntervalInput.classList.remove("input-error");
@@ -898,6 +918,19 @@ async function openSettings() {
     fgIntervalInput.value = config.foreground_poll_secs ?? 10;
     bgIntervalInput.value = config.background_poll_secs ?? 300;
     notificationsToggle.checked = config.notifications_enabled ?? false;
+    const grafana = config.grafana || null;
+    grafanaEnabledToggle.checked = !!(grafana && grafana.enabled);
+    grafanaUrlInput.value = grafana ? grafana.url : "";
+    grafanaVerifyTlsToggle.checked = grafana ? grafana.verify_tls !== false : true;
+    grafanaTokenInput.value = "";
+    try {
+      const hasToken = await invoke("has_grafana_token", { name: GRAFANA_CONN_NAME });
+      grafanaTokenInput.placeholder = hasToken
+        ? "(stored; leave blank to keep)"
+        : "paste service-account token";
+    } catch (err) {
+      console.error("Failed to check Grafana token:", err);
+    }
   } catch (err) {
     console.error("Failed to load config for settings:", err);
   }
@@ -947,7 +980,30 @@ async function saveSettings() {
     config.foreground_poll_secs = fgInterval;
     config.background_poll_secs = bgInterval;
     config.notifications_enabled = notificationsToggle.checked;
+    const grafanaEnabled = grafanaEnabledToggle.checked;
+    const grafanaUrl = grafanaUrlInput.value.trim();
+    if (grafanaUrl) {
+      config.grafana = {
+        name: GRAFANA_CONN_NAME,
+        url: grafanaUrl,
+        verify_tls: grafanaVerifyTlsToggle.checked,
+        enabled: grafanaEnabled,
+      };
+    } else {
+      config.grafana = null;
+    }
+    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
     await invoke("save_config_cmd", { newConfig: config });
+    const tokenValue = grafanaTokenInput.value.trim();
+    if (tokenValue) {
+      await invoke("set_grafana_token", {
+        name: GRAFANA_CONN_NAME,
+        token: tokenValue,
+      });
+    }
+    if (!grafanaConfigured) {
+      alertsSection.classList.add("hidden");
+    }
   } catch (err) {
     console.error("Failed to save settings:", err);
   }
@@ -1101,12 +1157,81 @@ function handleMetricsUpdate(event) {
   renderAll();
 }
 
+// Grafana Alerts
+
+let grafanaConfigured = false;
+
+function renderAlertRow(alert) {
+  const sevClass = alertSeverityClass(alert.severity);
+  const suppressed = alert.state === "suppressed" ? " suppressed" : "";
+  const age = formatAge(alert.starts_at);
+  const ageHtml = age ? `<span class="alert-age">${age}</span>` : "";
+  const summary = alert.summary || alert.name;
+  const url = alert.generator_url || "";
+  return `
+    <div class="alert-row ${sevClass}${suppressed}"
+         data-alert-url="${escapeHtml(url)}">
+      <span class="alert-dot"></span>
+      <div class="alert-text">
+        <span class="alert-name">${escapeHtml(alert.name)}</span>
+        <span class="alert-summary">${escapeHtml(summary)}</span>
+      </div>
+      ${ageHtml}
+    </div>`;
+}
+
+function handleAlertsUpdate(event) {
+  const payload = event.payload;
+  if (!payload) {
+    return;
+  }
+
+  if (!grafanaConfigured) {
+    alertsSection.classList.add("hidden");
+    resizeToContent();
+    return;
+  }
+  alertsSection.classList.remove("hidden");
+
+  if (payload.source_error) {
+    alertsStatus.textContent = "unreachable";
+    alertsStatus.classList.add("error");
+    alertsList.innerHTML =
+      `<div class="alerts-empty">${escapeHtml(payload.source_error)}</div>`;
+    resizeToContent();
+    return;
+  }
+
+  alertsStatus.classList.remove("error");
+  const alerts = Array.isArray(payload.alerts) ? payload.alerts : [];
+  const rank = { critical: 0, warning: 1, info: 2, unknown: 3 };
+  alerts.sort((a, b) => {
+    const sa = a.state === "suppressed" ? 10 : 0;
+    const sb = b.state === "suppressed" ? 10 : 0;
+    return (sa + (rank[a.severity] ?? 3)) - (sb + (rank[b.severity] ?? 3));
+  });
+
+  const active = alerts.filter((a) => a.state !== "suppressed").length;
+  alertsStatus.textContent = active > 0 ? `${active} firing` : "all clear";
+
+  if (alerts.length === 0) {
+    alertsList.innerHTML = '<div class="alerts-empty">No active alerts</div>';
+  } else {
+    alertsList.innerHTML = alerts.map(renderAlertRow).join("");
+  }
+  resizeToContent();
+}
+
 // ── Init ──────────────────────────────────────
 
 async function init() {
   try {
     const config = await invoke("get_config");
     servers = config.servers;
+    grafanaConfigured = !!(config.grafana && config.grafana.enabled);
+    if (!grafanaConfigured) {
+      alertsSection.classList.add("hidden");
+    }
     renderAll();
   } catch (err) {
     console.error("Failed to load config:", err);
@@ -1118,6 +1243,7 @@ async function init() {
     syncLabel.classList.add("visible");
   });
   await listen("metrics-update", handleMetricsUpdate);
+  await listen("alerts-update", handleAlertsUpdate);
 }
 
 // ── Event Bindings ────────────────────────────
@@ -1171,6 +1297,18 @@ serverListEl.addEventListener("click", (e) => {
     collapsedClusters.add(cluster);
   }
   renderAll();
+});
+
+alertsList.addEventListener("click", (e) => {
+  const row = e.target.closest(".alert-row");
+  if (!row) {
+    return;
+  }
+  const url = row.dataset.alertUrl;
+  if (url) {
+    invoke("open_url", { url }).catch((err) =>
+      console.error("Failed to open alert URL:", err));
+  }
 });
 
 serverListEl.addEventListener("contextmenu", (e) => {

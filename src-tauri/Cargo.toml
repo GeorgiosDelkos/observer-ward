@@ -32,6 +32,20 @@ tauri-plugin-notification = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2"
+# Direct HTTP client for the Grafana alerts API. rustls-tls (not the
+# default native-tls) matches kube's TLS backend so the build links one
+# TLS stack, not two. default-features = false drops the unused native-tls
+# default; a plain GET needs none of the dropped features.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# OS keychain for the Grafana service-account token (a secret, so it is
+# never written to config.json). keyring v4 selects the platform-native
+# backend automatically at compile time (no feature flags needed); on
+# macOS this is the Security framework Keychain.
+keyring = "4"
+# keyring-core is the sub-crate that owns the Error type; keyring v4
+# re-uses it but does not re-export it, so we depend on it directly to
+# reference keyring_core::Error in GrafanaError.
+keyring-core = "1"
 
 [dev-dependencies]
 tempfile = "3.25"

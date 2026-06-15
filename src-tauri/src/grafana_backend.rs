@@ -165,6 +165,9 @@ impl GrafanaBackend {
         self.base_url == config.url && self.verify_tls == config.verify_tls
     }
 
+    /// The Grafana-embedded Alertmanager alerts endpoint (note the
+    /// `/api/alertmanager/grafana/...` prefix — NOT the raw Alertmanager
+    /// `/api/v2/alerts` path).
     fn alerts_url(&self) -> String {
         format!(
             "{}/api/alertmanager/grafana/api/v2/alerts",

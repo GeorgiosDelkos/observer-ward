@@ -16,15 +16,16 @@ struct TrayIcons {
     restart: Image<'static>,
 }
 
-use crate::TrayState;
 use crate::config::{AppConfig, ServerConfig};
-use crate::grafana_backend::{GrafanaBackend, read_token};
+use crate::grafana_backend::{read_token, GrafanaBackend};
 use crate::k8s_backend::K8sBackend;
 use crate::metrics::{
-    Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel, MetricsUpdate, ServerMetrics,
-    ServerStatus, classify_level, has_restarts, newly_firing, worst_alert_level, worst_level,
+    classify_level, has_restarts, newly_firing, worst_alert_level, worst_level, Alert,
+    AlertSeverity, AlertState, AlertsUpdate, MetricLevel, MetricsUpdate, ServerMetrics,
+    ServerStatus,
 };
 use crate::ssh_backend::SshBackend;
+use crate::TrayState;
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;

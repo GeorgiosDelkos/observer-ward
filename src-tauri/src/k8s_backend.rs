@@ -12,6 +12,101 @@ use tokio::task::JoinSet;
 
 use crate::metrics::{ServerMetrics, ServerStatus};
 
+/// Failure categories for the Kubernetes backend. Each variant preserves
+/// its underlying cause in the source chain (axiom `rust_quality_57`);
+/// the poller flattens the chain only when logging.
+///
+/// `kube::Error` and `kube::config::KubeconfigError` are large (>128
+/// bytes), so they are boxed to keep `K8sError` — and therefore every
+/// `Result<_, K8sError>` on the happy path — small to move (axiom
+/// `rust_quality_151`, clippy `result_large_err`).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum K8sError {
+    #[error("failed to read kubeconfig {path}")]
+    ReadKubeconfig {
+        path: String,
+        #[source]
+        source: Box<kube::config::KubeconfigError>,
+    },
+    #[error("failed to read default kubeconfig")]
+    ReadDefaultKubeconfig(#[source] Box<kube::config::KubeconfigError>),
+    #[error("failed to build kube config for context {context}")]
+    BuildConfig {
+        context: String,
+        #[source]
+        source: Box<kube::config::KubeconfigError>,
+    },
+    #[error("failed to create kube client")]
+    CreateClient(#[source] Box<kube::Error>),
+    #[error("k8s client is not connected")]
+    NotConnected,
+    #[error("failed to list nodes")]
+    ListNodes(#[source] Box<kube::Error>),
+    #[error("failed to list events in namespace {namespace}")]
+    ListEvents {
+        namespace: String,
+        #[source]
+        source: Box<kube::Error>,
+    },
+    #[error("failed to list node metrics (is metrics-server installed?)")]
+    ListNodeMetrics(#[source] Box<kube::Error>),
+    #[error("failed to list pod metrics in namespace {namespace}")]
+    ListPodMetrics {
+        namespace: String,
+        #[source]
+        source: Box<kube::Error>,
+    },
+    #[error("failed to list pods in namespace {namespace}")]
+    ListPods {
+        namespace: String,
+        #[source]
+        source: Box<kube::Error>,
+    },
+    #[error("failed to build stats request for node {node}")]
+    BuildStatsRequest {
+        node: String,
+        #[source]
+        source: http::Error,
+    },
+    #[error("failed to fetch stats for node {node}")]
+    FetchNodeStats {
+        node: String,
+        #[source]
+        source: Box<kube::Error>,
+    },
+    #[error(transparent)]
+    Quantity(#[from] QuantityParseError),
+}
+
+/// Failure categories for parsing Kubernetes resource `Quantity` values.
+/// Carries the offending value and underlying numeric-parse cause as
+/// typed fields rather than a formatted string (axiom `rust_quality_63`).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum QuantityParseError {
+    #[error("invalid cpu quantity {value}")]
+    Cpu {
+        value: String,
+        #[source]
+        source: std::num::ParseFloatError,
+    },
+    #[error("invalid memory quantity {value}")]
+    MemoryInt {
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid memory quantity {value}")]
+    MemoryFloat {
+        value: String,
+        #[source]
+        source: std::num::ParseFloatError,
+    },
+    #[error("memory quantity {value} overflows u64")]
+    MemoryOverflow { value: String },
+}
+
 // -- Custom types for Metrics API (not in k8s-openapi) --
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -151,8 +246,8 @@ impl NetworkStats {
                 || n.starts_with("eno")
                 || n.starts_with("ens")
             {
-                rx += iface.rx_bytes.unwrap_or(0);
-                tx += iface.tx_bytes.unwrap_or(0);
+                rx = rx.saturating_add(iface.rx_bytes.unwrap_or(0));
+                tx = tx.saturating_add(iface.tx_bytes.unwrap_or(0));
             }
         }
         (rx, tx)
@@ -226,12 +321,16 @@ impl K8sBackend {
 
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
-    pub async fn connect(&mut self) -> Result<(), String> {
+    pub async fn connect(&mut self) -> Result<(), K8sError> {
         let kubeconfig = match &self.kubeconfig {
-            Some(path) => kube::config::Kubeconfig::read_from(path)
-                .map_err(|e| format!("failed to read kubeconfig '{path}': {e}"))?,
+            Some(path) => kube::config::Kubeconfig::read_from(path).map_err(|source| {
+                K8sError::ReadKubeconfig {
+                    path: path.clone(),
+                    source: Box::new(source),
+                }
+            })?,
             None => kube::config::Kubeconfig::read()
-                .map_err(|e| format!("failed to read default kubeconfig: {e}"))?,
+                .map_err(|source| K8sError::ReadDefaultKubeconfig(Box::new(source)))?,
         };
 
         let options = kube::config::KubeConfigOptions {
@@ -241,15 +340,13 @@ impl K8sBackend {
 
         let config = Config::from_custom_kubeconfig(kubeconfig, &options)
             .await
-            .map_err(|e| {
-                format!(
-                    "failed to build kube config for context '{}': {e}",
-                    self.context
-                )
+            .map_err(|source| K8sError::BuildConfig {
+                context: self.context.clone(),
+                source: Box::new(source),
             })?;
 
         let client =
-            Client::try_from(config).map_err(|e| format!("failed to create kube client: {e}"))?;
+            Client::try_from(config).map_err(|source| K8sError::CreateClient(Box::new(source)))?;
 
         self.client = Some(client);
         Ok(())
@@ -278,7 +375,7 @@ impl K8sBackend {
             match result {
                 Ok(Ok(summary)) => summaries.push(summary),
                 Ok(Err(e)) => {
-                    tracing::warn!("skipping node stats: {e}");
+                    tracing::warn!("skipping node stats: {}", crate::error::error_chain(&e));
                 }
                 Err(e) => {
                     tracing::warn!("node stats task panicked: {e}");
@@ -295,14 +392,15 @@ impl K8sBackend {
     pub async fn fetch_pod_events(
         client: &Client,
         namespace: &str,
-    ) -> Result<HashMap<String, String>, String> {
+    ) -> Result<HashMap<String, String>, K8sError> {
         let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
-        let events = events_api.list(&ListParams::default()).await.map_err(|e| {
-            format!(
-                "failed to list events in namespace \
-                     '{namespace}': {e}"
-            )
-        })?;
+        let events = events_api
+            .list(&ListParams::default())
+            .await
+            .map_err(|source| K8sError::ListEvents {
+                namespace: namespace.to_string(),
+                source: Box::new(source),
+            })?;
 
         let mut latest: HashMap<
             String,
@@ -357,12 +455,8 @@ impl K8sBackend {
         stats: &[StatsSummary],
         alloc_cpu: f64,
         alloc_mem: u64,
-    ) -> Result<ServerMetrics, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "k8s client not connected".to_string())?
-            .clone();
+    ) -> Result<ServerMetrics, K8sError> {
+        let client = self.client.as_ref().ok_or(K8sError::NotConnected)?.clone();
 
         let (cpu_used_cores, mem_used_bytes) = fetch_cpu_mem_usage(&client).await?;
 
@@ -451,12 +545,8 @@ impl K8sBackend {
         events: &HashMap<String, String>,
         cluster_cpu: f64,
         cluster_mem: u64,
-    ) -> Result<Vec<ServerMetrics>, String> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "k8s client not connected".to_string())?
-            .clone();
+    ) -> Result<Vec<ServerMetrics>, K8sError> {
+        let client = self.client.as_ref().ok_or(K8sError::NotConnected)?.clone();
 
         let metrics_api: Api<PodMetrics> = Api::namespaced(client.clone(), namespace);
         let pods_api: Api<Pod> = Api::namespaced(client, namespace);
@@ -465,17 +555,13 @@ impl K8sBackend {
         let (pod_metrics_result, pod_specs_result) =
             tokio::join!(metrics_api.list(&params), pods_api.list(&params),);
 
-        let pod_metrics_list = pod_metrics_result.map_err(|e| {
-            format!(
-                "failed to list pod metrics in namespace \
-                 '{namespace}': {e}"
-            )
+        let pod_metrics_list = pod_metrics_result.map_err(|source| K8sError::ListPodMetrics {
+            namespace: namespace.to_string(),
+            source: Box::new(source),
         })?;
-        let pod_specs = pod_specs_result.map_err(|e| {
-            format!(
-                "failed to list pods in namespace \
-                 '{namespace}': {e}"
-            )
+        let pod_specs = pod_specs_result.map_err(|source| K8sError::ListPods {
+            namespace: namespace.to_string(),
+            source: Box::new(source),
         })?;
 
         let pvc_map = extract_pod_pvc(stats, namespace);
@@ -502,7 +588,7 @@ impl K8sBackend {
                 Ok(m) => results.push(m),
                 Err(e) => {
                     let name = pm.metadata.name.as_deref().unwrap_or("unknown");
-                    tracing::warn!("skipping pod {name}: {e}");
+                    tracing::warn!("skipping pod {name}: {}", crate::error::error_chain(&e));
                 }
             }
         }
@@ -551,14 +637,12 @@ impl K8sBackend {
         &mut self,
         server_name: &str,
         namespace: &str,
-    ) -> Result<Vec<ServerMetrics>, String> {
+    ) -> Result<Vec<ServerMetrics>, K8sError> {
         if !self.is_connected() {
             self.connect().await?;
         }
 
-        let client = self
-            .client()
-            .ok_or_else(|| "k8s client not connected".to_string())?;
+        let client = self.client().ok_or(K8sError::NotConnected)?;
 
         let nodes = match fetch_nodes(&client).await {
             Ok(n) => n,
@@ -582,8 +666,8 @@ impl K8sBackend {
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
-                    "failed to fetch pod events \
-                     for {server_name}/{namespace}: {e}"
+                    "failed to fetch pod events for {server_name}/{namespace}: {}",
+                    crate::error::error_chain(&e)
                 );
                 HashMap::new()
             });
@@ -611,8 +695,8 @@ impl K8sBackend {
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
-                    "failed to collect pod metrics \
-                     for {server_name}/{namespace}: {e}"
+                    "failed to collect pod metrics for {server_name}/{namespace}: {}",
+                    crate::error::error_chain(&e)
                 );
                 Vec::new()
             });
@@ -638,7 +722,7 @@ fn build_pod_server_metrics(
     cluster_mem: u64,
     pvc_map: &HashMap<String, (u64, u64)>,
     events: &HashMap<String, String>,
-) -> Result<ServerMetrics, String> {
+) -> Result<ServerMetrics, K8sError> {
     let pod_name = pm.metadata.name.as_deref().unwrap_or("unknown");
     let pod = pod_index.get(pod_name).copied();
 
@@ -647,7 +731,7 @@ fn build_pod_server_metrics(
 
     for c in &pm.containers {
         cpu_used += parse_cpu_quantity(&c.usage.cpu)?;
-        mem_used += parse_memory_quantity(&c.usage.memory)?;
+        mem_used = mem_used.saturating_add(parse_memory_quantity(&c.usage.memory)?);
     }
 
     let (cpu_pct, mem_pct) =
@@ -806,18 +890,18 @@ fn container_override_reason(status: &k8s_openapi::api::core::v1::PodStatus) -> 
 }
 
 /// Fetch all cluster nodes from the API.
-async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, String> {
+async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, K8sError> {
     let nodes_api: Api<Node> = Api::all(client.clone());
     let nodes = nodes_api
         .list(&ListParams::default())
         .await
-        .map_err(|e| format!("failed to list nodes: {e}"))?;
+        .map_err(|source| K8sError::ListNodes(Box::new(source)))?;
     Ok(nodes.items)
 }
 
 /// Sum allocatable CPU (fractional cores) and memory (bytes)
 /// from the provided node list.
-fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), String> {
+fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), K8sError> {
     let mut total_cpu = 0.0_f64;
     let mut total_mem = 0_u64;
 
@@ -836,7 +920,7 @@ fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), String> {
         };
 
         total_cpu += parse_cpu_quantity(cpu_q)?;
-        total_mem += parse_memory_quantity(mem_q)?;
+        total_mem = total_mem.saturating_add(parse_memory_quantity(mem_q)?);
     }
 
     Ok((total_cpu, total_mem))
@@ -881,7 +965,7 @@ fn pod_allocations(pod: Option<&Pod>) -> (f64, u64) {
         }
         if let Some(q) = mem_q {
             if let Ok(v) = parse_memory_quantity(q) {
-                total_mem += v;
+                total_mem = total_mem.saturating_add(v);
             }
         }
     }
@@ -891,24 +975,19 @@ fn pod_allocations(pod: Option<&Pod>) -> (f64, u64) {
 
 /// Fetch total CPU (fractional cores) and memory (bytes)
 /// currently used across all nodes from the Metrics API.
-async fn fetch_cpu_mem_usage(client: &Client) -> Result<(f64, u64), String> {
+async fn fetch_cpu_mem_usage(client: &Client) -> Result<(f64, u64), K8sError> {
     let metrics_api: Api<NodeMetrics> = Api::all(client.clone());
     let node_metrics = metrics_api
         .list(&ListParams::default())
         .await
-        .map_err(|e| {
-            format!(
-                "failed to list node metrics (is metrics-server \
-             installed?): {e}"
-            )
-        })?;
+        .map_err(|source| K8sError::ListNodeMetrics(Box::new(source)))?;
 
     let mut total_cpu = 0.0_f64;
     let mut total_mem = 0_u64;
 
     for nm in &node_metrics {
         total_cpu += parse_cpu_quantity(&nm.usage.cpu)?;
-        total_mem += parse_memory_quantity(&nm.usage.memory)?;
+        total_mem = total_mem.saturating_add(parse_memory_quantity(&nm.usage.memory)?);
     }
 
     Ok((total_cpu, total_mem))
@@ -929,13 +1008,14 @@ fn compute_cluster_disk_net(summaries: &[StatsSummary]) -> (f64, u64, u64, u64, 
 
     for summary in summaries {
         if let Some(fs) = &summary.node.fs {
-            total_disk_used += fs.used_bytes.unwrap_or(0);
-            total_disk_capacity += fs.capacity_bytes.unwrap_or(0);
+            total_disk_used = total_disk_used.saturating_add(fs.used_bytes.unwrap_or(0));
+            total_disk_capacity =
+                total_disk_capacity.saturating_add(fs.capacity_bytes.unwrap_or(0));
         }
         if let Some(net) = &summary.node.network {
             let (rx, tx) = net.effective_bytes();
-            total_rx += rx;
-            total_tx += tx;
+            total_rx = total_rx.saturating_add(rx);
+            total_tx = total_tx.saturating_add(tx);
         }
     }
 
@@ -970,8 +1050,8 @@ fn extract_pod_pvc(summaries: &[StatsSummary], namespace: &str) -> HashMap<Strin
                     continue;
                 }
                 let entry = result.entry(pod.pod_ref.name.clone()).or_insert((0, 0));
-                entry.0 += vol.used_bytes.unwrap_or(0);
-                entry.1 += vol.capacity_bytes.unwrap_or(0);
+                entry.0 = entry.0.saturating_add(vol.used_bytes.unwrap_or(0));
+                entry.1 = entry.1.saturating_add(vol.capacity_bytes.unwrap_or(0));
             }
         }
     }
@@ -996,8 +1076,8 @@ fn extract_pod_network(summaries: &[StatsSummary], namespace: &str) -> HashMap<S
             };
             let (rx, tx) = net.effective_bytes();
             let entry = result.entry(pod.pod_ref.name.clone()).or_insert((0, 0));
-            entry.0 += rx;
-            entry.1 += tx;
+            entry.0 = entry.0.saturating_add(rx);
+            entry.1 = entry.1.saturating_add(tx);
         }
     }
 
@@ -1006,20 +1086,23 @@ fn extract_pod_network(summaries: &[StatsSummary], namespace: &str) -> HashMap<S
 
 /// Fetch the kubelet stats summary for a single node via the
 /// node proxy API.
-async fn fetch_node_stats(client: &Client, node_name: &str) -> Result<StatsSummary, String> {
+async fn fetch_node_stats(client: &Client, node_name: &str) -> Result<StatsSummary, K8sError> {
     let url = format!("/api/v1/nodes/{node_name}/proxy/stats/summary");
 
-    let request = http::Request::get(&url).body(Vec::new()).map_err(|e| {
-        format!(
-            "failed to build stats request for node \
-             '{node_name}': {e}"
-        )
-    })?;
+    let request = http::Request::get(&url)
+        .body(Vec::new())
+        .map_err(|source| K8sError::BuildStatsRequest {
+            node: node_name.to_string(),
+            source,
+        })?;
 
     client
         .request::<StatsSummary>(request)
         .await
-        .map_err(|e| format!("failed to fetch stats for node '{node_name}': {e}"))
+        .map_err(|source| K8sError::FetchNodeStats {
+            node: node_name.to_string(),
+            source: Box::new(source),
+        })
 }
 
 // -- Quantity parsers --
@@ -1028,19 +1111,20 @@ async fn fetch_node_stats(client: &Client, node_name: &str) -> Result<StatsSumma
 ///
 /// Handles nanocores ("100n"), millicores ("250m"), and whole
 /// cores ("2").
-fn parse_cpu_quantity(q: &Quantity) -> Result<f64, String> {
+fn parse_cpu_quantity(q: &Quantity) -> Result<f64, QuantityParseError> {
     let s = &q.0;
+    let cpu_err = |source| QuantityParseError::Cpu {
+        value: s.clone(),
+        source,
+    };
     if let Some(v) = s.strip_suffix('n') {
         v.parse::<f64>()
             .map(|n| n / 1_000_000_000.0)
-            .map_err(|e| format!("invalid cpu quantity '{s}': {e}"))
+            .map_err(cpu_err)
     } else if let Some(v) = s.strip_suffix('m') {
-        v.parse::<f64>()
-            .map(|n| n / 1000.0)
-            .map_err(|e| format!("invalid cpu quantity '{s}': {e}"))
+        v.parse::<f64>().map(|n| n / 1000.0).map_err(cpu_err)
     } else {
-        s.parse::<f64>()
-            .map_err(|e| format!("invalid cpu quantity '{s}': {e}"))
+        s.parse::<f64>().map_err(cpu_err)
     }
 }
 
@@ -1055,84 +1139,64 @@ fn parse_cpu_quantity(q: &Quantity) -> Result<f64, String> {
     reason = "memory quantities from K8s are always non-negative \
               and fit in u64"
 )]
-fn parse_memory_quantity(q: &Quantity) -> Result<u64, String> {
+fn parse_memory_quantity(q: &Quantity) -> Result<u64, QuantityParseError> {
     let s = &q.0;
-    let err = |e| format!("invalid memory quantity '{s}': {e}");
+    // Both closures capture `s` by shared reference, so they are `Copy`
+    // and may be reused across the loops below.
+    let int_err = |source| QuantityParseError::MemoryInt {
+        value: s.clone(),
+        source,
+    };
+    let float_err = |source| QuantityParseError::MemoryFloat {
+        value: s.clone(),
+        source,
+    };
 
-    // Binary suffixes (check before decimal — "Mi" before "M")
-    if let Some(v) = s.strip_suffix("Ki") {
-        return v.parse::<u64>().map(|n| n * 1024).map_err(err);
-    }
-    if let Some(v) = s.strip_suffix("Mi") {
-        return v.parse::<u64>().map(|n| n * 1024 * 1024).map_err(err);
-    }
-    if let Some(v) = s.strip_suffix("Gi") {
-        return v
-            .parse::<u64>()
-            .map(|n| n * 1024 * 1024 * 1024)
-            .map_err(err);
-    }
-    if let Some(v) = s.strip_suffix("Ti") {
-        return v
-            .parse::<u64>()
-            .map(|n| n * 1024 * 1024 * 1024 * 1024)
-            .map_err(err);
-    }
-    if let Some(v) = s.strip_suffix("Pi") {
-        return v
-            .parse::<u64>()
-            .map(|n| n * 1024 * 1024 * 1024 * 1024 * 1024)
-            .map_err(err);
-    }
-    if let Some(v) = s.strip_suffix("Ei") {
-        return v
-            .parse::<u64>()
-            .map(|n| n * 1024 * 1024 * 1024 * 1024 * 1024 * 1024)
-            .map_err(err);
+    // Binary suffixes (check before decimal — "Mi" before "M").
+    // `checked_mul` converts an overflowing product into a typed error
+    // rather than a debug-build panic / release-build silent wrap
+    // (axiom `rust_quality_113`). The factors 2^10..2^60 fit in u64; the
+    // product `n * factor` may not, which is exactly what we guard.
+    for (suffix, factor) in [
+        ("Ki", 1_u64 << 10),
+        ("Mi", 1_u64 << 20),
+        ("Gi", 1_u64 << 30),
+        ("Ti", 1_u64 << 40),
+        ("Pi", 1_u64 << 50),
+        ("Ei", 1_u64 << 60),
+    ] {
+        if let Some(v) = s.strip_suffix(suffix) {
+            let n: u64 = v.parse().map_err(int_err)?;
+            return n
+                .checked_mul(factor)
+                .ok_or_else(|| QuantityParseError::MemoryOverflow { value: s.clone() });
+        }
     }
 
-    // Decimal suffixes — parse as f64 to support fractional
-    // values like "1.5G"
-    let ferr = |e| format!("invalid memory quantity '{s}': {e}");
-    if let Some(v) = s.strip_suffix('k') {
-        return v.parse::<f64>().map(|n| (n * 1000.0) as u64).map_err(ferr);
-    }
-    if let Some(v) = s.strip_suffix('M') {
-        return v
-            .parse::<f64>()
-            .map(|n| (n * 1_000_000.0) as u64)
-            .map_err(ferr);
-    }
-    if let Some(v) = s.strip_suffix('G') {
-        return v
-            .parse::<f64>()
-            .map(|n| (n * 1_000_000_000.0) as u64)
-            .map_err(ferr);
-    }
-    if let Some(v) = s.strip_suffix('T') {
-        return v
-            .parse::<f64>()
-            .map(|n| (n * 1_000_000_000_000.0) as u64)
-            .map_err(ferr);
-    }
-    if let Some(v) = s.strip_suffix('P') {
-        return v
-            .parse::<f64>()
-            .map(|n| (n * 1_000_000_000_000_000.0) as u64)
-            .map_err(ferr);
-    }
-    if let Some(v) = s.strip_suffix('E') {
-        return v
-            .parse::<f64>()
-            .map(|n| (n * 1_000_000_000_000_000_000.0) as u64)
-            .map_err(ferr);
+    // Decimal suffixes — parse as f64 to support fractional values like
+    // "1.5G". The f64 -> u64 cast saturates (Rust 1.45+), so an enormous
+    // value clamps to u64::MAX instead of wrapping.
+    for (suffix, factor) in [
+        ('k', 1e3_f64),
+        ('M', 1e6),
+        ('G', 1e9),
+        ('T', 1e12),
+        ('P', 1e15),
+        ('E', 1e18),
+    ] {
+        if let Some(v) = s.strip_suffix(suffix) {
+            return v
+                .parse::<f64>()
+                .map(|n| (n * factor) as u64)
+                .map_err(float_err);
+        }
     }
 
-    // Plain bytes or exponent notation (e.g. "4096", "129e6")
+    // Plain bytes or exponent notation (e.g. "4096", "129e6").
     if let Ok(n) = s.parse::<u64>() {
         return Ok(n);
     }
-    s.parse::<f64>().map_err(ferr).map(|n| n as u64)
+    s.parse::<f64>().map(|n| n as u64).map_err(float_err)
 }
 
 #[cfg(test)]
@@ -1195,9 +1259,8 @@ mod tests {
 
     #[test]
     fn cpu_invalid_value() {
-        let result = parse_cpu_quantity(&q("abcm"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid cpu quantity"));
+        let err = parse_cpu_quantity(&q("abcm")).unwrap_err();
+        assert!(matches!(err, QuantityParseError::Cpu { .. }), "{err:?}");
     }
 
     #[test]
@@ -1252,9 +1315,11 @@ mod tests {
 
     #[test]
     fn memory_invalid_value() {
-        let result = parse_memory_quantity(&q("badMi"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("invalid memory quantity"));
+        let err = parse_memory_quantity(&q("badMi")).unwrap_err();
+        assert!(
+            matches!(err, QuantityParseError::MemoryInt { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1829,5 +1894,24 @@ mod tests {
         let result = extract_pod_network(&[summary], "default");
 
         assert!(result.is_empty());
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // Quantity parsers must never panic on arbitrary input; the
+        // checked/saturating arithmetic guards the overflow paths.
+        #[test]
+        fn quantity_parsers_never_panic(s in ".*") {
+            let _ = parse_cpu_quantity(&q(&s));
+            let _ = parse_memory_quantity(&q(&s));
+        }
+
+        // Binary `Ki` quantities round-trip exactly for any u32 magnitude.
+        #[test]
+        fn memory_ki_roundtrip(n in 0u64..=u64::from(u32::MAX)) {
+            let parsed = parse_memory_quantity(&q(&format!("{n}Ki"))).unwrap();
+            prop_assert_eq!(parsed, n * 1024);
+        }
     }
 }

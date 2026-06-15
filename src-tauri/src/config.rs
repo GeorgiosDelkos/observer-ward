@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub notifications_enabled: bool,
+    #[serde(default)]
+    pub grafana: Option<GrafanaConfig>,
 }
 
 fn default_foreground_poll() -> u64 {
@@ -28,8 +30,30 @@ impl Default for AppConfig {
             background_poll_secs: default_background_poll(),
             servers: Vec::new(),
             notifications_enabled: false,
+            grafana: None,
         }
     }
+}
+
+/// Connection details for a single Grafana instance whose alerts the
+/// app displays. The API token is NOT stored here — it lives in the OS
+/// keychain, keyed by `name` (see `grafana_backend::read_token`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GrafanaConfig {
+    /// Display label and keychain key for this connection.
+    pub name: String,
+    /// Base URL, e.g. `https://grafana.internal` (no trailing path).
+    pub url: String,
+    /// Verify TLS certificates. Defaults to true; set false only for a
+    /// self-signed instance you trust.
+    #[serde(default = "default_verify_tls")]
+    pub verify_tls: bool,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_verify_tls() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -449,5 +473,32 @@ mod tests {
         }"#;
         let result: Result<ServerConfig, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_without_grafana_defaults_to_none() {
+        let json = r#"{ "foreground_poll_secs": 10, "servers": [] }"#;
+        let config: AppConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(config.grafana.is_none());
+    }
+
+    #[test]
+    fn grafana_config_roundtrips_with_default_verify_tls() {
+        let json = r#"{
+            "foreground_poll_secs": 10,
+            "servers": [],
+            "grafana": { "name": "home", "url": "https://grafana.internal", "enabled": true }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).expect("deserialize");
+        let grafana = config.grafana.expect("grafana present");
+        assert_eq!(grafana.name, "home");
+        assert_eq!(grafana.url, "https://grafana.internal");
+        assert!(grafana.enabled);
+        assert!(grafana.verify_tls);
+    }
+
+    #[test]
+    fn default_config_has_no_grafana() {
+        assert!(AppConfig::default().grafana.is_none());
     }
 }

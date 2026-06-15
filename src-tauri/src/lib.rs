@@ -1,5 +1,6 @@
 mod config;
 mod error;
+pub mod grafana_backend;
 mod k8s_backend;
 pub mod metrics;
 mod poller;

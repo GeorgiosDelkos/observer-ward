@@ -4150,6 +4150,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "keyring",
+ "keyring-core",
  "kube",
  "proptest",
  "reqwest 0.12.28",

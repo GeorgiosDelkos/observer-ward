@@ -136,13 +136,19 @@ fn run_in_terminal(cmd: &str) -> Result<(), String> {
     }
 }
 
+/// Monotonic per-process counter making each temp-script filename unique.
+/// Combined with pid + millis it prevents `create_new` from spuriously
+/// failing when two terminal launches land in the same millisecond.
+static SCRIPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn run_in_warp(cmd: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!(
-        "ow-cmd-{}-{}.sh",
+        "ow-cmd-{}-{}-{}.sh",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis())
+            .map_or(0, |d| d.as_millis()),
+        SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     // Create the script exclusively (O_EXCL via create_new) so a symlink
     // pre-planted at this predictable path cannot redirect the write, and

@@ -740,8 +740,10 @@ Inter-|   Receive                                                |  Transmit
     proptest! {
         // A compromised server can return anything between the
         // separators; the parsers must never panic on arbitrary input.
+        // The strategy includes newlines (`[\s\S]`, not `.`) so the
+        // line-oriented parse paths past the early guards are exercised.
         #[test]
-        fn parsers_never_panic(s in ".*") {
+        fn parsers_never_panic(s in "[\\s\\S]{0,256}") {
             let _ = parse_cpu(&s);
             let _ = parse_memory(&s);
             let _ = parse_disk(&s);

@@ -2,6 +2,8 @@
 name = "observer-ward"
 version = "0.1.0"
 edition = "2021"
+# MSRV floor: poller.rs uses Duration::from_mins, stabilized in Rust 1.91.
+rust-version = "1.91"
 
 [lib]
 name = "observer_ward_lib"

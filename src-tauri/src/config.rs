@@ -102,6 +102,12 @@ pub enum ConfigError {
     Parse(#[source] serde_json::Error),
     #[error("failed to serialize config")]
     Serialize(#[source] serde_json::Error),
+    #[error("failed to rename config file into place: {path}")]
+    Rename {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Returns the config file path: `~/.config/observer-ward/config.json`
@@ -149,7 +155,7 @@ pub fn save_config(config: &AppConfig) -> Result<(), ConfigError> {
         path: tmp.display().to_string(),
         source,
     })?;
-    std::fs::rename(&tmp, &path).map_err(|source| ConfigError::Write {
+    std::fs::rename(&tmp, &path).map_err(|source| ConfigError::Rename {
         path: path.display().to_string(),
         source,
     })

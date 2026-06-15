@@ -98,6 +98,15 @@
       </div>
     </div>
 
+    <!-- Grafana Alerts (populated by alerts-update events) -->
+    <div id="alerts-section" class="alerts-section hidden">
+      <div class="alerts-header">
+        <span class="alerts-title">GRAFANA ALERTS</span>
+        <span id="alerts-status" class="alerts-status"></span>
+      </div>
+      <div id="alerts-list" class="alerts-list"></div>
+    </div>
+
     <!-- Server List -->
     <div id="server-list" class="server-list">
       <div class="empty-state">
@@ -148,6 +157,31 @@
             <input type="checkbox" id="notifications-toggle">
             <span class="toggle-slider"></span>
           </label>
+        </div>
+        <div class="settings-divider"></div>
+        <div class="settings-row">
+          <label for="grafana-enabled">Grafana alerts</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="grafana-enabled">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <label for="grafana-url">Grafana URL</label>
+          <input type="text" id="grafana-url"
+                 placeholder="https://grafana.internal">
+        </div>
+        <div class="settings-row">
+          <label for="grafana-verify-tls">Verify TLS</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="grafana-verify-tls" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="settings-row">
+          <label for="grafana-token">API token</label>
+          <input type="password" id="grafana-token"
+                 placeholder="(stored; leave blank to keep)">
         </div>
         <div class="settings-actions">
           <button id="btn-save-settings"

@@ -225,12 +225,12 @@ function computeAnomaly(values) {
 
 function sparklineColor(levelClass) {
   if (levelClass === "level-crit") {
-    return "rgba(255,45,111,0.4)";
+    return "rgba(255,69,58,0.30)";
   }
   if (levelClass === "level-warn") {
-    return "rgba(255,184,0,0.4)";
+    return "rgba(255,159,10,0.30)";
   }
-  return "rgba(0,255,240,0.4)";
+  return "rgba(50,215,75,0.30)";
 }
 
 function renderSparkline(values, levelClass) {

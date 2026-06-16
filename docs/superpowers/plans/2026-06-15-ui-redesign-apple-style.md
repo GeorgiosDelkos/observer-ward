@@ -1,3 +1,123 @@
+# Apple-style UI Redesign Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Re-skin the Observer Ward tray UI from the "Tron neon" theme to a clean, professional Apple-style **Refined Dark** look (dark-only, Apple Blue accent), with no loss of functionality.
+
+**Architecture:** Pure presentation change. The new look is driven by a full rewrite of `ui/styles.css` around a token set; `app.js` keeps generating the same CSS class names (we re-skin those exact classes), with one small palette change (`sparklineColor`). `index.html` changes only the `.ward-eye` inner markup. No Rust, no events, no commands, no features change.
+
+**Tech Stack:** Vanilla CSS / HTML / JS (no build step, no JS test harness). Verification is manual via `cargo tauri dev` plus `node --check` / CSS brace-balance checks.
+
+---
+
+## File Structure
+
+- `ui/index.html` — MODIFY (tiny): replace the 3-element `.ward-eye` internals (`.ward-core` + two `.ward-ring`) with a single `.ward-dot`. Keep the `.ward-eye` element and its `syncing`/`alert` state classes (set by `app.js`).
+- `ui/app.js` — MODIFY (tiny): repoint `sparklineColor()` to a flat, subtle palette. No other JS change.
+- `ui/styles.css` — REWRITE (the bulk): replace the entire file with the new themed stylesheet. Re-skins every existing class name; no renames.
+
+The dynamic class names that `app.js` emits MUST stay styled (this is the contract). The full list lives in the spec under "Principle: re-skin existing classes" and is the checklist for Task 4.
+
+---
+
+## Task 1: Simplify the ward-eye markup
+
+**Files:**
+- Modify: `ui/index.html` (the `.ward-eye` block inside `.header`)
+
+- [ ] **Step 1: Replace the ward-eye markup**
+
+In `ui/index.html`, find this block:
+
+```html
+        <div class="ward-eye">
+          <div class="ward-core"></div>
+          <div class="ward-ring ward-ring-outer"></div>
+          <div class="ward-ring ward-ring-inner"></div>
+        </div>
+```
+
+Replace it with:
+
+```html
+        <div class="ward-eye">
+          <span class="ward-dot"></span>
+        </div>
+```
+
+- [ ] **Step 2: Verify the element hooks are intact**
+
+Run: `grep -n 'ward-eye\|ward-dot\|ward-core\|ward-ring' ui/index.html ui/app.js`
+Expected: `index.html` shows only `ward-eye` and `ward-dot` (no `ward-core`/`ward-ring`); `app.js` still references `.ward-eye` (the `wardEye` query selector and its `classList` `syncing`/`alert` toggles are unchanged). Confirm no `app.js` line selects `.ward-core`/`.ward-ring`/`.ward-dot` (it does not — it only toggles classes on `.ward-eye`).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ui/index.html
+git commit -m "refactor(ui): reduce ward-eye to a single status dot"
+```
+
+---
+
+## Task 2: Flatten the sparkline palette
+
+**Files:**
+- Modify: `ui/app.js` (`sparklineColor` function, currently ~lines 226-234)
+
+- [ ] **Step 1: Replace `sparklineColor`**
+
+In `ui/app.js`, find:
+
+```js
+function sparklineColor(levelClass) {
+  if (levelClass === "level-crit") {
+    return "rgba(255,45,111,0.4)";
+  }
+  if (levelClass === "level-warn") {
+    return "rgba(255,184,0,0.4)";
+  }
+  return "rgba(0,255,240,0.4)";
+}
+```
+
+Replace it with (flat, low-opacity strokes matching the new semantic palette — no neon):
+
+```js
+function sparklineColor(levelClass) {
+  if (levelClass === "level-crit") {
+    return "rgba(255,69,58,0.30)";
+  }
+  if (levelClass === "level-warn") {
+    return "rgba(255,159,10,0.30)";
+  }
+  return "rgba(50,215,75,0.30)";
+}
+```
+
+- [ ] **Step 2: Verify syntax**
+
+Run: `node --check ui/app.js`
+Expected: exit 0, no output.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ui/app.js
+git commit -m "style(ui): flatten sparkline stroke palette"
+```
+
+---
+
+## Task 3: Rewrite the stylesheet to Refined Dark
+
+**Files:**
+- Modify: `ui/styles.css` (replace the ENTIRE file)
+
+- [ ] **Step 1: Replace the whole file**
+
+Replace the entire contents of `ui/styles.css` with exactly this:
+
+```css
 /* Observer Ward -- Refined Dark (Apple-style) theme */
 
 :root {
@@ -35,7 +155,7 @@
   --pad-x: 14px;
 }
 
-/* Reset */
+/* ── Reset ─────────────────────────────────── */
 *,
 *::before,
 *::after {
@@ -44,7 +164,7 @@
   box-sizing: border-box;
 }
 
-/* Base */
+/* ── Base ──────────────────────────────────── */
 html,
 body {
   height: auto;
@@ -62,7 +182,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Scrollbar */
+/* ── Scrollbar ─────────────────────────────── */
 ::-webkit-scrollbar {
   width: 6px;
 }
@@ -74,7 +194,7 @@ body {
   border-radius: 3px;
 }
 
-/* Layout */
+/* ── Layout ────────────────────────────────── */
 .container {
   display: flex;
   flex-direction: column;
@@ -84,7 +204,7 @@ body {
   overflow: hidden;
 }
 
-/* Header */
+/* ── Header ────────────────────────────────── */
 .header {
   display: flex;
   align-items: center;
@@ -168,6 +288,7 @@ body {
   background: var(--bg-hover);
   color: var(--text);
 }
+/* The add (+) button reads as the primary action */
 #btn-open-add {
   color: var(--accent);
 }
@@ -176,13 +297,13 @@ body {
   color: var(--accent);
 }
 
-/* Server List */
+/* ── Server List ───────────────────────────── */
 .server-list {
   flex: none;
   overflow: visible;
 }
 
-/* Empty State */
+/* ── Empty State ───────────────────────────── */
 .empty-state {
   display: flex;
   flex-direction: column;
@@ -202,7 +323,7 @@ body {
   line-height: 1.6;
 }
 
-/* Server Card */
+/* ── Server Card ───────────────────────────── */
 .server-card {
   padding: 11px var(--pad-x);
   border-bottom: 1px solid var(--sep);
@@ -286,7 +407,7 @@ body {
   flex-shrink: 0;
 }
 
-/* Metric Rows */
+/* ── Metric Rows ───────────────────────────── */
 .metric-rows {
   display: flex;
   flex-direction: column;
@@ -350,12 +471,12 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Anomaly Indicator */
+/* ── Anomaly Indicator ─────────────────────── */
 .metric-row.anomaly .metric-bar-track {
   box-shadow: inset 0 0 0 1px var(--amber);
 }
 
-/* Network Row */
+/* ── Network Row ───────────────────────────── */
 .net-row {
   display: flex;
   align-items: center;
@@ -385,7 +506,7 @@ body {
   font-size: 10px;
 }
 
-/* Pending metrics */
+/* ── Pending metrics ───────────────────────── */
 .metrics-pending {
   padding-left: 16px;
   margin-top: 8px;
@@ -393,7 +514,7 @@ body {
   color: var(--text-3);
 }
 
-/* Add Form */
+/* ── Add Form ──────────────────────────────── */
 .add-form-panel {
   display: none;
   flex-shrink: 0;
@@ -490,7 +611,7 @@ body {
   color: var(--text);
 }
 
-/* Settings Panel */
+/* ── Settings Panel ────────────────────────── */
 .settings-panel {
   display: none;
   flex-shrink: 0;
@@ -566,7 +687,7 @@ body {
   padding: 7px 22px;
 }
 
-/* Toggle Switch */
+/* ── Toggle Switch ────────────────────────── */
 .toggle-switch {
   position: relative;
   display: inline-block;
@@ -605,7 +726,7 @@ body {
   transform: translateX(16px);
 }
 
-/* Footer */
+/* ── Footer ────────────────────────────────── */
 .footer {
   padding: 10px var(--pad-x) 12px;
   border-top: 1px solid var(--sep);
@@ -630,7 +751,7 @@ body {
   background: var(--bg-hover);
 }
 
-/* Context Menu */
+/* ── Context Menu ──────────────────────────── */
 .context-menu {
   position: fixed;
   z-index: 1000;
@@ -655,7 +776,8 @@ body {
   transition: background 0.12s ease;
 }
 .context-menu-item:hover {
-  background: var(--bg-hover);
+  background: var(--accent);
+  color: #fff;
 }
 .context-menu-separator {
   height: 1px;
@@ -666,10 +788,11 @@ body {
   color: var(--red);
 }
 .context-menu-item.danger:hover {
-  background: rgba(255, 69, 58, 0.12);
+  background: var(--red);
+  color: #fff;
 }
 
-/* Pod Status & Badges */
+/* ── Pod Status & Badges ──────────────────── */
 .pod-status-badge {
   font-size: 10px;
   font-weight: 500;
@@ -711,7 +834,7 @@ body {
   background: rgba(255, 69, 58, 0.16);
 }
 
-/* Cluster Summary */
+/* ── Cluster Summary ──────────────────────── */
 .cluster-summary {
   display: flex;
   align-items: center;
@@ -753,7 +876,7 @@ body {
   padding-left: 26px;
 }
 
-/* Pod Logs Button */
+/* ── Pod Logs Button ──────────────────────── */
 .btn-logs {
   background: none;
   border: 1px solid var(--sep);
@@ -774,7 +897,7 @@ body {
   background: var(--accent-bg);
 }
 
-/* Pod Event */
+/* ── Pod Event ────────────────────────────── */
 .pod-event {
   padding-left: 16px;
   margin-top: 6px;
@@ -785,7 +908,7 @@ body {
   white-space: nowrap;
 }
 
-/* Pod Metric Values */
+/* ── Pod Metric Values ────────────────────── */
 .metric-value.pod-value {
   width: 44px;
   font-size: 11px;
@@ -801,7 +924,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Grafana Alerts */
+/* ── Grafana Alerts ───────────────────────── */
 .alerts-section {
   flex-shrink: 0;
 }
@@ -849,6 +972,7 @@ body {
 .alert-row.suppressed {
   opacity: 0.5;
 }
+/* severity bar on the left, full row height */
 .alert-dot {
   width: 3px;
   height: auto;
@@ -892,7 +1016,7 @@ body {
   flex-shrink: 0;
 }
 
-/* Animations */
+/* ── Animations ────────────────────────────── */
 @keyframes breathe-ok {
   0%, 100% { box-shadow: 0 0 0 0 rgba(50, 215, 75, 0.45); }
   50% { box-shadow: 0 0 0 5px rgba(50, 215, 75, 0); }
@@ -916,3 +1040,91 @@ body {
     transition: none !important;
   }
 }
+```
+
+- [ ] **Step 2: Verify CSS brace balance**
+
+Run:
+```bash
+node -e "const s=require('fs').readFileSync('ui/styles.css','utf8');const o=(s.match(/{/g)||[]).length,c=(s.match(/}/g)||[]).length;console.log('open',o,'close',c,o===c?'BALANCED':'MISMATCH');"
+```
+Expected: `BALANCED`.
+
+- [ ] **Step 3: Visual smoke test**
+
+Run `cargo tauri dev` from the repo root. With at least one SSH server and one K8s cluster configured (or the empty state), confirm: dark `#1c1c1e` window, system font (not monospace), header with a green breathing dot + "Observer Ward" title + blue `+` + gray gear, server cards with green/amber/red bars (no neon glow), hairline separators between rows. No element appears as raw unstyled text.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add ui/styles.css
+git commit -m "style(ui): rewrite stylesheet to Refined Dark Apple theme"
+```
+
+---
+
+## Task 4: Full-state QA pass and re-skin verification
+
+**Files:**
+- Modify (only if fixes needed): `ui/styles.css`
+
+This task finds and fixes any class the rewrite missed or any state that looks wrong. No new feature work.
+
+- [ ] **Step 1: Cross-check every dynamic class is styled**
+
+Run this to list class names `app.js` applies, then confirm each has a rule in `ui/styles.css`:
+```bash
+grep -oE 'class="[^"]*"' ui/app.js | tr ' ' '\n' | grep -oE '[a-z][a-z0-9-]+' | sort -u
+```
+For each class in the spec's "re-skin existing classes" list, confirm a matching selector exists:
+```bash
+for c in container ward-eye title sync-label btn-icon server-list empty-state server-card status-dot server-name alias-input server-type-badge offline-label metric-rows metric-row metric-label metric-bar-track sparkline-svg metric-bar-fill metric-value metric-pct net-row net-label net-values net-up net-down net-arrow metrics-pending add-form-panel add-form-inner form-title form-group form-error form-actions btn btn-primary btn-cancel settings-panel settings-header settings-title settings-body settings-row settings-divider settings-actions toggle-switch toggle-slider footer btn-settings context-menu context-menu-item context-menu-separator cluster-summary cluster-name cluster-stat chevron btn-logs pod-event pod-age restart-badge pod-status-badge node-count-badge alerts-section alerts-header alerts-title alerts-status alerts-empty alert-row alert-dot alert-text alert-name alert-summary alert-age; do grep -q "\.$c" ui/styles.css || echo "MISSING: .$c"; done
+```
+Expected: no `MISSING:` lines. If any appear, add a styled rule for it (match the theme), then re-run.
+
+- [ ] **Step 2: Manual walkthrough of every state**
+
+Run `cargo tauri dev` and verify each, fixing any off-theme styling in `ui/styles.css` as you go:
+- Empty state (no servers): icon + text are muted, centered.
+- SSH server online: green dot, name, SSH badge, CPU/Mem/Disk bars colored by level, net row subtle.
+- Server offline/error: red dot, card dimmed, "offline" label red.
+- Server pending: gray dot, "awaiting metrics..." muted.
+- K8s cluster: header row with chevron; click to collapse/expand (chevron rotates); pods indented with inset hairlines.
+- Pod with restarts: amber/red `2 restarts` pill; pod event line muted; logs button (hover → blue).
+- Anomaly: a metric bar track shows a thin amber inset ring (no pulsing).
+- Grafana alerts: uppercase gray section header + count; crit row red left bar, warn amber, info blue; suppressed dimmed; `alerts-status.error` red; empty/unreachable text muted.
+- Add form: open via `+`; switch type k8s↔ssh (fields show/hide); focus shows blue ring; trigger a validation error (red text); primary button solid blue, cancel subtle.
+- Settings: open via footer; number inputs + the redesigned toggle (off gray / on blue, knob slides); Grafana URL/token text+password inputs; divider hairline; SAVE button.
+- Context menu: right-click a server (Open Terminal / Copy kubectl / Copy Metrics / Remove-danger-red) and a pod (View Logs); hover highlights blue, danger highlights red.
+- Alias edit: double-click a server/cluster name → inline input with blue border.
+- Header states: idle (green breathing dot); during a poll the `.syncing` class (blue dot, faster) and `sync-label` "syncing" caption appear; if a metric is critical the `.alert` class (red dot) shows.
+
+- [ ] **Step 3: Reduced-motion check**
+
+Temporarily enable macOS "Reduce Motion" (System Settings → Accessibility → Display) OR confirm by code review that the `@media (prefers-reduced-motion: reduce)` block disables `.ward-dot` animation and transitions. Confirm the dot stops breathing.
+
+- [ ] **Step 4: Commit any fixes**
+
+```bash
+git add ui/styles.css
+git commit -m "style(ui): QA fixes for Refined Dark theme"
+```
+(If no fixes were needed, skip the commit and note "QA clean — no fixes required".)
+
+---
+
+## Self-Review
+
+**Spec coverage:**
+- Refined Dark, dark-only, Apple Blue accent, semantic health colors → Task 3 tokens + `.metric-bar-fill.level-*` (green/amber/red) + accent confined to `#btn-open-add`, focus rings, toggle, `btn-primary`, `btn-logs` hover, context-menu hover, `sev-info`.
+- Ward-eye → single breathing dot → Task 1 (markup) + Task 3 (`.ward-dot` + `breathe-*` keyframes + `.syncing`/`.alert` states).
+- System font, 13px base, tabular numerals → Task 3 `--font`, body, `.metric-value`/`.metric-pct` `tabular-nums`.
+- Restrained motion, neon removed, `prefers-reduced-motion` → Task 3 (only `breathe-*` keyframes remain; reduced-motion block).
+- Sparkline flattened, anomaly = inset ring → Task 2 (`sparklineColor`) + Task 3 (`.metric-row.anomaly` inset ring).
+- macOS list grouping (hairlines, cluster header, uppercase section header) → Task 3 server-card/cluster-summary/alerts-header.
+- Re-skin every existing class (no renames) → Task 3 covers the full list; Task 4 Step 1 verifies none missing.
+- Per-component specs (header, cards, metrics, net, cluster/pods, alerts, add form, settings, toggle, context menu, scrollbar, empty, alias) → all present in Task 3.
+
+**Placeholder scan:** No TBD/TODO; Task 3 contains the complete file; every command has expected output. Task 4 Step 4 explicitly handles the "no fixes" case.
+
+**Type/contract consistency:** All selectors in Task 3 match class names `app.js`/`index.html` emit (verified against the read source). `sparklineColor` return values (Task 2) are valid CSS colors consumed by the inline SVG stroke. The `.ward-eye` element + `syncing`/`alert` classes (untouched in `app.js`) are styled in Task 3. `#btn-open-add` id matches `index.html`. The alerts `.alert-dot` is repurposed as the left severity bar (the JS renders `<span class="alert-dot">`); confirmed consistent with the existing `app.js` `renderAlertRow`.

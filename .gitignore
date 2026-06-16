@@ -15,3 +15,6 @@
 # Environment
 .env
 .env.*
+
+# Superpowers brainstorm artifacts (visual companion mockups)
+.superpowers/

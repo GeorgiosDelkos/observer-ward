@@ -17,6 +17,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 /// timeout (boundary-validation, axiom `rust_api_axiom_25`).
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// Format `host:port` for russh. IPv6 literals must be bracketed.
+fn ssh_connect_addr(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 const METRICS_COMMAND: &str = "\
     top -bn1 | head -5; \
     echo '---SEPARATOR---'; \
@@ -258,7 +267,7 @@ impl SshBackend {
     /// Returns [`SshError`] if the private key cannot be loaded, the TCP
     /// connection or SSH handshake fails, or authentication is rejected.
     pub async fn connect(&mut self) -> Result<(), SshError> {
-        let key_path = self.key_path.clone();
+        let key_path = crate::config::expand_tilde(&self.key_path);
         let key = tokio::task::spawn_blocking(move || load_secret_key(&key_path, None))
             .await
             .map_err(|_| SshError::KeyLoadCancelled)?
@@ -268,7 +277,7 @@ impl SshBackend {
             })?;
 
         let config = Arc::new(client::Config::default());
-        let addr = format!("{}:{}", self.host, self.port);
+        let addr = ssh_connect_addr(&self.host, self.port);
 
         let handler = SshHandler {
             host: self.host.clone(),
@@ -572,6 +581,18 @@ mod tests {
             (left - right).abs() < epsilon,
             "expected ~{right}, got {left}"
         );
+    }
+
+    #[test]
+    fn ssh_connect_addr_ipv4_and_hostname() {
+        assert_eq!(ssh_connect_addr("10.0.0.5", 22), "10.0.0.5:22");
+        assert_eq!(ssh_connect_addr("box.local", 2222), "box.local:2222");
+    }
+
+    #[test]
+    fn ssh_connect_addr_brackets_ipv6() {
+        assert_eq!(ssh_connect_addr("2001:db8::1", 22), "[2001:db8::1]:22");
+        assert_eq!(ssh_connect_addr("[::1]", 22), "[::1]:22");
     }
 
     // --- CPU parsing ---

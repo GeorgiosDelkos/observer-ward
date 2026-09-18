@@ -1,54 +1,46 @@
 # Observer Ward
 
-A lightweight tray-based monitoring dashboard for Kubernetes clusters and SSH servers. Built with [Tauri](https://tauri.app/) and vanilla JavaScript.
+A macOS menu-bar dashboard for Kubernetes clusters, SSH hosts, and Grafana alerts. Built with [Tauri](https://tauri.app/) 2 and vanilla JavaScript.
 
-Observer Ward lives in your menu bar, polling your infrastructure at configurable intervals and displaying real-time CPU, memory, disk, and network metrics in a compact popover window.
+Observer Ward lives in the menu bar (no Dock icon). It polls your infrastructure on a foreground/background schedule and shows CPU, memory, disk, network, pod health, and firing Grafana alerts in a compact popover.
 
 ## Features
 
-- **Kubernetes monitoring** -- cluster-level and per-pod metrics via the Metrics API
-- **SSH server monitoring** -- collects CPU, memory, disk, and network stats over SSH
-- **Grafana alerts** -- pulls currently-firing alerts from a self-hosted Grafana and shows them in the tray, with severity-colored rows and native notifications
-- **Tray-native** -- no dock icon, click the tray to open, click away to dismiss
-- **Pod details** -- status badges, restart counts, age, PVC usage, recent events
-- **Failure backoff** -- unreachable servers back off automatically to avoid noise
-- **Connection pooling** -- reuses SSH and Kubernetes connections across poll cycles
-- **Configurable poll interval** -- 5 to 300 seconds
-- **Launch at login** -- optional autostart via system integration
-- **Dark neon UI** -- Tron-inspired theme with color-coded metric thresholds
+- **Kubernetes** — cluster and per-pod metrics via the Metrics API (restarts, age, PVC usage, recent events)
+- **SSH hosts** — CPU, memory, disk, and network over key-based SSH
+- **Grafana alerts** — currently firing alerts, severity-colored rows, native notifications
+- **Tray-native** — click the tray icon to open, click away to dismiss, Quit in the popover footer
+- **Failure backoff** — unreachable targets back off so a dead host does not spam polls
+- **Connection pooling** — SSH and Kubernetes clients are reused across cycles
+- **Dual poll intervals** — faster while the popover is open, slower in the background
+- **Launch at login** — optional autostart
+- **Refined dark UI** — color-coded thresholds (green &lt; 60%, amber 60–85%, red ≥ 85%)
 
-## Screenshots
+## Requirements
 
-<!-- TODO: add screenshots -->
+- macOS (Apple Silicon and Intel)
+- [Rust](https://rustup.rs/) (stable; this repo pins 1.95.0 via `src-tauri/rust-toolchain.toml`)
+- [Tauri CLI](https://v2.tauri.app/) v2
+- Xcode Command Line Tools: `xcode-select --install`
 
-## Prerequisites
+The frontend is static files in `ui/`. Node.js is not required.
 
-- **Rust** (stable, via [rustup](https://rustup.rs/))
-- **Node.js** 18+ (for Tauri CLI)
-- **Tauri CLI** v2
-
-### Platform-specific
-
-**macOS:** Xcode Command Line Tools
-
-```sh
-xcode-select --install
-```
-
-**Linux:** system dependencies for Tauri -- see the [Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/).
-
-## Installation
-
-### From source
+## Install from source
 
 ```sh
 git clone https://github.com/GeorgiosDelkos/observer-ward.git
 cd observer-ward
 cargo install tauri-cli --version "^2"
-cargo tauri build
+cargo tauri build --bundles dmg
 ```
 
-The built application bundle is in `src-tauri/target/release/bundle/`.
+The disk image is written to `src-tauri/target/release/bundle/dmg/`. Drag **Observer Ward.app** to Applications.
+
+This build is ad-hoc signed. On first launch, Control-click the app and choose **Open**, or:
+
+```sh
+xattr -cr "/Applications/Observer Ward.app"
+```
 
 ### Development
 
@@ -56,76 +48,70 @@ The built application bundle is in `src-tauri/target/release/bundle/`.
 cargo tauri dev
 ```
 
-This starts the app in development mode with hot-reload for the frontend.
+Edits under `ui/` are picked up on the next window load (there is no bundler or hot-reload server).
 
 ## Usage
 
-### Adding a Kubernetes cluster
+Click the tray icon to open the popover. Click outside it to dismiss.
 
-1. Click the tray icon to open the popover
-2. Click the **+** button
-3. Select **Kubernetes** as the server type
-4. Fill in:
-   - **Name** -- display label for this cluster
-   - **Context** -- kubectl context name (required)
-   - **Namespace** -- namespace to monitor pods in (required)
-   - **Kubeconfig** -- path to kubeconfig file (leave blank for `~/.kube/config`)
-5. Click **Add**
+### Add a Kubernetes cluster
 
-Requirements:
-- The [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) must be installed in the cluster
-- The kubeconfig must have permissions to read nodes, pods, events, and the metrics API
+1. Click **+**
+2. Type **Kubernetes**
+3. Fill in **Name**, **Context**, and **Namespace**. Leave kubeconfig blank to use `~/.kube/config`.
+4. Click **Add**
 
-### Adding an SSH server
+The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API.
 
-1. Click **+** and select **SSH**
-2. Fill in:
-   - **Name** -- display label
-   - **Host** -- hostname or IP
-   - **Port** -- SSH port (default: 22)
-   - **User** -- SSH username
-   - **Key path** -- path to private key (e.g., `~/.ssh/id_ed25519`)
+Expanded pod lists show three pods at a time (scroll for the rest) and are sorted A–Z.
+
+### Add an SSH server
+
+1. Click **+** and choose **SSH**
+2. Fill in **Name**, **Host**, **Port**, **User**, and **Key path** (for example `~/.ssh/id_ed25519`)
 3. Click **Add**
 
-Requirements:
-- Key-based authentication (password auth is not supported)
-- The remote server must have `top`, `free`, `df`, and `/proc/net/dev` available (standard on Linux)
+Password auth is not supported. The remote host must provide `top`, `free`, `df`, and `/proc/net/dev`.
 
-### Connecting Grafana alerts
+### Grafana alerts
 
-1. In Grafana, create a service-account token (Administration -> Users and access -> Service accounts) with permission to read alerts.
-2. In Observer Ward, open Settings (gear icon) and enable **Grafana alerts**.
-3. Enter your Grafana **URL** (e.g. `https://grafana.internal`) and paste the **API token**.
-4. Save. Active alerts appear within one poll cycle.
+1. In Grafana, create a service-account token that can read alerts.
+2. Open **Settings**, enable **Grafana alerts**, enter the base URL, and paste the token.
+3. Save. Firing alerts appear on the next poll.
 
-The token is stored in the OS keychain, never in `config.json`. Observer Ward only reads alerts (it never modifies or silences them) and polls outbound, so it works from a laptop that Grafana cannot reach directly. Alerts must be Grafana-managed (the integration reads `/api/alertmanager/grafana/api/v2/alerts`).
+The token is stored in the macOS Keychain, never in `config.json`. Observer Ward only reads alerts (it never silences them). Alerts must be Grafana-managed; the client calls `/api/alertmanager/grafana/api/v2/alerts`.
 
-To change or rotate the API token later, toggle the Grafana connection off and Save, then on and Save again (or restart the app): the connection's cached client only rebuilds when the URL or enabled state changes, so re-entering the token alone needs the toggle to take effect.
+To rotate the token, paste the new value in Settings and Save. The poller re-reads the keychain each cycle.
 
 ### Settings
 
-Click the gear icon in the footer to adjust:
+Footer **Settings**:
 
-- **Poll interval** -- how often to collect metrics (5--300 seconds, default: 30)
-- **Launch at login** -- start Observer Ward automatically on system boot
+- **Foreground interval** — poll period while the popover is open (5–120 s, default 10)
+- **Background interval** — poll period while hidden (30–600 s, default 300)
+- **Launch at login**
+- **Threshold alerts** — native notifications when a metric crosses amber/red
+- **Grafana** — enable, URL, TLS verification, API token
 
-### Removing a server
+### Remove a cluster or server
 
-Right-click any server card and select **Remove**.
+Click **remove** on the card (or right-click → Remove). Confirm in the in-app dialog. This cannot be undone; add the target again if you still need it.
 
 ## Configuration
 
-Configuration is stored at:
-
-```
-~/.config/observer-ward/config.json
-```
-
-Example:
+`~/.config/observer-ward/config.json`
 
 ```json
 {
-  "poll_interval_secs": 30,
+  "foreground_poll_secs": 10,
+  "background_poll_secs": 300,
+  "notifications_enabled": false,
+  "grafana": {
+    "name": "default",
+    "url": "https://grafana.internal",
+    "verify_tls": true,
+    "enabled": true
+  },
   "servers": [
     {
       "type": "k8s",
@@ -146,45 +132,46 @@ Example:
 }
 ```
 
+`poll_interval_secs` is still accepted as an alias for `foreground_poll_secs`. The Grafana token is not in this file.
+
 ## Architecture
 
 ```
 observer-ward/
-├── src-tauri/          # Rust backend (Tauri)
+├── src-tauri/              # Rust / Tauri
 │   └── src/
-│       ├── lib.rs          # App setup, tray, Tauri commands
-│       ├── config.rs       # Configuration models and persistence
-│       ├── metrics.rs      # Metric data types
-│       ├── poller.rs       # Poll loop orchestration with backoff
-│       ├── k8s_backend.rs  # Kubernetes metrics collection
-│       └── ssh_backend.rs  # SSH metrics collection
-└── ui/                 # Frontend (vanilla JS/HTML/CSS)
+│       ├── lib.rs              # App setup, tray, commands
+│       ├── config.rs           # Config models and persistence
+│       ├── error.rs            # Error-chain formatting
+│       ├── metrics.rs          # Metric and alert types
+│       ├── poller.rs           # Poll loop, backoff, tray icon
+│       ├── k8s_backend.rs      # Kubernetes Metrics API + kubelet stats
+│       ├── ssh_backend.rs      # SSH remote command parsing
+│       └── grafana_backend.rs  # Grafana Alertmanager alerts
+└── ui/                     # Vanilla JS / HTML / CSS
     ├── index.html
     ├── app.js
     └── styles.css
 ```
 
-The backend spawns an async poll loop that collects metrics from all configured servers in parallel, then emits Tauri events to the frontend. The frontend renders metric cards with color-coded bars (green < 60%, amber 60--85%, red >= 85%).
+The poll loop collects every server in parallel, then emits Tauri events. The UI re-renders cards from those events.
 
 ## Development
-
-### Running tests
 
 ```sh
 cd src-tauri
 cargo test
-```
-
-### Linting
-
-```sh
-cd src-tauri
-cargo fmt -- --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo deny check advisories
 ```
 
-The project enforces strict clippy lints including denying `unwrap`, `panic`, `todo`, and `dbg!` in production code.
+Clippy denies `unwrap`, `panic`, `todo`, and `dbg!` in production code. Logging uses `tracing`.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Report vulnerabilities via GitHub private advisories.
 
 ## License
 
-MIT
+[MIT](LICENSE)

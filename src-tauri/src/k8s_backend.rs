@@ -357,7 +357,10 @@ impl K8sBackend {
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
     pub async fn connect(&mut self) -> Result<(), K8sError> {
-        let kubeconfig_path = self.kubeconfig.clone();
+        let kubeconfig_path = self
+            .kubeconfig
+            .clone()
+            .map(|p| crate::config::expand_tilde(&p));
         let kubeconfig = tokio::task::spawn_blocking(move || match kubeconfig_path {
             Some(path) => kube::config::Kubeconfig::read_from(&path).map_err(|source| {
                 K8sError::ReadKubeconfig {

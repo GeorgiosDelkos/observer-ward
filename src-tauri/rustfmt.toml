@@ -1,0 +1,12 @@
+# Stable-channel options only. Match edition to Cargo.toml.
+edition = "2021"
+max_width = 100
+# Default keeps multi-line structure readable. Never use "Max".
+use_small_heuristics = "Default"
+newline_style = "Unix"
+reorder_imports = true
+reorder_modules = true
+merge_derives = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+remove_nested_parens = true

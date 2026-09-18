@@ -134,6 +134,23 @@ pub enum ConfigError {
     },
 }
 
+/// Expand a leading `~/` (or a lone `~`) to the user's home directory.
+/// Other paths are returned unchanged.
+#[must_use]
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map_or_else(|| path.to_string(), |home| home.display().to_string());
+    }
+    let Some(rest) = path.strip_prefix("~/") else {
+        return path.to_string();
+    };
+    match dirs::home_dir() {
+        Some(home) => home.join(rest).display().to_string(),
+        None => path.to_string(),
+    }
+}
+
 /// Returns the config file path: `~/.config/observer-ward/config.json`
 fn config_path() -> Result<PathBuf, ConfigError> {
     let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
@@ -193,6 +210,23 @@ pub fn save_config(config: &AppConfig) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn expand_tilde_leaves_absolute_and_relative_paths() {
+        assert_eq!(expand_tilde("/etc/ssh/id"), "/etc/ssh/id");
+        assert_eq!(expand_tilde("keys/id_ed25519"), "keys/id_ed25519");
+        assert_eq!(expand_tilde(""), "");
+    }
+
+    #[test]
+    fn expand_tilde_prefixes_home() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            expand_tilde("~/.ssh/id_ed25519"),
+            home.join(".ssh/id_ed25519").display().to_string()
+        );
+        assert_eq!(expand_tilde("~"), home.display().to_string());
+    }
 
     #[test]
     fn default_config_has_expected_values() {

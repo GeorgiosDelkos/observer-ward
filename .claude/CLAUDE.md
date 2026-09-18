@@ -28,12 +28,16 @@ cargo tauri build                                   # production build (from rep
 
 - `lib.rs` -- Tauri setup, tray icon, window management, commands
 - `config.rs` -- `AppConfig`/`ServerConfig` models, JSON persistence
+- `error.rs` -- error-chain formatting at the Tauri command boundary
 - `metrics.rs` -- `ServerMetrics`/`ServerStatus` data types
 - `poller.rs` -- async poll loop with failure tracking and backoff
 - `k8s_backend.rs` -- Kubernetes Metrics API + kubelet stats
 - `ssh_backend.rs` -- SSH remote command parsing (top/free/df/proc)
+- `grafana_backend.rs` -- Grafana Alertmanager firing alerts; token in Keychain
 
-**Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update` and `poll-start` events from the backend.
+**Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update`, `poll-start`, and `alerts-update` events from the backend.
+
+Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`.
 
 **Data flow:** Poll loop -> collect metrics per server -> emit Tauri event -> frontend re-renders.
 

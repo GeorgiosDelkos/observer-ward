@@ -269,6 +269,7 @@ mod tests {
         let result = parse_memory_quantity(&q("129e6")).unwrap();
         assert_eq!(result, 129_000_000);
     }
+
     use proptest::prelude::*;
 
     proptest! {

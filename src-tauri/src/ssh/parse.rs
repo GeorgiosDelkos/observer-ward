@@ -152,12 +152,14 @@ pub(super) fn parse_network(proc_net_dev: &str) -> Result<(u64, u64), MetricsPar
 )]
 mod tests {
     use super::*;
+
     fn assert_f64_near(left: f64, right: f64, epsilon: f64) {
         assert!(
             (left - right).abs() < epsilon,
             "expected ~{right}, got {left}"
         );
     }
+
     // --- CPU parsing ---
 
     #[test]

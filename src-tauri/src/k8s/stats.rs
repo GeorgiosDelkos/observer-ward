@@ -101,6 +101,7 @@ pub(super) struct VolumeStats {
 pub(super) struct PvcRef {}
 
 const NODE_STATS_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Percent-encode a URL path segment so a node name cannot alter the
 /// kubelet proxy path. Kubernetes node names are DNS-1123, but the
 /// proxy URL is still interpolated.
@@ -459,6 +460,7 @@ mod tests {
         let summary: StatsSummary = serde_json::from_str(json).expect("parse stats");
         assert!(summary.pods.is_empty());
     }
+
     // -- Pod network deserialization --
 
     #[test]

@@ -119,6 +119,7 @@ impl client::Handler for SshHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn unknown_host_is_learned() {
         assert_eq!(

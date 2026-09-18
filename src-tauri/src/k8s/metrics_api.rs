@@ -98,6 +98,7 @@ impl Resource for PodMetrics {
 )]
 mod tests {
     use super::*;
+
     #[test]
     fn parse_pod_metrics() {
         let json = r#"{

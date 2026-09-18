@@ -26,6 +26,7 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
+
 pub struct TrayState {
     pub icon: Mutex<tauri::tray::TrayIcon>,
     pub icon_reset: AtomicBool,

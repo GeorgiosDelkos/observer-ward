@@ -1149,6 +1149,7 @@ function handleMetricsUpdate(event) {
   }
 
   pods = currentPods;
+  const activePodNames = new Set(pods.map((p) => p.name));
   wardEye.classList.remove("syncing");
   syncLabel.classList.remove("visible");
 
@@ -1157,8 +1158,7 @@ function handleMetricsUpdate(event) {
     if (m.error) {
       continue;
     }
-    // Only check servers/pods that are still active
-    const isActivePod = key.includes("/") && receivedPodNames.has(key);
+    const isActivePod = key.includes("/") && activePodNames.has(key);
     const isActiveServer = !key.includes("/") && activeServerNames.has(key);
     if (!isActivePod && !isActiveServer) {
       continue;
@@ -1419,7 +1419,13 @@ serverListEl.addEventListener("dblclick", (e) => {
     } else {
       saveAlias(fullName, "");
     }
+    finishEdit();
     renderAll();
+  }
+
+  function finishEdit() {
+    input.removeEventListener("blur", commit);
+    input.remove();
   }
 
   input.addEventListener("blur", commit);
@@ -1430,7 +1436,7 @@ serverListEl.addEventListener("dblclick", (e) => {
     }
     if (ev.key === "Escape") {
       ev.preventDefault();
-      input.removeEventListener("blur", commit);
+      finishEdit();
       renderAll();
     }
   });

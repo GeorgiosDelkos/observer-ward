@@ -25,8 +25,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned toolchain
-        # rustup reads src-tauri/rust-toolchain.toml and installs the
-        # pinned channel plus the clippy/rustfmt components it declares.
+        # rustup walks up to rust-toolchain.toml (repo root and
+        # src-tauri) and installs the pinned channel plus clippy/rustfmt.
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

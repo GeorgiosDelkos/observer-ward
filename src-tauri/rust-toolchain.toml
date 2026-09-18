@@ -3,5 +3,5 @@
 # `clippy::duration_suboptimal_units` (and others) are version-specific;
 # pinning prevents the documented `-D warnings` gate from silently
 # breaking on a toolchain bump. Bump deliberately, then re-run clippy.
-channel = "1.95.0"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]

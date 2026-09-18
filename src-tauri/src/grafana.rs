@@ -17,14 +17,14 @@ use crate::metrics::{Alert, AlertSeverity, AlertState};
 
 /// Keychain service name under which Grafana tokens are stored, keyed by
 /// the connection's `name`.
-pub const KEYCHAIN_SERVICE: &str = "observer-ward.grafana";
+pub(crate) const KEYCHAIN_SERVICE: &str = "observer-ward.grafana";
 
 /// Failure categories for Grafana alert ingestion. Each variant keeps
 /// its underlying cause in the source chain (mirrors `ConfigError`),
 /// so the poll loop can render it with `error::error_chain` at the edge.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum GrafanaError {
+pub(crate) enum GrafanaError {
     #[error("no Grafana API token stored for connection '{name}'")]
     MissingToken { name: String },
     #[error("keychain access failed")]
@@ -102,7 +102,7 @@ fn to_alert(raw: GettableAlert) -> Alert {
 ///
 /// Returns [`GrafanaError::Parse`] if `body` is not a JSON array of
 /// Alertmanager v2 alert objects.
-pub fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
+pub(crate) fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
     let raw: Vec<GettableAlert> = serde_json::from_str(body).map_err(GrafanaError::Parse)?;
     Ok(raw.into_iter().map(to_alert).collect())
 }
@@ -115,7 +115,7 @@ pub fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
 /// Returns [`GrafanaError::MissingToken`] if no token has been stored for
 /// this connection, or [`GrafanaError::Keychain`] if the platform
 /// keychain cannot be accessed.
-pub fn read_token(name: &str) -> Result<String, GrafanaError> {
+pub(crate) fn read_token(name: &str) -> Result<String, GrafanaError> {
     let entry = keyring_core::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)?;
     match entry.get_password() {
         Ok(token) => Ok(token),
@@ -129,7 +129,7 @@ pub fn read_token(name: &str) -> Result<String, GrafanaError> {
 /// HTTP client bound to one Grafana instance. Owns its `reqwest::Client`,
 /// base URL, and the token (held in memory only, loaded from the keychain
 /// at construction). Cached in the `Poller` and reused across cycles.
-pub struct GrafanaBackend {
+pub(crate) struct GrafanaBackend {
     base_url: String,
     verify_tls: bool,
     token: String,
@@ -143,7 +143,7 @@ impl GrafanaBackend {
     ///
     /// Returns [`GrafanaError::Client`] if the HTTP client cannot be built
     /// (e.g. the TLS backend fails to initialize).
-    pub fn new(config: &GrafanaConfig, token: String) -> Result<Self, GrafanaError> {
+    pub(crate) fn new(config: &GrafanaConfig, token: String) -> Result<Self, GrafanaError> {
         let client = reqwest::Client::builder()
             // verify_tls == false opts out of certificate validation for a
             // trusted self-signed instance; default config keeps it on.
@@ -164,14 +164,14 @@ impl GrafanaBackend {
     /// The token is intentionally excluded: a token change is handled by
     /// rebuilding from the keychain, not compared here.
     #[must_use]
-    pub fn matches_config(&self, config: &GrafanaConfig) -> bool {
+    pub(crate) fn matches_config(&self, config: &GrafanaConfig) -> bool {
         self.base_url == config.url && self.verify_tls == config.verify_tls
     }
 
     /// True if this backend is using `token`. Compared on each poll so a
     /// keychain rotation rebuilds the client without a URL change.
     #[must_use]
-    pub fn uses_token(&self, token: &str) -> bool {
+    pub(crate) fn uses_token(&self, token: &str) -> bool {
         self.token == token
     }
 
@@ -193,7 +193,7 @@ impl GrafanaBackend {
     /// [`GrafanaError::Status`] on a non-2xx response (e.g. 401 for a bad
     /// token), or [`GrafanaError::Parse`] if the body is not valid
     /// Alertmanager v2 JSON.
-    pub async fn fetch_alerts(&self) -> Result<Vec<Alert>, GrafanaError> {
+    pub(crate) async fn fetch_alerts(&self) -> Result<Vec<Alert>, GrafanaError> {
         let response = self
             .client
             .get(self.alerts_url())

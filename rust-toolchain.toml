@@ -1,0 +1,5 @@
+[toolchain]
+# Same pin as src-tauri/rust-toolchain.toml so `cargo tauri` from the
+# repo root uses the same compiler as `cargo test` inside src-tauri.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

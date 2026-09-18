@@ -28,14 +28,17 @@ cargo tauri build                                   # production build
 
 **Backend modules:**
 
-- `lib.rs` -- Tauri setup, tray icon, window management, commands
+- `lib.rs` -- crate root, Tauri builder, `run()`
+- `commands.rs` -- Tauri IPC commands
+- `tray.rs` -- tray icon, popover show/hide, blur grace
+- `terminal.rs` -- open ssh/kubectl in Warp or Terminal.app
 - `config.rs` -- `AppConfig`/`ServerConfig` models, JSON persistence
 - `error.rs` -- error-chain formatting at the Tauri command boundary
 - `metrics.rs` -- `ServerMetrics`/`ServerStatus` data types
 - `poller.rs` -- async poll loop with failure tracking and backoff
-- `k8s_backend.rs` -- Kubernetes Metrics API + kubelet stats
-- `ssh_backend.rs` -- SSH remote command parsing (top/free/df/proc)
-- `grafana_backend.rs` -- Grafana Alertmanager firing alerts; token in Keychain
+- `k8s.rs` + `k8s/` -- Kubernetes Metrics API + kubelet stats
+- `ssh.rs` + `ssh/` -- SSH remote command parsing (top/free/df/proc)
+- `grafana.rs` -- Grafana Alertmanager firing alerts; token in Keychain
 
 **Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update`, `poll-start`, and `alerts-update` events from the backend.
 

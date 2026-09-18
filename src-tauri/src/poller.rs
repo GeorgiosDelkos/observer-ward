@@ -89,12 +89,12 @@ enum BackendEntry {
 /// Inputs the poll loop needs from Tauri setup. Bundled so `Poller::new`
 /// stays within the positional-argument limit.
 pub(crate) struct PollerHandles {
-    pub app_handle: AppHandle,
-    pub config_state: Arc<Mutex<AppConfig>>,
-    pub is_visible: Arc<AtomicBool>,
-    pub wake: Arc<Notify>,
-    pub latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
-    pub latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
+    pub(crate) app_handle: AppHandle,
+    pub(crate) config_state: Arc<Mutex<AppConfig>>,
+    pub(crate) is_visible: Arc<AtomicBool>,
+    pub(crate) wake: Arc<Notify>,
+    pub(crate) latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
+    pub(crate) latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
 }
 
 pub(crate) struct Poller {
@@ -157,7 +157,7 @@ impl Poller {
         icons
     }
 
-    pub async fn run(&mut self) {
+    pub(crate) async fn run(&mut self) {
         loop {
             let snapshot = self.config_state.lock().ok().map(|c| c.clone());
 

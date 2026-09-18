@@ -21,8 +21,8 @@ pub(crate) use error::K8sError;
 use events::fetch_pod_events;
 use metrics_api::{NodeMetrics, PodMetrics};
 use pods::{
-    apply_pod_net_rates, build_pod_server_metrics, derive_pod_status, pod_restart_count,
-    pod_start_time,
+    PodMetricCtx, apply_pod_net_rates, build_pod_server_metrics, derive_pod_status,
+    pod_restart_count, pod_start_time,
 };
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
 use stats::{
@@ -58,11 +58,11 @@ impl K8sBackend {
         }
     }
 
-    pub(crate) fn is_connected(&self) -> bool {
+    fn is_connected(&self) -> bool {
         self.client.is_some()
     }
 
-    pub(crate) fn client(&self) -> Option<Client> {
+    fn client(&self) -> Option<Client> {
         self.client.clone()
     }
 
@@ -72,7 +72,7 @@ impl K8sBackend {
 
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
-    pub(crate) async fn connect(&mut self) -> Result<(), K8sError> {
+    async fn connect(&mut self) -> Result<(), K8sError> {
         let kubeconfig_path = self
             .kubeconfig
             .clone()
@@ -218,11 +218,13 @@ impl K8sBackend {
             match build_pod_server_metrics(
                 pm,
                 &pod_index,
-                data.server_name,
-                data.alloc_cpu,
-                data.alloc_mem,
-                &pvc_map,
-                data.events,
+                &PodMetricCtx {
+                    cluster_name: data.server_name,
+                    cluster_cpu: data.alloc_cpu,
+                    cluster_mem: data.alloc_mem,
+                    pvc_map: &pvc_map,
+                    events: data.events,
+                },
             ) {
                 Ok(m) => {
                     if let Some(name) = pm.metadata.name.as_deref() {
@@ -392,6 +394,7 @@ async fn fetch_pod_metrics_and_specs(
     })?;
     Ok((pod_metrics_list, pod_specs))
 }
+
 /// Fetch all cluster nodes from the API.
 async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, K8sError> {
     let nodes_api: Api<Node> = Api::all(client.clone());
@@ -428,6 +431,7 @@ fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), K8sError> {
 
     Ok((total_cpu, total_mem))
 }
+
 /// Fetch total CPU (fractional cores) and memory (bytes)
 /// currently used across all nodes from the Metrics API.
 async fn fetch_cpu_mem_usage(client: &Client) -> Result<(f64, u64), K8sError> {

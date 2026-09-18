@@ -52,5 +52,5 @@ Poll intervals: foreground (popover open, default 10s) and background (hidden, d
 - `tracing` for logging (no `println!`)
 - `ServerConfig` is a tagged enum (`type` field in JSON)
 - Metric thresholds: green < 60%, amber 60-85%, red >= 85%
-- No relative imports, no wildcard matches
+- No `..` imports. `super` is allowed inside a concept module (`k8s/`, `ssh/`) for siblings. No wildcard matches on crate enums.
 - Tests colocated in each module (`#[cfg(test)]`)

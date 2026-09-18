@@ -52,6 +52,7 @@ const METRICS_COMMAND: &str = "\
     df -B1 /; \
     echo '---SEPARATOR---'; \
     cat /proc/net/dev";
+
 /// SSH backend that collects metrics from a single remote server.
 pub(crate) struct SshBackend {
     session: Option<client::Handle<SshHandler>>,
@@ -62,6 +63,7 @@ pub(crate) struct SshBackend {
     prev_net_bytes: Option<(u64, u64)>,
     prev_poll_time: Option<Instant>,
 }
+
 impl SshBackend {
     pub(crate) fn new(host: String, port: u16, user: String, key_path: String) -> Self {
         Self {

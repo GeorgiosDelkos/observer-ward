@@ -50,6 +50,16 @@ pub(super) fn apply_pod_net_rates(
     }
 }
 
+/// Cluster-level inputs for one pod card. Bundled so
+/// `build_pod_server_metrics` stays within the positional-argument limit.
+pub(super) struct PodMetricCtx<'a> {
+    pub(super) cluster_name: &'a str,
+    pub(super) cluster_cpu: f64,
+    pub(super) cluster_mem: u64,
+    pub(super) pvc_map: &'a HashMap<String, (u64, u64)>,
+    pub(super) events: &'a HashMap<String, String>,
+}
+
 /// Build a `ServerMetrics` for one pod from its metrics and
 /// spec data.
 #[expect(
@@ -59,11 +69,7 @@ pub(super) fn apply_pod_net_rates(
 pub(super) fn build_pod_server_metrics(
     pm: &PodMetrics,
     pod_index: &HashMap<&str, &Pod>,
-    cluster_name: &str,
-    cluster_cpu: f64,
-    cluster_mem: u64,
-    pvc_map: &HashMap<String, (u64, u64)>,
-    events: &HashMap<String, String>,
+    ctx: &PodMetricCtx<'_>,
 ) -> Result<ServerMetrics, K8sError> {
     let pod_name = pm.metadata.name.as_deref().unwrap_or("unknown");
     let pod = pod_index.get(pod_name).copied();
@@ -77,19 +83,19 @@ pub(super) fn build_pod_server_metrics(
     }
 
     let (cpu_pct, mem_pct) =
-        compute_pod_percentages(cpu_used, mem_used, pod, cluster_cpu, cluster_mem);
+        compute_pod_percentages(cpu_used, mem_used, pod, ctx.cluster_cpu, ctx.cluster_mem);
 
-    let (pvc_used, pvc_cap) = pvc_map.get(pod_name).copied().unwrap_or((0, 0));
+    let (pvc_used, pvc_cap) = ctx.pvc_map.get(pod_name).copied().unwrap_or((0, 0));
     let disk_pct = if pvc_cap > 0 {
         pvc_used as f64 / pvc_cap as f64 * 100.0
     } else {
         0.0
     };
 
-    let last_event = events.get(pod_name).cloned().unwrap_or_default();
+    let last_event = ctx.events.get(pod_name).cloned().unwrap_or_default();
 
     Ok(ServerMetrics {
-        server_name: format!("{cluster_name}/{pod_name}"),
+        server_name: format!("{}/{pod_name}", ctx.cluster_name),
         server_type: "pod".to_string(),
         status: ServerStatus::Online,
         cpu_percent: cpu_pct,
@@ -230,6 +236,7 @@ pub(super) fn container_override_reason(
 
     None
 }
+
 /// Sum a pod's container resource caps (CPU in fractional cores,
 /// memory in bytes). Prefers `limits`; if a limit is unset, uses
 /// the matching `requests` reservation. CPU and memory are chosen

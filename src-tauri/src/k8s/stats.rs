@@ -99,6 +99,7 @@ pub(super) struct VolumeStats {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PvcRef {}
+
 const NODE_STATS_TIMEOUT: Duration = Duration::from_secs(8);
 /// Percent-encode a URL path segment so a node name cannot alter the
 /// kubelet proxy path. Kubernetes node names are DNS-1123, but the
@@ -118,6 +119,7 @@ pub(super) fn encode_path_segment(s: &str) -> String {
     }
     out
 }
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "disk byte totals fit comfortably in f64"

@@ -62,6 +62,7 @@ pub(crate) struct TrayState {
     /// key focus on mouse-down.
     pub(crate) last_blur_hide_ms: AtomicU64,
 }
+
 pub(crate) fn setup_tray_and_window(
     app: &App,
     is_visible: &Arc<AtomicBool>,

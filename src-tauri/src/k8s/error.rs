@@ -10,7 +10,7 @@
 /// `rust_quality_151`, clippy `result_large_err`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum K8sError {
+pub(crate) enum K8sError {
     #[error("failed to read kubeconfig {path}")]
     ReadKubeconfig {
         path: String,
@@ -76,7 +76,7 @@ pub enum K8sError {
 /// typed fields rather than a formatted string (axiom `rust_quality_63`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum QuantityParseError {
+pub(crate) enum QuantityParseError {
     #[error("invalid cpu quantity {value}")]
     Cpu {
         value: String,

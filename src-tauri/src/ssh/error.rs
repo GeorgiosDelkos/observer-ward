@@ -5,7 +5,7 @@
 /// poller flattens the chain only when logging.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum SshError {
+pub(crate) enum SshError {
     #[error("failed to load SSH key {path}")]
     LoadKey {
         path: String,
@@ -45,7 +45,7 @@ pub enum SshError {
 /// typed fields rather than a formatted string (axiom `rust_quality_63`).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum MetricsParseError {
+pub(crate) enum MetricsParseError {
     #[error("expected {expected} sections in metrics output, got {got}")]
     SectionCount { expected: usize, got: usize },
     #[error("no Cpu line found in top output")]

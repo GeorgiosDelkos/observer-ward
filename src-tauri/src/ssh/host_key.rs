@@ -49,6 +49,7 @@ fn decide_host_key(check: HostKeyCheck, recorded_key_count: usize) -> HostKeyDec
         }
     }
 }
+
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 

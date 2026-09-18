@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.10", features = ["tray-icon", "macos-private-api", "image-png"] }
+tauri = { version = "2.11", features = ["tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-autostart = "2.5"
 tauri-plugin-positioner = { version = "2.3", features = ["tray-icon"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -44,14 +44,9 @@ thiserror = "2"
 # default; a plain GET needs none of the dropped features.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # OS keychain for the Grafana service-account token (a secret, so it is
-# never written to config.json). keyring v4 selects the platform-native
-# backend automatically at compile time (no feature flags needed); on
-# macOS this is the Security framework Keychain.
-keyring = "4"
-# keyring-core is the sub-crate that owns the Error type; keyring v4
-# re-uses it but does not re-export it, so we depend on it directly to
-# reference keyring_core::Error in GrafanaError.
-keyring-core = "1"
+# never written to config.json). keyring 4.2's default `v1` feature
+# initializes the macOS Keychain on the first `Entry::new`.
+keyring = "4.2"
 
 [dev-dependencies]
 tempfile = "3.25"

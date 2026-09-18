@@ -28,7 +28,7 @@ pub(crate) enum GrafanaError {
     #[error("no Grafana API token stored for connection '{name}'")]
     MissingToken { name: String },
     #[error("keychain access failed")]
-    Keychain(#[source] keyring_core::Error),
+    Keychain(#[source] keyring::Error),
     #[error("failed to build the Grafana HTTP client")]
     Client(#[source] reqwest::Error),
     #[error("request to Grafana failed")]
@@ -116,10 +116,10 @@ pub(crate) fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
 /// this connection, or [`GrafanaError::Keychain`] if the platform
 /// keychain cannot be accessed.
 pub(crate) fn read_token(name: &str) -> Result<String, GrafanaError> {
-    let entry = keyring_core::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)?;
     match entry.get_password() {
         Ok(token) => Ok(token),
-        Err(keyring_core::Error::NoEntry) => Err(GrafanaError::MissingToken {
+        Err(keyring::Error::NoEntry) => Err(GrafanaError::MissingToken {
             name: name.to_string(),
         }),
         Err(source) => Err(GrafanaError::Keychain(source)),

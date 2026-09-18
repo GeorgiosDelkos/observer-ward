@@ -17,15 +17,14 @@ struct TrayIcons {
 }
 
 use crate::config::{AppConfig, ServerConfig};
-use crate::grafana_backend::{read_token, GrafanaBackend};
-use crate::k8s_backend::K8sBackend;
+use crate::grafana::{GrafanaBackend, read_token};
+use crate::k8s::K8sBackend;
 use crate::metrics::{
-    classify_level, has_restarts, newly_firing, worst_alert_level, worst_level, Alert,
-    AlertSeverity, AlertState, AlertsUpdate, MetricLevel, MetricsUpdate, ServerMetrics,
-    ServerStatus,
+    Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel, MetricsUpdate, ServerMetrics,
+    ServerStatus, classify_level, has_restarts, newly_firing, worst_alert_level, worst_level,
 };
-use crate::ssh_backend::SshBackend;
-use crate::TrayState;
+use crate::ssh::SshBackend;
+use crate::tray::TrayState;
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
@@ -87,7 +86,18 @@ enum BackendEntry {
     K8s(K8sBackend),
 }
 
-pub struct Poller {
+/// Inputs the poll loop needs from Tauri setup. Bundled so `Poller::new`
+/// stays within the positional-argument limit.
+pub(crate) struct PollerHandles {
+    pub(crate) app_handle: AppHandle,
+    pub(crate) config_state: Arc<Mutex<AppConfig>>,
+    pub(crate) is_visible: Arc<AtomicBool>,
+    pub(crate) wake: Arc<Notify>,
+    pub(crate) latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
+    pub(crate) latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
+}
+
+pub(crate) struct Poller {
     app_handle: AppHandle,
     config_state: Arc<Mutex<AppConfig>>,
     is_visible: Arc<AtomicBool>,
@@ -106,20 +116,13 @@ pub struct Poller {
 }
 
 impl Poller {
-    pub fn new(
-        app_handle: AppHandle,
-        config_state: Arc<Mutex<AppConfig>>,
-        is_visible: Arc<AtomicBool>,
-        wake: Arc<Notify>,
-        latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
-        latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
-    ) -> Self {
+    pub(crate) fn new(handles: PollerHandles) -> Self {
         let tray_icons = Self::load_tray_icons();
         Self {
-            app_handle,
-            config_state,
-            is_visible,
-            wake,
+            app_handle: handles.app_handle,
+            config_state: handles.config_state,
+            is_visible: handles.is_visible,
+            wake: handles.wake,
             ssh_backends: HashMap::new(),
             k8s_backends: HashMap::new(),
             failures: HashMap::new(),
@@ -129,8 +132,8 @@ impl Poller {
             last_good_grafana_alerts: Vec::new(),
             tray_icons,
             prev_tray_state: None,
-            latest_metrics,
-            latest_alerts,
+            latest_metrics: handles.latest_metrics,
+            latest_alerts: handles.latest_alerts,
         }
     }
 
@@ -154,7 +157,7 @@ impl Poller {
         icons
     }
 
-    pub async fn run(&mut self) {
+    pub(crate) async fn run(&mut self) {
         loop {
             let snapshot = self.config_state.lock().ok().map(|c| c.clone());
 
@@ -313,7 +316,9 @@ impl Poller {
                 let existing = self.ssh_backends.remove(name);
                 let backend = match existing {
                     Some(b) if b.matches_config(host, *port, user, key_path) => b,
-                    _ => SshBackend::new(host.clone(), *port, user.clone(), key_path.clone()),
+                    Some(_) | None => {
+                        SshBackend::new(host.clone(), *port, user.clone(), key_path.clone())
+                    }
                 };
                 BackendEntry::Ssh(backend)
             }
@@ -326,7 +331,7 @@ impl Poller {
                 let existing = self.k8s_backends.remove(name);
                 let backend = match existing {
                     Some(b) if b.matches_config(kubeconfig.as_ref(), context) => b,
-                    _ => K8sBackend::new(kubeconfig.clone(), context.clone()),
+                    Some(_) | None => K8sBackend::new(kubeconfig.clone(), context.clone()),
                 };
                 BackendEntry::K8s(backend)
             }
@@ -609,11 +614,11 @@ async fn collect_with_entry(
     // the poll loop does with it is log it / mark the server offline).
     let result: Result<Vec<ServerMetrics>, String> = match (&mut entry, server) {
         (BackendEntry::Ssh(backend), ServerConfig::Ssh { name, .. }) => {
-            if !backend.is_connected() {
-                if let Err(e) = backend.connect().await {
-                    backend.disconnect().await;
-                    return (entry, Err(crate::error::error_chain(&e)));
-                }
+            if !backend.is_connected()
+                && let Err(e) = backend.connect().await
+            {
+                backend.disconnect().await;
+                return (entry, Err(crate::error::error_chain(&e)));
             }
             let result = backend.collect_metrics(name).await;
             if result.is_err() {
@@ -632,7 +637,10 @@ async fn collect_with_entry(
             .collect_all(name, namespace)
             .await
             .map_err(|e| crate::error::error_chain(&e)),
-        _ => Err("backend type mismatch".to_string()),
+        (BackendEntry::Ssh(_), ServerConfig::K8s { .. })
+        | (BackendEntry::K8s(_), ServerConfig::Ssh { .. }) => {
+            Err("backend type mismatch".to_string())
+        }
     };
     (entry, result)
 }
@@ -649,8 +657,8 @@ fn offline_metrics(name: &str, server_type: &str) -> ServerMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_decision, tray_alerts_after_grafana, tray_icon_kind, BackoffDecision, TrayIconKind,
-        BACKOFF_DURATION, BACKOFF_THRESHOLD,
+        BACKOFF_DURATION, BACKOFF_THRESHOLD, BackoffDecision, TrayIconKind, backoff_decision,
+        tray_alerts_after_grafana, tray_icon_kind,
     };
     use crate::metrics::{Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel};
     use std::collections::BTreeMap;

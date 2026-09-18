@@ -37,7 +37,7 @@ impl Default for AppConfig {
 
 /// Connection details for a single Grafana instance whose alerts the
 /// app displays. The API token is NOT stored here — it lives in the OS
-/// keychain, keyed by `name` (see `grafana_backend::read_token`).
+/// keychain, keyed by `name` (see `grafana::read_token`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GrafanaConfig {
     /// Display label and keychain key for this connection.

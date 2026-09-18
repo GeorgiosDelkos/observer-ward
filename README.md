@@ -19,7 +19,7 @@ Observer Ward lives in the menu bar (no Dock icon). It polls your infrastructure
 ## Requirements
 
 - macOS (Apple Silicon and Intel)
-- [Rust](https://rustup.rs/) (stable; this repo pins 1.95.0 via `src-tauri/rust-toolchain.toml`)
+- [Rust](https://rustup.rs/) (stable; this repo pins 1.98.0 via `rust-toolchain.toml`)
 - [Tauri CLI](https://v2.tauri.app/) v2
 - Xcode Command Line Tools: `xcode-select --install`
 
@@ -138,16 +138,20 @@ Click **remove** on the card (or right-click → Remove). Confirm in the in-app 
 
 ```
 observer-ward/
+├── rust-toolchain.toml     # Pins rustc 1.98.0 (also under src-tauri/)
 ├── src-tauri/              # Rust / Tauri
 │   └── src/
-│       ├── lib.rs              # App setup, tray, commands
+│       ├── lib.rs              # Crate root: Tauri builder, run()
+│       ├── commands.rs         # IPC commands
+│       ├── tray.rs             # Tray icon, popover show/hide
+│       ├── terminal.rs         # Open ssh/kubectl in Warp or Terminal
 │       ├── config.rs           # Config models and persistence
 │       ├── error.rs            # Error-chain formatting
 │       ├── metrics.rs          # Metric and alert types
 │       ├── poller.rs           # Poll loop, backoff, tray icon
-│       ├── k8s_backend.rs      # Kubernetes Metrics API + kubelet stats
-│       ├── ssh_backend.rs      # SSH remote command parsing
-│       └── grafana_backend.rs  # Grafana Alertmanager alerts
+│       ├── k8s.rs / k8s/       # Kubernetes Metrics API + kubelet stats
+│       ├── ssh.rs / ssh/       # SSH session, TOFU, command parsers
+│       └── grafana.rs          # Grafana Alertmanager alerts
 └── ui/                     # Vanilla JS / HTML / CSS
     ├── index.html
     ├── app.js

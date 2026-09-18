@@ -1,15 +1,15 @@
 [package]
 name = "observer-ward"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "macOS menu-bar dashboard for Kubernetes, SSH hosts, and Grafana alerts"
 license = "MIT"
 repository = "https://github.com/GeorgiosDelkos/observer-ward"
 homepage = "https://github.com/GeorgiosDelkos/observer-ward"
 readme = "../README.md"
 authors = ["Georgios Delkos"]
-# MSRV floor: poller.rs uses Duration::from_mins, stabilized in Rust 1.91.
-rust-version = "1.91"
+# Application pin: matches rust-toolchain.toml. Not a published library.
+rust-version = "1.98"
 
 [lib]
 name = "observer_ward_lib"

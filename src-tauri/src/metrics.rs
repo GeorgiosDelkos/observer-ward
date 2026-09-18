@@ -116,7 +116,7 @@ impl AlertSeverity {
             Some("critical") => AlertSeverity::Critical,
             Some("warning") => AlertSeverity::Warning,
             Some("info") => AlertSeverity::Info,
-            _ => AlertSeverity::Unknown,
+            Some(_) | None => AlertSeverity::Unknown,
         }
     }
 }

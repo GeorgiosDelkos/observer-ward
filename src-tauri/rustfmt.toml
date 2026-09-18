@@ -1,5 +1,5 @@
 # Stable-channel options only. Match edition to Cargo.toml.
-edition = "2021"
+edition = "2024"
 max_width = 100
 # Default keeps multi-line structure readable. Never use "Max".
 use_small_heuristics = "Default"

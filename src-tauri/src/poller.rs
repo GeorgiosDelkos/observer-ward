@@ -54,6 +54,8 @@ pub struct Poller {
     prev_alert_fingerprints: HashSet<String>,
     tray_icons: Option<TrayIcons>,
     prev_tray_state: Option<(MetricLevel, bool)>,
+    latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
+    latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
 }
 
 impl Poller {
@@ -62,6 +64,8 @@ impl Poller {
         config_state: Arc<Mutex<AppConfig>>,
         is_visible: Arc<AtomicBool>,
         wake: Arc<Notify>,
+        latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
+        latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
     ) -> Self {
         let tray_icons = Self::load_tray_icons();
         Self {
@@ -77,6 +81,8 @@ impl Poller {
             prev_alert_fingerprints: HashSet::new(),
             tray_icons,
             prev_tray_state: None,
+            latest_metrics,
+            latest_alerts,
         }
     }
 
@@ -122,19 +128,29 @@ impl Poller {
                 tracing::warn!("failed to emit poll-start: {e}");
             }
 
-            let all_metrics = self.poll_all_servers(&servers).await;
+            let mut grafana_backend = self.grafana_backend.take();
+            let (all_metrics, grafana_result) = tokio::join!(
+                self.poll_all_servers(&servers),
+                Self::poll_grafana(&mut grafana_backend, grafana_cfg.as_ref()),
+            );
+            self.grafana_backend = grafana_backend;
 
             let update = MetricsUpdate {
                 servers: all_metrics,
             };
+            if let Ok(mut guard) = self.latest_metrics.lock() {
+                *guard = Some(update.clone());
+            }
             if let Err(e) = self.app_handle.emit("metrics-update", &update) {
                 tracing::warn!("failed to emit metrics-update: {e}");
             }
 
             self.check_and_notify(notifications_enabled, &update.servers);
 
-            let alerts = if let Some(alerts_update) = self.poll_grafana(grafana_cfg.as_ref()).await
-            {
+            let alerts = if let Some(alerts_update) = grafana_result {
+                if let Ok(mut guard) = self.latest_alerts.lock() {
+                    *guard = Some(alerts_update.clone());
+                }
                 if let Err(e) = self.app_handle.emit("alerts-update", &alerts_update) {
                     tracing::warn!("failed to emit alerts-update: {e}");
                 }
@@ -146,6 +162,10 @@ impl Poller {
                 }
                 alerts_update.alerts
             } else {
+                if let Ok(mut guard) = self.latest_alerts.lock() {
+                    *guard = None;
+                }
+                self.prev_alert_fingerprints.clear();
                 Vec::new()
             };
 
@@ -421,32 +441,32 @@ impl Poller {
     /// auth failures are returned as an `AlertsUpdate` carrying a
     /// `source_error`, never as a panic.
     async fn poll_grafana(
-        &mut self,
+        grafana_backend: &mut Option<GrafanaBackend>,
         grafana: Option<&crate::config::GrafanaConfig>,
     ) -> Option<AlertsUpdate> {
         let Some(cfg) = grafana.filter(|c| c.enabled) else {
-            self.grafana_backend = None;
-            self.prev_alert_fingerprints.clear();
+            *grafana_backend = None;
             return None;
         };
 
-        let needs_rebuild = self
-            .grafana_backend
+        let token = match read_token(&cfg.name) {
+            Ok(token) => token,
+            Err(e) => {
+                *grafana_backend = None;
+                return Some(AlertsUpdate {
+                    alerts: Vec::new(),
+                    source_error: Some(crate::error::error_chain(&e)),
+                });
+            }
+        };
+        let needs_rebuild = grafana_backend
             .as_ref()
-            .is_none_or(|b| !b.matches_config(cfg));
+            .is_none_or(|b| !b.matches_config(cfg) || !b.uses_token(&token));
         if needs_rebuild {
-            let token = match read_token(&cfg.name) {
-                Ok(token) => token,
-                Err(e) => {
-                    return Some(AlertsUpdate {
-                        alerts: Vec::new(),
-                        source_error: Some(crate::error::error_chain(&e)),
-                    });
-                }
-            };
             match GrafanaBackend::new(cfg, token) {
-                Ok(backend) => self.grafana_backend = Some(backend),
+                Ok(backend) => *grafana_backend = Some(backend),
                 Err(e) => {
+                    *grafana_backend = None;
                     return Some(AlertsUpdate {
                         alerts: Vec::new(),
                         source_error: Some(crate::error::error_chain(&e)),
@@ -455,7 +475,7 @@ impl Poller {
             }
         }
 
-        let backend = self.grafana_backend.as_ref()?;
+        let backend = grafana_backend.as_ref()?;
         match tokio::time::timeout(COLLECT_TIMEOUT, backend.fetch_alerts()).await {
             Ok(Ok(alerts)) => Some(AlertsUpdate {
                 alerts,

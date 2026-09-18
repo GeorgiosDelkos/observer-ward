@@ -36,18 +36,19 @@ function loadAliases() {
   }
 }
 
+let aliasesCache = loadAliases();
+
 function saveAlias(fullName, alias) {
-  const aliases = loadAliases();
   if (alias && alias.trim()) {
-    aliases[fullName] = alias.trim();
+    aliasesCache[fullName] = alias.trim();
   } else {
-    delete aliases[fullName];
+    delete aliasesCache[fullName];
   }
-  localStorage.setItem(ALIAS_KEY, JSON.stringify(aliases));
+  localStorage.setItem(ALIAS_KEY, JSON.stringify(aliasesCache));
 }
 
 function getDisplayName(fullName, fallback) {
-  return loadAliases()[fullName] || fallback;
+  return aliasesCache[fullName] || fallback;
 }
 
 // ── DOM refs ──────────────────────────────────
@@ -519,6 +520,9 @@ function renderClusterSummary(clusterName, clusterPods) {
 }
 
 function renderAll() {
+  if (document.querySelector(".alias-input")) {
+    return;
+  }
   if (servers.length === 0 && pods.length === 0) {
     serverListEl.innerHTML = `
       <div class="empty-state">
@@ -992,8 +996,8 @@ async function saveSettings() {
     } else {
       config.grafana = null;
     }
-    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
     await invoke("save_config_cmd", { newConfig: config });
+    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
     const tokenValue = grafanaTokenInput.value.trim();
     if (tokenValue) {
       await invoke("set_grafana_token", {
@@ -1086,8 +1090,14 @@ function handleMetricsUpdate(event) {
       };
     }
 
-    // Track which clusters were included in this poll
-    if (entry.server_type !== "pod") {
+    // Only treat a k8s cluster as "pod inventory is authoritative"
+    // when the backend successfully listed pods. Offline / backoff
+    // rows and pod-list failures must not wipe the previous cards.
+    if (
+      entry.server_type === "k8s" &&
+      entry.status === "online" &&
+      entry.collected_pods
+    ) {
       polledClusters.add(name);
     }
 
@@ -1129,6 +1139,12 @@ function handleMetricsUpdate(event) {
     if (!key.includes("/") && !activeServerNames.has(key)) {
       delete metricsHistory[key];
       delete anomalyState[key];
+    }
+  }
+
+  for (const pod of pods) {
+    if (!receivedPodNames.has(pod.name) && !polledClusters.has(pod.cluster)) {
+      currentPods.push(pod);
     }
   }
 
@@ -1244,6 +1260,23 @@ async function init() {
   });
   await listen("metrics-update", handleMetricsUpdate);
   await listen("alerts-update", handleAlertsUpdate);
+
+  try {
+    const latest = await invoke("get_latest_metrics");
+    if (latest) {
+      handleMetricsUpdate({ payload: latest });
+    }
+  } catch (err) {
+    console.error("Failed to load cached metrics:", err);
+  }
+  try {
+    const alerts = await invoke("get_latest_alerts");
+    if (alerts) {
+      handleAlertsUpdate({ payload: alerts });
+    }
+  } catch (err) {
+    console.error("Failed to load cached alerts:", err);
+  }
 }
 
 // ── Event Bindings ────────────────────────────

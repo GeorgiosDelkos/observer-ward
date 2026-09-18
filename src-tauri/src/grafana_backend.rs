@@ -8,6 +8,7 @@
 //! body to the pure `parse_alerts`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -147,6 +148,8 @@ impl GrafanaBackend {
             // verify_tls == false opts out of certificate validation for a
             // trusted self-signed instance; default config keeps it on.
             .danger_accept_invalid_certs(!config.verify_tls)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
             .build()
             .map_err(GrafanaError::Client)?;
         Ok(Self {
@@ -163,6 +166,13 @@ impl GrafanaBackend {
     #[must_use]
     pub fn matches_config(&self, config: &GrafanaConfig) -> bool {
         self.base_url == config.url && self.verify_tls == config.verify_tls
+    }
+
+    /// True if this backend is using `token`. Compared on each poll so a
+    /// keychain rotation rebuilds the client without a URL change.
+    #[must_use]
+    pub fn uses_token(&self, token: &str) -> bool {
+        self.token == token
     }
 
     /// The Grafana-embedded Alertmanager alerts endpoint (note the
@@ -319,6 +329,8 @@ mod tests {
         };
         let backend = GrafanaBackend::new(&cfg, "token".to_string()).expect("build");
         assert!(backend.matches_config(&cfg));
+        assert!(backend.uses_token("token"));
+        assert!(!backend.uses_token("other"));
 
         let changed = GrafanaConfig {
             url: "https://other.internal".to_string(),

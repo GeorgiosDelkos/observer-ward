@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::api::{Api, ListParams, ObjectMeta};
+use kube::api::{Api, ListParams, ObjectList, ObjectMeta};
 use kube::core::{ClusterResourceScope, NamespaceResourceScope};
 use kube::{Client, Config, Resource};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,10 @@ pub enum K8sError {
     CreateClient(#[source] Box<kube::Error>),
     #[error("k8s client is not connected")]
     NotConnected,
+    #[error("kubeconfig load task failed")]
+    KubeconfigTask,
+    #[error("timed out fetching stats for node {node}")]
+    NodeStatsTimeout { node: String },
     #[error("failed to list nodes")]
     ListNodes(#[source] Box<kube::Error>),
     #[error("failed to list events in namespace {namespace}")]
@@ -282,6 +286,37 @@ struct PvcRef {}
 
 // -- K8s backend --
 
+const NODE_STATS_TIMEOUT: Duration = Duration::from_secs(8);
+const KUBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const KUBE_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const EVENT_LIST_LIMIT: u32 = 400;
+
+fn event_list_params() -> ListParams {
+    ListParams::default()
+        .fields("involvedObject.kind=Pod")
+        .limit(EVENT_LIST_LIMIT)
+        .timeout(15)
+}
+
+/// Percent-encode a URL path segment so a node name cannot alter the
+/// kubelet proxy path. Kubernetes node names are DNS-1123, but the
+/// proxy URL is still interpolated.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Kubernetes backend that collects cluster-wide metrics by
 /// aggregating across all nodes.
 pub struct K8sBackend {
@@ -322,28 +357,33 @@ impl K8sBackend {
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
     pub async fn connect(&mut self) -> Result<(), K8sError> {
-        let kubeconfig = match &self.kubeconfig {
-            Some(path) => kube::config::Kubeconfig::read_from(path).map_err(|source| {
+        let kubeconfig_path = self.kubeconfig.clone();
+        let kubeconfig = tokio::task::spawn_blocking(move || match kubeconfig_path {
+            Some(path) => kube::config::Kubeconfig::read_from(&path).map_err(|source| {
                 K8sError::ReadKubeconfig {
-                    path: path.clone(),
+                    path,
                     source: Box::new(source),
                 }
-            })?,
+            }),
             None => kube::config::Kubeconfig::read()
-                .map_err(|source| K8sError::ReadDefaultKubeconfig(Box::new(source)))?,
-        };
+                .map_err(|source| K8sError::ReadDefaultKubeconfig(Box::new(source))),
+        })
+        .await
+        .map_err(|_| K8sError::KubeconfigTask)??;
 
         let options = kube::config::KubeConfigOptions {
             context: Some(self.context.clone()),
             ..Default::default()
         };
 
-        let config = Config::from_custom_kubeconfig(kubeconfig, &options)
+        let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
             .await
             .map_err(|source| K8sError::BuildConfig {
                 context: self.context.clone(),
                 source: Box::new(source),
             })?;
+        config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
+        config.read_timeout = Some(KUBE_READ_TIMEOUT);
 
         let client =
             Client::try_from(config).map_err(|source| K8sError::CreateClient(Box::new(source)))?;
@@ -367,7 +407,14 @@ impl K8sBackend {
             }
             let client = client.clone();
             let name = name.to_string();
-            tasks.spawn(async move { fetch_node_stats(&client, &name).await });
+            tasks.spawn(async move {
+                match tokio::time::timeout(NODE_STATS_TIMEOUT, fetch_node_stats(&client, &name))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(K8sError::NodeStatsTimeout { node: name }),
+                }
+            });
         }
 
         let mut summaries = Vec::with_capacity(nodes.len());
@@ -395,7 +442,7 @@ impl K8sBackend {
     ) -> Result<HashMap<String, String>, K8sError> {
         let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
         let events = events_api
-            .list(&ListParams::default())
+            .list(&event_list_params())
             .await
             .map_err(|source| K8sError::ListEvents {
                 namespace: namespace.to_string(),
@@ -449,19 +496,13 @@ impl K8sBackend {
         reason = "byte/nanosecond sums fit comfortably in f64 \
                   mantissa for percentage and rate calculations"
     )]
-    pub async fn collect_metrics(
+    fn cluster_metrics_from_usage(
         &mut self,
-        server_name: &str,
-        stats: &[StatsSummary],
-        alloc_cpu: f64,
-        alloc_mem: u64,
-    ) -> Result<ServerMetrics, K8sError> {
-        let client = self.client.as_ref().ok_or(K8sError::NotConnected)?.clone();
-
-        let (cpu_used_cores, mem_used_bytes) = fetch_cpu_mem_usage(&client).await?;
-
-        let cpu_pct = if alloc_cpu > 0.0 {
-            cpu_used_cores / alloc_cpu * 100.0
+        data: &ClusterPollData<'_>,
+        collected_pods: bool,
+    ) -> ServerMetrics {
+        let cpu_pct = if data.alloc_cpu > 0.0 {
+            data.cpu_used / data.alloc_cpu * 100.0
         } else {
             0.0
         };
@@ -469,14 +510,14 @@ impl K8sBackend {
             clippy::cast_precision_loss,
             reason = "memory byte totals fit comfortably in f64"
         )]
-        let mem_pct = if alloc_mem > 0 {
-            mem_used_bytes as f64 / alloc_mem as f64 * 100.0
+        let mem_pct = if data.alloc_mem > 0 {
+            data.mem_used as f64 / data.alloc_mem as f64 * 100.0
         } else {
             0.0
         };
 
         let (disk_pct, total_rx, total_tx, disk_used, disk_capacity) =
-            compute_cluster_disk_net(stats);
+            compute_cluster_disk_net(data.stats);
 
         let now = Instant::now();
         let (rx_per_sec, tx_per_sec) = match (self.prev_net_bytes, self.prev_poll_time) {
@@ -506,10 +547,10 @@ impl K8sBackend {
             clippy::cast_possible_truncation,
             reason = "cluster node count is always small"
         )]
-        let node_count = stats.len() as u32;
+        let node_count = data.stats.len() as u32;
 
-        Ok(ServerMetrics {
-            server_name: server_name.to_string(),
+        ServerMetrics {
+            server_name: data.server_name.to_string(),
             server_type: "k8s".to_string(),
             status: ServerStatus::Online,
             cpu_percent: cpu_pct,
@@ -517,55 +558,29 @@ impl K8sBackend {
             disk_percent: disk_pct,
             net_rx_bytes_per_sec: rx_per_sec,
             net_tx_bytes_per_sec: tx_per_sec,
-            cpu_millicores: cpu_used_cores * 1000.0,
-            memory_bytes: mem_used_bytes,
+            cpu_millicores: data.cpu_used * 1000.0,
+            memory_bytes: data.mem_used,
             disk_used_bytes: disk_used,
             disk_capacity_bytes: disk_capacity,
             node_count,
+            collected_pods,
             ..ServerMetrics::default()
-        })
+        }
     }
 
-    /// Collect per-pod CPU and memory metrics for a namespace.
+    /// Build per-pod `ServerMetrics` from already-fetched lists.
     ///
-    /// Each pod becomes a separate `ServerMetrics` entry with
-    /// `server_type: "pod"` and `server_name: "{cluster}/{pod}"`.
-    /// Percentages are relative to the pod's own resource
-    /// requests (preferred) or limits. Falls back to cluster
-    /// allocatable when neither is set.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "byte deltas fit comfortably in f64 for rate calc"
-    )]
-    pub async fn collect_pod_metrics(
+    /// Pods present in the spec list but missing from metrics-server
+    /// (Pending, `CrashLoopBackOff` with no samples) still get a card so they
+    /// are not invisible. Succeeded pods are skipped.
+    fn assemble_pod_metrics(
         &mut self,
-        cluster_name: &str,
-        namespace: &str,
-        stats: &[StatsSummary],
-        events: &HashMap<String, String>,
-        cluster_cpu: f64,
-        cluster_mem: u64,
-    ) -> Result<Vec<ServerMetrics>, K8sError> {
-        let client = self.client.as_ref().ok_or(K8sError::NotConnected)?.clone();
-
-        let metrics_api: Api<PodMetrics> = Api::namespaced(client.clone(), namespace);
-        let pods_api: Api<Pod> = Api::namespaced(client, namespace);
-        let params = ListParams::default();
-
-        let (pod_metrics_result, pod_specs_result) =
-            tokio::join!(metrics_api.list(&params), pods_api.list(&params),);
-
-        let pod_metrics_list = pod_metrics_result.map_err(|source| K8sError::ListPodMetrics {
-            namespace: namespace.to_string(),
-            source: Box::new(source),
-        })?;
-        let pod_specs = pod_specs_result.map_err(|source| K8sError::ListPods {
-            namespace: namespace.to_string(),
-            source: Box::new(source),
-        })?;
-
-        let pvc_map = extract_pod_pvc(stats, namespace);
-        let net_map = extract_pod_network(stats, namespace);
+        data: &ClusterPollData<'_>,
+        pod_metrics_list: &ObjectList<PodMetrics>,
+        pod_specs: &ObjectList<Pod>,
+    ) -> Vec<ServerMetrics> {
+        let pvc_map = extract_pod_pvc(data.stats, data.namespace);
+        let net_map = extract_pod_network(data.stats, data.namespace);
 
         let pod_index: HashMap<&str, &Pod> = pod_specs
             .items
@@ -573,19 +588,25 @@ impl K8sBackend {
             .filter_map(|p| p.metadata.name.as_deref().map(|n| (n, p)))
             .collect();
 
-        let mut results = Vec::with_capacity(pod_metrics_list.items.len());
+        let mut results = Vec::with_capacity(pod_metrics_list.items.len() + pod_specs.items.len());
+        let mut seen = HashSet::new();
 
-        for pm in &pod_metrics_list {
+        for pm in pod_metrics_list {
             match build_pod_server_metrics(
                 pm,
                 &pod_index,
-                cluster_name,
-                cluster_cpu,
-                cluster_mem,
+                data.server_name,
+                data.alloc_cpu,
+                data.alloc_mem,
                 &pvc_map,
-                events,
+                data.events,
             ) {
-                Ok(m) => results.push(m),
+                Ok(m) => {
+                    if let Some(name) = pm.metadata.name.as_deref() {
+                        seen.insert(name.to_string());
+                    }
+                    results.push(m);
+                }
                 Err(e) => {
                     let name = pm.metadata.name.as_deref().unwrap_or("unknown");
                     tracing::warn!("skipping pod {name}: {}", crate::error::error_chain(&e));
@@ -593,38 +614,39 @@ impl K8sBackend {
             }
         }
 
-        let now = Instant::now();
-        if let Some(prev_time) = self.prev_pod_poll_time {
-            let elapsed = now.duration_since(prev_time).as_secs_f64();
-            if elapsed > 0.0 {
-                for m in &mut results {
-                    let pod_name = m.server_name.split_once('/').map_or("", |(_, p)| p);
-                    let Some(&(curr_rx, curr_tx)) = net_map.get(pod_name) else {
-                        continue;
-                    };
-                    let Some(&(prev_rx, prev_tx)) = self.prev_pod_net.get(pod_name) else {
-                        continue;
-                    };
-                    let rx_rate = curr_rx.saturating_sub(prev_rx) as f64 / elapsed;
-                    let tx_rate = curr_tx.saturating_sub(prev_tx) as f64 / elapsed;
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "rates from byte deltas are \
-                                  always small positive"
-                    )]
-                    {
-                        m.net_rx_bytes_per_sec = rx_rate as u64;
-                        m.net_tx_bytes_per_sec = tx_rate as u64;
-                    }
-                }
+        for pod in &pod_specs.items {
+            let Some(name) = pod.metadata.name.as_deref() else {
+                continue;
+            };
+            if seen.contains(name) {
+                continue;
             }
+            let status = derive_pod_status(Some(pod));
+            if status == "Succeeded" {
+                continue;
+            }
+            results.push(ServerMetrics {
+                server_name: format!("{}/{name}", data.server_name),
+                server_type: "pod".to_string(),
+                status: ServerStatus::Online,
+                restart_count: pod_restart_count(Some(pod)),
+                start_time: pod_start_time(Some(pod)),
+                pod_status: status,
+                last_event: data.events.get(name).cloned().unwrap_or_default(),
+                ..ServerMetrics::default()
+            });
         }
 
+        apply_pod_net_rates(
+            &mut results,
+            &net_map,
+            &self.prev_pod_net,
+            self.prev_pod_poll_time,
+        );
         self.prev_pod_net = net_map;
-        self.prev_pod_poll_time = Some(now);
+        self.prev_pod_poll_time = Some(Instant::now());
 
-        Ok(results)
+        results
     }
 
     /// Collect all metrics for a K8s cluster: node-level
@@ -660,51 +682,130 @@ impl K8sBackend {
             }
         };
 
-        let stats = Self::fetch_all_node_stats(&client, &nodes).await;
+        let (stats, usage_result, events_result, pod_lists_result) = tokio::join!(
+            Self::fetch_all_node_stats(&client, &nodes),
+            fetch_cpu_mem_usage(&client),
+            Self::fetch_pod_events(&client, namespace),
+            fetch_pod_metrics_and_specs(&client, namespace),
+        );
 
-        let events = Self::fetch_pod_events(&client, namespace)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "failed to fetch pod events for {server_name}/{namespace}: {}",
-                    crate::error::error_chain(&e)
-                );
-                HashMap::new()
-            });
-
-        let node_metrics = match self
-            .collect_metrics(server_name, &stats, alloc_cpu, alloc_mem)
-            .await
-        {
-            Ok(m) => m,
+        let (cpu_used, mem_used) = match usage_result {
+            Ok(usage) => usage,
             Err(e) => {
                 self.client = None;
                 return Err(e);
             }
         };
 
-        let pod_metrics = self
-            .collect_pod_metrics(
-                server_name,
-                namespace,
-                &stats,
-                &events,
-                alloc_cpu,
-                alloc_mem,
-            )
-            .await
-            .unwrap_or_else(|e| {
+        let events = events_result.unwrap_or_else(|e| {
+            tracing::warn!(
+                "failed to fetch pod events for {server_name}/{namespace}: {}",
+                crate::error::error_chain(&e)
+            );
+            HashMap::new()
+        });
+
+        let poll_data = ClusterPollData {
+            server_name,
+            namespace,
+            stats: &stats,
+            events: &events,
+            alloc_cpu,
+            alloc_mem,
+            cpu_used,
+            mem_used,
+        };
+
+        let (collected_pods, pod_metrics) = match pod_lists_result {
+            Ok((pod_metrics_list, pod_specs)) => (
+                true,
+                self.assemble_pod_metrics(&poll_data, &pod_metrics_list, &pod_specs),
+            ),
+            Err(e) => {
                 tracing::warn!(
                     "failed to collect pod metrics for {server_name}/{namespace}: {}",
                     crate::error::error_chain(&e)
                 );
-                Vec::new()
-            });
+                (false, Vec::new())
+            }
+        };
+
+        let node_metrics = self.cluster_metrics_from_usage(&poll_data, collected_pods);
 
         let mut results = Vec::with_capacity(1 + pod_metrics.len());
         results.push(node_metrics);
         results.extend(pod_metrics);
         Ok(results)
+    }
+}
+
+struct ClusterPollData<'a> {
+    server_name: &'a str,
+    namespace: &'a str,
+    stats: &'a [StatsSummary],
+    events: &'a HashMap<String, String>,
+    alloc_cpu: f64,
+    alloc_mem: u64,
+    cpu_used: f64,
+    mem_used: u64,
+}
+
+async fn fetch_pod_metrics_and_specs(
+    client: &Client,
+    namespace: &str,
+) -> Result<(ObjectList<PodMetrics>, ObjectList<Pod>), K8sError> {
+    let metrics_api: Api<PodMetrics> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let params = ListParams::default();
+    let (pod_metrics_result, pod_specs_result) =
+        tokio::join!(metrics_api.list(&params), pods_api.list(&params),);
+    let pod_metrics_list = pod_metrics_result.map_err(|source| K8sError::ListPodMetrics {
+        namespace: namespace.to_string(),
+        source: Box::new(source),
+    })?;
+    let pod_specs = pod_specs_result.map_err(|source| K8sError::ListPods {
+        namespace: namespace.to_string(),
+        source: Box::new(source),
+    })?;
+    Ok((pod_metrics_list, pod_specs))
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte deltas fit comfortably in f64 for rate calc"
+)]
+fn apply_pod_net_rates(
+    results: &mut [ServerMetrics],
+    net_map: &HashMap<String, (u64, u64)>,
+    prev_pod_net: &HashMap<String, (u64, u64)>,
+    prev_pod_poll_time: Option<Instant>,
+) {
+    let Some(prev_time) = prev_pod_poll_time else {
+        return;
+    };
+    let elapsed = Instant::now().duration_since(prev_time).as_secs_f64();
+    if elapsed <= 0.0 {
+        return;
+    }
+    for m in results {
+        let pod_name = m.server_name.split_once('/').map_or("", |(_, p)| p);
+        let Some(&(curr_rx, curr_tx)) = net_map.get(pod_name) else {
+            continue;
+        };
+        let Some(&(prev_rx, prev_tx)) = prev_pod_net.get(pod_name) else {
+            continue;
+        };
+        let rx_rate = curr_rx.saturating_sub(prev_rx) as f64 / elapsed;
+        let tx_rate = curr_tx.saturating_sub(prev_tx) as f64 / elapsed;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "rates from byte deltas are always small positive"
+        )]
+        {
+            m.net_rx_bytes_per_sec = rx_rate as u64;
+            m.net_tx_bytes_per_sec = tx_rate as u64;
+        }
     }
 }
 
@@ -1087,7 +1188,8 @@ fn extract_pod_network(summaries: &[StatsSummary], namespace: &str) -> HashMap<S
 /// Fetch the kubelet stats summary for a single node via the
 /// node proxy API.
 async fn fetch_node_stats(client: &Client, node_name: &str) -> Result<StatsSummary, K8sError> {
-    let url = format!("/api/v1/nodes/{node_name}/proxy/stats/summary");
+    let encoded = encode_path_segment(node_name);
+    let url = format!("/api/v1/nodes/{encoded}/proxy/stats/summary");
 
     let request = http::Request::get(&url)
         .body(Vec::new())
@@ -1121,6 +1223,8 @@ fn parse_cpu_quantity(q: &Quantity) -> Result<f64, QuantityParseError> {
         v.parse::<f64>()
             .map(|n| n / 1_000_000_000.0)
             .map_err(cpu_err)
+    } else if let Some(v) = s.strip_suffix('u') {
+        v.parse::<f64>().map(|n| n / 1_000_000.0).map_err(cpu_err)
     } else if let Some(v) = s.strip_suffix('m') {
         v.parse::<f64>().map(|n| n / 1000.0).map_err(cpu_err)
     } else {
@@ -1234,6 +1338,12 @@ mod tests {
     }
 
     #[test]
+    fn cpu_microcores() {
+        let result = parse_cpu_quantity(&q("100u")).unwrap();
+        assert_f64_near(result, 0.0001, 1e-12);
+    }
+
+    #[test]
     fn cpu_millicores() {
         let result = parse_cpu_quantity(&q("250m")).unwrap();
         assert_f64_near(result, 0.25, 1e-9);
@@ -1255,6 +1365,26 @@ mod tests {
     fn cpu_fractional_cores() {
         let result = parse_cpu_quantity(&q("0.5")).unwrap();
         assert_f64_near(result, 0.5, 1e-9);
+    }
+
+    #[test]
+    fn encode_path_segment_leaves_dns_names() {
+        assert_eq!(encode_path_segment("worker-1.prod"), "worker-1.prod");
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_slash() {
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn event_list_params_are_bounded() {
+        let params = event_list_params();
+        assert_eq!(
+            params.field_selector.as_deref(),
+            Some("involvedObject.kind=Pod")
+        );
+        assert_eq!(params.limit, Some(EVENT_LIST_LIMIT));
     }
 
     #[test]

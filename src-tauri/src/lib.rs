@@ -40,14 +40,6 @@ use tray::setup_tray_and_window;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    // keyring v4 requires a credential store to be registered before any
-    // Entry operation; register the platform-native store (macOS Keychain)
-    // once at startup. A failure here only disables Grafana token storage —
-    // the rest of the app still works — so log and continue.
-    if let Err(e) = keyring::use_native_store(false) {
-        tracing::warn!("failed to initialize keychain store: {e}");
-    }
-
     let initial_config = match config::load_config() {
         Ok(config) => config,
         Err(e) => {

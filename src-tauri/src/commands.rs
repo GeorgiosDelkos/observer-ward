@@ -184,7 +184,7 @@ pub(crate) fn set_grafana_token(
     name: String,
     token: String,
 ) -> Result<(), String> {
-    let entry = keyring_core::Entry::new(grafana::KEYCHAIN_SERVICE, &name)
+    let entry = keyring::Entry::new(grafana::KEYCHAIN_SERVICE, &name)
         .map_err(|e| format!("keychain error: {e}"))?;
     entry
         .set_password(&token)
@@ -210,11 +210,11 @@ pub(crate) fn has_grafana_token(name: String) -> bool {
     reason = "tauri::command macro requires owned parameters"
 )]
 pub(crate) fn delete_grafana_token(wake: State<'_, WakeState>, name: String) -> Result<(), String> {
-    let entry = keyring_core::Entry::new(grafana::KEYCHAIN_SERVICE, &name)
+    let entry = keyring::Entry::new(grafana::KEYCHAIN_SERVICE, &name)
         .map_err(|e| format!("keychain error: {e}"))?;
     match entry.delete_credential() {
         // Deleting a token that was never stored is a no-op success.
-        Ok(()) | Err(keyring_core::Error::NoEntry) => {
+        Ok(()) | Err(keyring::Error::NoEntry) => {
             wake.0.notify_one();
             Ok(())
         }

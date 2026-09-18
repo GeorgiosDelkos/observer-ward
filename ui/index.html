@@ -30,7 +30,7 @@
     <div id="add-form-panel" class="add-form-panel">
       <div class="add-form-inner">
         <div class="form-title">Add Server</div>
-        <form id="add-form" autocomplete="off">
+        <form id="add-form" autocomplete="off" novalidate>
           <div class="form-group">
             <label for="field-name">Name</label>
             <input id="field-name" type="text"
@@ -53,7 +53,7 @@
           <div class="form-group field-k8s">
             <label for="field-namespace">Namespace</label>
             <input id="field-namespace" type="text"
-                   placeholder="e.g. default" required>
+                   placeholder="e.g. default">
           </div>
           <div class="form-group field-k8s">
             <label for="field-kubeconfig">
@@ -181,6 +181,7 @@
           <input type="password" id="grafana-token"
                  placeholder="(stored; leave blank to keep)">
         </div>
+        <div id="settings-error" class="form-error"></div>
         <div class="settings-actions">
           <button id="btn-save-settings"
                   class="btn btn-primary">SAVE</button>
@@ -193,6 +194,21 @@
       <button class="btn-settings" id="btn-settings">
         &#x2699; Settings
       </button>
+      <button class="btn-settings" id="btn-quit">Quit</button>
+    </div>
+
+    <div id="remove-modal" class="modal-overlay">
+      <div class="modal" role="dialog" aria-modal="true"
+           aria-labelledby="remove-modal-title">
+        <div id="remove-modal-title" class="modal-title">Remove?</div>
+        <p id="remove-modal-body" class="modal-body"></p>
+        <div class="modal-actions">
+          <button type="button" id="btn-remove-cancel"
+                  class="btn btn-cancel">Cancel</button>
+          <button type="button" id="btn-remove-confirm"
+                  class="btn btn-danger">Remove</button>
+        </div>
+      </div>
     </div>
 
   </div>

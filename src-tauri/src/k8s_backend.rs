@@ -357,7 +357,10 @@ impl K8sBackend {
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
     pub async fn connect(&mut self) -> Result<(), K8sError> {
-        let kubeconfig_path = self.kubeconfig.clone();
+        let kubeconfig_path = self
+            .kubeconfig
+            .clone()
+            .map(|p| crate::config::expand_tilde(&p));
         let kubeconfig = tokio::task::spawn_blocking(move || match kubeconfig_path {
             Some(path) => kube::config::Kubeconfig::read_from(&path).map_err(|source| {
                 K8sError::ReadKubeconfig {
@@ -867,7 +870,7 @@ fn build_pod_server_metrics(
 }
 
 /// Compute CPU and memory percentages for a pod, preferring
-/// pod-level requests/limits over cluster allocatable.
+/// container limits (then requests) over cluster allocatable.
 #[expect(
     clippy::cast_precision_loss,
     reason = "byte sums fit in f64 for percentage calculations"
@@ -1027,9 +1030,10 @@ fn sum_allocatable(nodes: &[Node]) -> Result<(f64, u64), K8sError> {
     Ok((total_cpu, total_mem))
 }
 
-/// Sum a pod's container resource requests (CPU in fractional
-/// cores, memory in bytes). Prefers `requests`; falls back to
-/// `limits`. Returns `(0.0, 0)` when neither is set.
+/// Sum a pod's container resource caps (CPU in fractional cores,
+/// memory in bytes). Prefers `limits`; if a limit is unset, uses
+/// the matching `requests` reservation. CPU and memory are chosen
+/// independently. Returns `(0.0, 0)` when neither is set.
 fn pod_allocations(pod: Option<&Pod>) -> (f64, u64) {
     let Some(pod) = pod else {
         return (0.0, 0);
@@ -1047,17 +1051,16 @@ fn pod_allocations(pod: Option<&Pod>) -> (f64, u64) {
             continue;
         };
 
-        // Prefer requests, fall back to limits
         let cpu_q = res
-            .requests
+            .limits
             .as_ref()
-            .and_then(|r| r.get("cpu"))
-            .or_else(|| res.limits.as_ref().and_then(|l| l.get("cpu")));
+            .and_then(|l| l.get("cpu"))
+            .or_else(|| res.requests.as_ref().and_then(|r| r.get("cpu")));
         let mem_q = res
-            .requests
+            .limits
             .as_ref()
-            .and_then(|r| r.get("memory"))
-            .or_else(|| res.limits.as_ref().and_then(|l| l.get("memory")));
+            .and_then(|l| l.get("memory"))
+            .or_else(|| res.requests.as_ref().and_then(|r| r.get("memory")));
 
         if let Some(q) = cpu_q {
             if let Ok(v) = parse_cpu_quantity(q) {
@@ -1748,6 +1751,132 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    struct ContainerRes {
+        cpu_request: Option<&'static str>,
+        mem_request: Option<&'static str>,
+        cpu_limit: Option<&'static str>,
+        mem_limit: Option<&'static str>,
+    }
+
+    fn qty_map(
+        cpu: Option<&str>,
+        mem: Option<&str>,
+    ) -> Option<std::collections::BTreeMap<String, Quantity>> {
+        let mut map = std::collections::BTreeMap::new();
+        if let Some(cpu) = cpu {
+            map.insert("cpu".to_string(), q(cpu));
+        }
+        if let Some(mem) = mem {
+            map.insert("memory".to_string(), q(mem));
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
+        }
+    }
+
+    fn make_pod_with_resources(name: &str, containers: &[ContainerRes]) -> Pod {
+        use k8s_openapi::api::core::v1::{Container, PodSpec, ResourceRequirements};
+
+        let spec_containers = containers
+            .iter()
+            .map(|c| Container {
+                name: "app".to_string(),
+                resources: Some(ResourceRequirements {
+                    requests: qty_map(c.cpu_request, c.mem_request),
+                    limits: qty_map(c.cpu_limit, c.mem_limit),
+                    ..ResourceRequirements::default()
+                }),
+                ..Container::default()
+            })
+            .collect();
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                containers: spec_containers,
+                ..PodSpec::default()
+            }),
+            ..Pod::default()
+        }
+    }
+
+    #[test]
+    fn pod_allocations_prefers_limits_over_requests() {
+        let pod = make_pod_with_resources(
+            "hcfs-server",
+            &[ContainerRes {
+                cpu_request: Some("100m"),
+                mem_request: Some("128Mi"),
+                cpu_limit: Some("1"),
+                mem_limit: Some("1Gi"),
+            }],
+        );
+        let (cpu, mem) = pod_allocations(Some(&pod));
+        assert_f64_near(cpu, 1.0, 1e-9);
+        assert_eq!(mem, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pod_allocations_uses_requests_when_limits_absent() {
+        let pod = make_pod_with_resources(
+            "worker",
+            &[ContainerRes {
+                cpu_request: Some("250m"),
+                mem_request: Some("256Mi"),
+                cpu_limit: None,
+                mem_limit: None,
+            }],
+        );
+        let (cpu, mem) = pod_allocations(Some(&pod));
+        assert_f64_near(cpu, 0.25, 1e-9);
+        assert_eq!(mem, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pod_allocations_cpu_and_memory_caps_are_independent() {
+        let pod = make_pod_with_resources(
+            "mixed",
+            &[ContainerRes {
+                cpu_request: Some("100m"),
+                mem_request: Some("512Mi"),
+                cpu_limit: Some("2"),
+                mem_limit: None,
+            }],
+        );
+        let (cpu, mem) = pod_allocations(Some(&pod));
+        assert_f64_near(cpu, 2.0, 1e-9);
+        assert_eq!(mem, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn pod_percent_uses_limits_not_small_requests() {
+        let pod = make_pod_with_resources(
+            "hcfs-server",
+            &[ContainerRes {
+                cpu_request: Some("100m"),
+                mem_request: Some("128Mi"),
+                cpu_limit: Some("1"),
+                mem_limit: Some("1Gi"),
+            }],
+        );
+        // 90m / 1 core = 9%, 64Mi / 1Gi = 6.25%. Against requests these
+        // would look like 90% and 50%.
+        let (cpu, mem) = compute_pod_percentages(
+            0.09,
+            64 * 1024 * 1024,
+            Some(&pod),
+            64.0,
+            256 * 1024 * 1024 * 1024,
+        );
+        assert_f64_near(cpu, 9.0, 0.01);
+        assert_f64_near(mem, 6.25, 0.01);
     }
 
     #[test]

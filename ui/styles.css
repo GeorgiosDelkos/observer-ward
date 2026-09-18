@@ -76,6 +76,7 @@ body {
 
 /* Layout */
 .container {
+  position: relative;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -489,6 +490,53 @@ body {
   background: var(--bg-hover);
   color: var(--text);
 }
+.btn-danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+.btn-danger:hover {
+  opacity: 0.9;
+}
+
+/* In-window confirm. Native dialogs steal focus and hide the tray. */
+.modal-overlay {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1100;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.5);
+}
+.modal-overlay.open {
+  display: flex;
+}
+.modal {
+  width: 100%;
+  background: #2c2c2e;
+  border: 1px solid var(--sep);
+  border-radius: var(--r-window);
+  padding: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.modal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.modal-body {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+.modal-actions {
+  display: flex;
+  gap: 8px;
+}
 
 /* Settings Panel */
 .settings-panel {
@@ -610,7 +658,8 @@ body {
   padding: 10px var(--pad-x) 12px;
   border-top: 1px solid var(--sep);
   display: flex;
-  justify-content: center;
+  justify-content: space-between;
+  align-items: center;
   flex-shrink: 0;
 }
 .btn-settings {
@@ -729,7 +778,11 @@ body {
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  flex-shrink: 0;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: default;
 }
 .cluster-stat {
@@ -753,6 +806,14 @@ body {
   padding-left: 26px;
 }
 
+/* More than VISIBLE_POD_CARDS: max-height is set in JS from the
+   first three cards so the window stays compact and the rest scroll. */
+.cluster-pods.is-scrollable {
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 /* Pod Logs Button */
 .btn-logs {
   background: none;
@@ -772,6 +833,27 @@ body {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-bg);
+}
+
+.btn-remove {
+  background: none;
+  border: 1px solid var(--sep);
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  margin-left: auto;
+  flex-shrink: 0;
+  transition: background 0.18s ease, color 0.18s ease,
+    border-color 0.18s ease;
+}
+.btn-remove:hover {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(255, 69, 58, 0.16);
 }
 
 /* Pod Event */

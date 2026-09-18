@@ -6,6 +6,7 @@ const { listen } = window.__TAURI__.event;
 const WIN_WIDTH = 380;
 const WIN_MIN_HEIGHT = 100;
 const WIN_PADDING = 20;
+const VISIBLE_POD_CARDS = 3;
 
 const UNITS = ["B/s", "KB/s", "MB/s", "GB/s"];
 const KILO = 1024;
@@ -72,16 +73,62 @@ function resizeToContent() {
   const header = document.querySelector(".header");
   const footer = document.querySelector(".footer");
 
+  const alerts = document.getElementById("alerts-section");
   const contentHeight =
     header.offsetHeight +
     addFormPanel.offsetHeight +
-    serverListEl.scrollHeight +
+    (alerts ? alerts.offsetHeight : 0) +
+    serverListEl.offsetHeight +
     settingsPanel.offsetHeight +
     footer.offsetHeight +
     WIN_PADDING;
 
   const height = Math.max(WIN_MIN_HEIGHT, contentHeight);
   invoke("resize_window", { width: WIN_WIDTH, height }).catch(() => {});
+}
+
+function snapshotPodScroll() {
+  const pos = {};
+  for (const list of document.querySelectorAll(".cluster-pods")) {
+    const cluster = list.dataset.clusterPods;
+    if (cluster) {
+      pos[cluster] = list.scrollTop;
+    }
+  }
+  return pos;
+}
+
+function restorePodScroll(pos) {
+  for (const list of document.querySelectorAll(".cluster-pods")) {
+    const cluster = list.dataset.clusterPods;
+    if (cluster && pos[cluster]) {
+      list.scrollTop = pos[cluster];
+    }
+  }
+}
+
+// Pod cards vary in height (metrics, PVC, events), so the 3-visible
+// cap is measured from the first three cards rather than a CSS constant.
+function capClusterPodLists() {
+  for (const list of document.querySelectorAll(".cluster-pods")) {
+    if (list.style.display === "none") {
+      list.style.maxHeight = "";
+      list.classList.remove("is-scrollable");
+      continue;
+    }
+    const cards = list.querySelectorAll(":scope > .server-card");
+    if (cards.length <= VISIBLE_POD_CARDS) {
+      list.style.maxHeight = "";
+      list.classList.remove("is-scrollable");
+      continue;
+    }
+    let height = 0;
+    for (let i = 0; i < VISIBLE_POD_CARDS; i += 1) {
+      height += cards[i].offsetHeight;
+    }
+    list.style.maxHeight = `${height}px`;
+    list.classList.add("is-scrollable");
+  }
 }
 
 // ── Helpers ───────────────────────────────────
@@ -389,6 +436,7 @@ function renderServerCard(server) {
         <span class="server-type-badge">${serverTypeBadge(server)}</span>
         ${nodeCountBadge}
         ${offlineHtml}
+        ${renderRemoveButton(name)}
       </div>
       ${metricsHtml}
     </div>`;
@@ -516,6 +564,7 @@ function renderClusterSummary(clusterName, clusterPods) {
       <span class="cluster-stat">${clusterPods.length} pods</span>
       <span class="cluster-stat">${formatMillicores(totalCpu)} CPU</span>
       <span class="cluster-stat">${formatMemory(totalMem)} MEM</span>
+      ${renderRemoveButton(clusterName)}
     </div>`;
 }
 
@@ -554,11 +603,12 @@ function renderAll() {
       collapsedClusters.add(cluster);
     }
     clusterPods.sort((a, b) => {
-      const ma = metricsCache[a.name];
-      const mb = metricsCache[b.name];
-      const cpuA = ma && !ma.error ? ma.cpu : 0;
-      const cpuB = mb && !mb.error ? mb.cpu : 0;
-      return cpuB - cpuA;
+      const nameA = getDisplayName(a.name, a.displayName);
+      const nameB = getDisplayName(b.name, b.displayName);
+      return nameA.localeCompare(nameB, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
     });
     const collapsed = collapsedClusters.has(cluster);
     const displayStyle = collapsed ? "display: none;" : "";
@@ -568,7 +618,10 @@ function renderAll() {
     podHtml += "</div>";
   }
 
+  const podScroll = snapshotPodScroll();
   serverListEl.innerHTML = serverHtml + podHtml;
+  capClusterPodLists();
+  restorePodScroll(podScroll);
   resizeToContent();
 }
 
@@ -694,6 +747,12 @@ const ctxCopyMetrics = document.getElementById("ctx-copy-metrics");
 const ctxRemove = document.getElementById("ctx-remove");
 const ctxSeparator = contextMenu.querySelector(".context-menu-separator");
 
+function renderRemoveButton(name) {
+  return `<button type="button" class="btn-remove"
+    data-server-name="${escapeHtml(name)}"
+    title="Remove">remove</button>`;
+}
+
 function showContextMenu(e, target) {
   e.preventDefault();
   contextMenuTarget = target;
@@ -736,32 +795,94 @@ function findServerConfig(name) {
   return servers.find((s) => s.name === name) || null;
 }
 
-async function handleRemoveServer() {
+const removeModal = document.getElementById("remove-modal");
+const removeModalTitle = document.getElementById("remove-modal-title");
+const removeModalBody = document.getElementById("remove-modal-body");
+const btnRemoveCancel = document.getElementById("btn-remove-cancel");
+const btnRemoveConfirm = document.getElementById("btn-remove-confirm");
+let pendingRemoveName = null;
+let removeInFlight = false;
+
+function serverKindLabel(name) {
+  const cfg = findServerConfig(name);
+  if (cfg && cfg.type === "k8s") {
+    return "cluster";
+  }
+  if (cfg && cfg.type === "ssh") {
+    return "server";
+  }
+  return "entry";
+}
+
+function openRemoveModal(name) {
+  hideContextMenu();
+  pendingRemoveName = name;
+  const kind = serverKindLabel(name);
+  const label = getDisplayName(name, name);
+  removeModalTitle.textContent = `Remove ${kind}?`;
+  removeModalBody.textContent =
+    `Remove "${label}"? This cannot be undone.`;
+  removeModal.classList.add("open");
+  btnRemoveCancel.focus();
+}
+
+function closeRemoveModal() {
+  if (removeInFlight) {
+    return;
+  }
+  pendingRemoveName = null;
+  removeModal.classList.remove("open");
+}
+
+async function confirmRemove() {
+  if (removeInFlight) {
+    return;
+  }
+  const name = pendingRemoveName;
+  if (!name) {
+    closeRemoveModal();
+    return;
+  }
+  removeInFlight = true;
+  btnRemoveConfirm.disabled = true;
+  btnRemoveCancel.disabled = true;
+  try {
+    await removeServerByName(name);
+    removeInFlight = false;
+    closeRemoveModal();
+  } catch (err) {
+    removeModalBody.textContent = String(err);
+  } finally {
+    removeInFlight = false;
+    btnRemoveConfirm.disabled = false;
+    btnRemoveCancel.disabled = false;
+  }
+}
+
+async function removeServerByName(name) {
+  hideContextMenu();
+  const config = await invoke("remove_server", { name });
+  servers = config.servers;
+  delete metricsCache[name];
+  delete metricsHistory[name];
+  delete anomalyState[name];
+  const podPrefix = name + "/";
+  for (const key of Object.keys(metricsCache)) {
+    if (key.startsWith(podPrefix)) {
+      delete metricsCache[key];
+      delete metricsHistory[key];
+      delete anomalyState[key];
+    }
+  }
+  pods = pods.filter((p) => p.cluster !== name);
+  renderAll();
+}
+
+function handleRemoveServer() {
   if (!contextMenuTarget) {
     return;
   }
-  const name = contextMenuTarget.name;
-  hideContextMenu();
-
-  try {
-    const config = await invoke("remove_server", { name });
-    servers = config.servers;
-    delete metricsCache[name];
-    delete metricsHistory[name];
-    delete anomalyState[name];
-    const podPrefix = name + "/";
-    for (const key of Object.keys(metricsCache)) {
-      if (key.startsWith(podPrefix)) {
-        delete metricsCache[key];
-        delete metricsHistory[key];
-        delete anomalyState[key];
-      }
-    }
-    pods = pods.filter((p) => p.cluster !== name);
-    renderAll();
-  } catch (err) {
-    console.error("Failed to remove server:", err);
-  }
+  openRemoveModal(contextMenuTarget.name);
 }
 
 async function handleOpenTerminal() {
@@ -901,6 +1022,7 @@ const grafanaEnabledToggle = document.getElementById("grafana-enabled");
 const grafanaUrlInput = document.getElementById("grafana-url");
 const grafanaVerifyTlsToggle = document.getElementById("grafana-verify-tls");
 const grafanaTokenInput = document.getElementById("grafana-token");
+const settingsError = document.getElementById("settings-error");
 
 const GRAFANA_CONN_NAME = "default";
 
@@ -917,6 +1039,7 @@ function alertSeverityClass(severity) {
 async function openSettings() {
   fgIntervalInput.classList.remove("input-error");
   bgIntervalInput.classList.remove("input-error");
+  settingsError.textContent = "";
   try {
     const config = await invoke("get_config");
     fgIntervalInput.value = config.foreground_poll_secs ?? 10;
@@ -1010,6 +1133,8 @@ async function saveSettings() {
     }
   } catch (err) {
     console.error("Failed to save settings:", err);
+    settingsError.textContent = String(err);
+    return;
   }
 
   try {
@@ -1020,6 +1145,8 @@ async function saveSettings() {
     }
   } catch (err) {
     console.error("Failed to update autostart:", err);
+    settingsError.textContent = String(err);
+    return;
   }
 
   closeSettings();
@@ -1299,13 +1426,52 @@ ctxCopyMetrics.addEventListener("click", handleCopyMetrics);
 document.getElementById("btn-settings")
   .addEventListener("click", openSettings);
 
+document.getElementById("btn-quit")
+  .addEventListener("click", () => {
+    invoke("quit_app").catch((err) => {
+      console.error("Failed to quit:", err);
+    });
+  });
+
 document.getElementById("btn-close-settings")
   .addEventListener("click", closeSettings);
 
 document.getElementById("btn-save-settings")
   .addEventListener("click", saveSettings);
 
+btnRemoveCancel.addEventListener("click", closeRemoveModal);
+btnRemoveConfirm.addEventListener("click", confirmRemove);
+removeModal.addEventListener("click", (e) => {
+  if (e.target === removeModal) {
+    closeRemoveModal();
+  }
+});
+removeModal.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !removeModal.classList.contains("open")) {
+    return;
+  }
+  const order = [btnRemoveCancel, btnRemoveConfirm];
+  const idx = order.indexOf(document.activeElement);
+  e.preventDefault();
+  if (e.shiftKey) {
+    const prev = idx <= 0 ? order.length - 1 : idx - 1;
+    order[prev].focus();
+  } else {
+    const next = idx < 0 || idx === order.length - 1 ? 0 : idx + 1;
+    order[next].focus();
+  }
+});
+
 serverListEl.addEventListener("click", (e) => {
+  const removeBtn = e.target.closest(".btn-remove");
+  if (removeBtn) {
+    e.stopPropagation();
+    const name = removeBtn.dataset.serverName;
+    if (name) {
+      openRemoveModal(name);
+    }
+    return;
+  }
   const logsBtn = e.target.closest(".btn-logs");
   if (logsBtn) {
     e.stopPropagation();
@@ -1345,6 +1511,20 @@ alertsList.addEventListener("click", (e) => {
 });
 
 serverListEl.addEventListener("contextmenu", (e) => {
+  const summary = e.target.closest(".cluster-summary");
+  if (summary) {
+    const name = summary.dataset.cluster;
+    if (!name) {
+      return;
+    }
+    const cfg = findServerConfig(name);
+    showContextMenu(e, {
+      name,
+      cardType: "server",
+      serverType: cfg ? cfg.type : "k8s",
+    });
+    return;
+  }
   const card = e.target.closest(".server-card");
   if (!card) {
     return;
@@ -1444,6 +1624,10 @@ serverListEl.addEventListener("dblclick", (e) => {
 
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (removeModal.classList.contains("open")) {
+      closeRemoveModal();
+      return;
+    }
     hideContextMenu();
     closeAddForm();
     closeSettings();

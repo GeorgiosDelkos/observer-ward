@@ -30,7 +30,7 @@
     <div id="add-form-panel" class="add-form-panel">
       <div class="add-form-inner">
         <div class="form-title">Add Server</div>
-        <form id="add-form" autocomplete="off">
+        <form id="add-form" autocomplete="off" novalidate>
           <div class="form-group">
             <label for="field-name">Name</label>
             <input id="field-name" type="text"
@@ -181,6 +181,7 @@
           <input type="password" id="grafana-token"
                  placeholder="(stored; leave blank to keep)">
         </div>
+        <div id="settings-error" class="form-error"></div>
         <div class="settings-actions">
           <button id="btn-save-settings"
                   class="btn btn-primary">SAVE</button>

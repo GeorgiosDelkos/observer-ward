@@ -801,6 +801,7 @@ const removeModalBody = document.getElementById("remove-modal-body");
 const btnRemoveCancel = document.getElementById("btn-remove-cancel");
 const btnRemoveConfirm = document.getElementById("btn-remove-confirm");
 let pendingRemoveName = null;
+let removeInFlight = false;
 
 function serverKindLabel(name) {
   const cfg = findServerConfig(name);
@@ -826,21 +827,35 @@ function openRemoveModal(name) {
 }
 
 function closeRemoveModal() {
+  if (removeInFlight) {
+    return;
+  }
   pendingRemoveName = null;
   removeModal.classList.remove("open");
 }
 
 async function confirmRemove() {
+  if (removeInFlight) {
+    return;
+  }
   const name = pendingRemoveName;
   if (!name) {
     closeRemoveModal();
     return;
   }
+  removeInFlight = true;
+  btnRemoveConfirm.disabled = true;
+  btnRemoveCancel.disabled = true;
   try {
     await removeServerByName(name);
+    removeInFlight = false;
     closeRemoveModal();
   } catch (err) {
     removeModalBody.textContent = String(err);
+  } finally {
+    removeInFlight = false;
+    btnRemoveConfirm.disabled = false;
+    btnRemoveCancel.disabled = false;
   }
 }
 
@@ -1007,6 +1022,7 @@ const grafanaEnabledToggle = document.getElementById("grafana-enabled");
 const grafanaUrlInput = document.getElementById("grafana-url");
 const grafanaVerifyTlsToggle = document.getElementById("grafana-verify-tls");
 const grafanaTokenInput = document.getElementById("grafana-token");
+const settingsError = document.getElementById("settings-error");
 
 const GRAFANA_CONN_NAME = "default";
 
@@ -1023,6 +1039,7 @@ function alertSeverityClass(severity) {
 async function openSettings() {
   fgIntervalInput.classList.remove("input-error");
   bgIntervalInput.classList.remove("input-error");
+  settingsError.textContent = "";
   try {
     const config = await invoke("get_config");
     fgIntervalInput.value = config.foreground_poll_secs ?? 10;
@@ -1116,6 +1133,7 @@ async function saveSettings() {
     }
   } catch (err) {
     console.error("Failed to save settings:", err);
+    settingsError.textContent = String(err);
     return;
   }
 
@@ -1127,6 +1145,8 @@ async function saveSettings() {
     }
   } catch (err) {
     console.error("Failed to update autostart:", err);
+    settingsError.textContent = String(err);
+    return;
   }
 
   closeSettings();
@@ -1424,6 +1444,21 @@ btnRemoveConfirm.addEventListener("click", confirmRemove);
 removeModal.addEventListener("click", (e) => {
   if (e.target === removeModal) {
     closeRemoveModal();
+  }
+});
+removeModal.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !removeModal.classList.contains("open")) {
+    return;
+  }
+  const order = [btnRemoveCancel, btnRemoveConfirm];
+  const idx = order.indexOf(document.activeElement);
+  e.preventDefault();
+  if (e.shiftKey) {
+    const prev = idx <= 0 ? order.length - 1 : idx - 1;
+    order[prev].focus();
+  } else {
+    const next = idx < 0 || idx === order.length - 1 ? 0 : idx + 1;
+    order[next].focus();
   }
 });
 

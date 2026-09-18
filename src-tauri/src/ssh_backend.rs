@@ -17,13 +17,19 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 /// timeout (boundary-validation, axiom `rust_api_axiom_25`).
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
+/// Bracket an unbracketed IPv6 literal for OpenSSH/`russh` address forms.
+#[must_use]
+pub(crate) fn ssh_cli_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 /// Format `host:port` for russh. IPv6 literals must be bracketed.
 fn ssh_connect_addr(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
+    format!("{}:{port}", ssh_cli_host(host))
 }
 
 const METRICS_COMMAND: &str = "\

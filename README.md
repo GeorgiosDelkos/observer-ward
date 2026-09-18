@@ -57,7 +57,7 @@ Click the tray icon to open the popover. Click outside it to dismiss.
 ### Add a Kubernetes cluster
 
 1. Click **+**
-2. Type **Kubernetes**
+2. Leave **Type** on **Kubernetes**
 3. Fill in **Name**, **Context**, and **Namespace**. Leave kubeconfig blank to use `~/.kube/config`.
 4. Click **Add**
 

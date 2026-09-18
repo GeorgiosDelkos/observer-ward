@@ -226,6 +226,8 @@ mod tests {
             home.join(".ssh/id_ed25519").display().to_string()
         );
         assert_eq!(expand_tilde("~"), home.display().to_string());
+        assert_eq!(std::path::PathBuf::from(expand_tilde("~/")), home);
+        assert_eq!(expand_tilde("~foo/.ssh/id"), "~foo/.ssh/id");
     }
 
     #[test]

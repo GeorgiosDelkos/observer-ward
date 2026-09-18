@@ -16,10 +16,12 @@ Tray-based Kubernetes and SSH monitoring dashboard built with Tauri 2 + vanilla 
 ```sh
 cd src-tauri
 cargo test                                          # run all tests
-cargo fmt -- --check                                # format check
+cargo fmt --all -- --check                          # format check
 cargo clippy --all-targets --all-features -- -D warnings  # lint
-cargo tauri dev                                     # run in dev mode (from repo root)
-cargo tauri build                                   # production build (from repo root)
+
+# from repo root (not src-tauri):
+cargo tauri dev                                     # run in dev mode
+cargo tauri build                                   # production build
 ```
 
 ## Architecture

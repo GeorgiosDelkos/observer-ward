@@ -67,6 +67,16 @@ fn tray_icon_kind(level: MetricLevel, restarts: bool) -> TrayIconKind {
     }
 }
 
+/// Tray input after a Grafana poll. A fetch error is unknown, not
+/// all-clear: keep the last successful list across consecutive failures.
+fn tray_alerts_after_grafana(fetch: Option<&AlertsUpdate>, last_good: &[Alert]) -> Vec<Alert> {
+    match fetch {
+        None => Vec::new(),
+        Some(update) if update.source_error.is_none() => update.alerts.clone(),
+        Some(_) => last_good.to_vec(),
+    }
+}
+
 struct FailureState {
     count: u32,
     last_attempt: Instant,
@@ -88,6 +98,7 @@ pub struct Poller {
     prev_levels: HashMap<String, [MetricLevel; 3]>,
     grafana_backend: Option<GrafanaBackend>,
     prev_alert_fingerprints: HashSet<String>,
+    last_good_grafana_alerts: Vec<Alert>,
     tray_icons: Option<TrayIcons>,
     prev_tray_state: Option<(MetricLevel, bool)>,
     latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
@@ -115,6 +126,7 @@ impl Poller {
             prev_levels: HashMap::new(),
             grafana_backend: None,
             prev_alert_fingerprints: HashSet::new(),
+            last_good_grafana_alerts: Vec::new(),
             tray_icons,
             prev_tray_state: None,
             latest_metrics,
@@ -183,13 +195,10 @@ impl Poller {
 
             self.check_and_notify(notifications_enabled, &update.servers);
 
-            let prev_alerts = self
-                .latest_alerts
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone());
+            let alerts_for_tray =
+                tray_alerts_after_grafana(grafana_result.as_ref(), &self.last_good_grafana_alerts);
 
-            let alerts_for_tray = if let Some(alerts_update) = grafana_result {
+            if let Some(alerts_update) = grafana_result {
                 if let Ok(mut guard) = self.latest_alerts.lock() {
                     *guard = Some(alerts_update.clone());
                 }
@@ -200,18 +209,17 @@ impl Poller {
                 // *unknown*, not "all clear" — skip the notify/dedup update so
                 // recovery does not replay every still-firing alert as new.
                 if alerts_update.source_error.is_none() {
+                    self.last_good_grafana_alerts
+                        .clone_from(&alerts_update.alerts);
                     self.notify_new_alerts(notifications_enabled, &alerts_update.alerts);
-                    alerts_update.alerts
-                } else {
-                    prev_alerts.map_or_else(Vec::new, |prev| prev.alerts)
                 }
             } else {
                 if let Ok(mut guard) = self.latest_alerts.lock() {
                     *guard = None;
                 }
                 self.prev_alert_fingerprints.clear();
-                Vec::new()
-            };
+                self.last_good_grafana_alerts.clear();
+            }
 
             self.update_tray_icon(&update.servers, &alerts_for_tray);
 
@@ -641,11 +649,26 @@ fn offline_metrics(name: &str, server_type: &str) -> ServerMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_decision, tray_icon_kind, BackoffDecision, TrayIconKind, BACKOFF_DURATION,
-        BACKOFF_THRESHOLD,
+        backoff_decision, tray_alerts_after_grafana, tray_icon_kind, BackoffDecision, TrayIconKind,
+        BACKOFF_DURATION, BACKOFF_THRESHOLD,
     };
-    use crate::metrics::MetricLevel;
+    use crate::metrics::{Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel};
+    use std::collections::BTreeMap;
     use std::time::Duration;
+
+    fn sample_alert(name: &str) -> Alert {
+        Alert {
+            fingerprint: format!("fp-{name}"),
+            name: name.to_string(),
+            severity: AlertSeverity::Critical,
+            state: AlertState::Active,
+            summary: String::new(),
+            description: String::new(),
+            starts_at: String::new(),
+            labels: BTreeMap::new(),
+            generator_url: None,
+        }
+    }
 
     #[test]
     fn backoff_ready_below_threshold() {
@@ -684,5 +707,52 @@ mod tests {
             TrayIconKind::Restart
         );
         assert_eq!(tray_icon_kind(MetricLevel::Warn, false), TrayIconKind::Warn);
+        assert_eq!(
+            tray_icon_kind(MetricLevel::Ok, false),
+            TrayIconKind::Default
+        );
+    }
+
+    #[test]
+    fn tray_alerts_success_replaces_last_good() {
+        let fresh = vec![sample_alert("new")];
+        let update = AlertsUpdate {
+            alerts: fresh.clone(),
+            source_error: None,
+        };
+        let last_good = vec![sample_alert("old")];
+        assert_eq!(tray_alerts_after_grafana(Some(&update), &last_good), fresh);
+    }
+
+    #[test]
+    fn tray_alerts_error_keeps_last_good_across_failures() {
+        let last_good = vec![sample_alert("firing")];
+        let failed = AlertsUpdate {
+            alerts: Vec::new(),
+            source_error: Some("timeout".to_string()),
+        };
+        assert_eq!(
+            tray_alerts_after_grafana(Some(&failed), &last_good),
+            last_good
+        );
+        assert_eq!(
+            tray_alerts_after_grafana(Some(&failed), &last_good),
+            last_good
+        );
+    }
+
+    #[test]
+    fn tray_alerts_error_with_no_history_is_empty() {
+        let failed = AlertsUpdate {
+            alerts: Vec::new(),
+            source_error: Some("timeout".to_string()),
+        };
+        assert!(tray_alerts_after_grafana(Some(&failed), &[]).is_empty());
+    }
+
+    #[test]
+    fn tray_alerts_disabled_grafana_is_empty() {
+        let last_good = vec![sample_alert("stale")];
+        assert!(tray_alerts_after_grafana(None, &last_good).is_empty());
     }
 }

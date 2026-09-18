@@ -19,3 +19,9 @@ First tagged shape of the app: a macOS menu-bar dashboard for Kubernetes, SSH ho
 ### Fixed
 
 - macOS 27 tray left-click swallowed by an attached status-item menu; popover now opens on click, Quit lives in the footer
+- Expand `~/` in SSH key and kubeconfig paths
+- Keep Grafana tray severity across consecutive fetch errors
+- Crit tray icon is not replaced by a lifetime pod restart count
+- SSH add form no longer blocked by a hidden Kubernetes namespace field
+- Window height includes the Grafana alerts section
+- IPv6 SSH addresses are bracketed for both polling and Open Terminal

@@ -170,7 +170,11 @@ fn validate_shell_safe(value: &str, field: &str) -> Result<(), String> {
         return Err(format!("{field} is empty"));
     }
     if !value.chars().all(|c| {
-        c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '@' | ':' | '~' | '+' | ' ')
+        c.is_alphanumeric()
+            || matches!(
+                c,
+                '-' | '_' | '.' | '/' | '@' | ':' | '~' | '+' | ' ' | '[' | ']'
+            )
     }) {
         return Err(format!("{field} contains unsafe characters"));
     }
@@ -256,10 +260,11 @@ fn open_ssh_terminal(
     user: String,
     key_path: String,
 ) -> Result<(), String> {
+    let host = crate::ssh_backend::ssh_cli_host(&host);
+    let key_path = config::expand_tilde(&key_path);
     validate_shell_safe(&host, "host")?;
     validate_shell_safe(&user, "user")?;
     validate_shell_safe(&key_path, "key_path")?;
-    let key_path = config::expand_tilde(&key_path);
     let cmd = format!("ssh '{user}'@'{host}' -p {port} -i '{key_path}'");
     run_in_terminal(&cmd)
 }
@@ -278,10 +283,10 @@ fn open_pod_logs(
     validate_shell_safe(&pod_name, "pod_name")?;
     validate_shell_safe(&namespace, "namespace")?;
     validate_shell_safe(&context, "context")?;
+    let kubeconfig = kubeconfig.map(|kc| config::expand_tilde(&kc));
     if let Some(kc) = &kubeconfig {
         validate_shell_safe(kc, "kubeconfig")?;
     }
-    let kubeconfig = kubeconfig.map(|kc| config::expand_tilde(&kc));
     let cmd = if let Some(kc) = &kubeconfig {
         format!(
             "kubectl logs -f '{pod_name}' -n '{namespace}' \
@@ -662,6 +667,8 @@ mod tests {
         validate_shell_safe("user_name", "user").expect("user");
         validate_shell_safe("/home/user/.ssh/id_ed25519", "key").expect("key");
         validate_shell_safe("10.0.0.5", "host").expect("host");
+        validate_shell_safe("[::1]", "host").expect("ipv6");
+        validate_shell_safe("/Users/me/.ssh/id", "key").expect("expanded key");
     }
 
     #[test]

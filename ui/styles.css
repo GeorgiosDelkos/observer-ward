@@ -778,7 +778,11 @@ body {
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  flex-shrink: 0;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: default;
 }
 .cluster-stat {

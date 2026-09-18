@@ -34,6 +34,12 @@ pub struct ServerMetrics {
     pub disk_capacity_bytes: u64,
     #[serde(default)]
     pub node_count: u32,
+    /// True when this cluster poll successfully listed pods (including
+    /// an empty namespace). False for SSH rows and for k8s rows whose
+    /// pod inventory failed, so the UI can keep the previous pod list
+    /// instead of treating a fetch error as "zero pods".
+    #[serde(default)]
+    pub collected_pods: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -224,6 +230,7 @@ mod tests {
         assert_eq!(m.disk_used_bytes, 0);
         assert_eq!(m.disk_capacity_bytes, 0);
         assert_eq!(m.node_count, 0);
+        assert!(!m.collected_pods);
     }
 
     #[test]

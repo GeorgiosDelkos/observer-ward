@@ -18,6 +18,15 @@ use tokio::sync::Notify;
 
 struct ConfigState(Arc<Mutex<config::AppConfig>>);
 struct WakeState(Arc<Notify>);
+struct LatestMetrics(Arc<Mutex<Option<metrics::MetricsUpdate>>>);
+struct LatestAlerts(Arc<Mutex<Option<metrics::AlertsUpdate>>>);
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 pub struct TrayState {
     pub icon: Mutex<tauri::tray::TrayIcon>,
     pub icon_reset: AtomicBool,
@@ -72,12 +81,13 @@ fn add_server(
     if config.servers.iter().any(|s| s.name() == server.name()) {
         return Err(format!("server '{}' already exists", server.name()));
     }
-    config.servers.push(server);
-    config::save_config(&config).map_err(|e| error::error_chain(&e))?;
-    let result = config.clone();
+    let mut next = config.clone();
+    next.servers.push(server);
+    config::save_config(&next).map_err(|e| error::error_chain(&e))?;
+    *config = next.clone();
     drop(config);
     wake.0.notify_one();
-    Ok(result)
+    Ok(next)
 }
 
 #[tauri::command]
@@ -92,16 +102,17 @@ fn remove_server(
     name: String,
 ) -> Result<config::AppConfig, String> {
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
-    let before = config.servers.len();
-    config.servers.retain(|s| s.name() != name);
-    if config.servers.len() == before {
+    let mut next = config.clone();
+    let before = next.servers.len();
+    next.servers.retain(|s| s.name() != name);
+    if next.servers.len() == before {
         return Err(format!("server '{name}' not found"));
     }
-    config::save_config(&config).map_err(|e| error::error_chain(&e))?;
-    let result = config.clone();
+    config::save_config(&next).map_err(|e| error::error_chain(&e))?;
+    *config = next.clone();
     drop(config);
     wake.0.notify_one();
-    Ok(result)
+    Ok(next)
 }
 
 #[tauri::command]
@@ -263,12 +274,18 @@ fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> 
     clippy::needless_pass_by_value,
     reason = "tauri::command macro requires owned parameters"
 )]
-fn set_grafana_token(name: String, token: String) -> Result<(), String> {
+fn set_grafana_token(
+    wake: State<'_, WakeState>,
+    name: String,
+    token: String,
+) -> Result<(), String> {
     let entry = keyring_core::Entry::new(grafana_backend::KEYCHAIN_SERVICE, &name)
         .map_err(|e| format!("keychain error: {e}"))?;
     entry
         .set_password(&token)
-        .map_err(|e| format!("keychain write failed: {e}"))
+        .map_err(|e| format!("keychain write failed: {e}"))?;
+    wake.0.notify_one();
+    Ok(())
 }
 
 #[tauri::command]
@@ -287,14 +304,41 @@ fn has_grafana_token(name: String) -> bool {
     clippy::needless_pass_by_value,
     reason = "tauri::command macro requires owned parameters"
 )]
-fn delete_grafana_token(name: String) -> Result<(), String> {
+fn delete_grafana_token(wake: State<'_, WakeState>, name: String) -> Result<(), String> {
     let entry = keyring_core::Entry::new(grafana_backend::KEYCHAIN_SERVICE, &name)
         .map_err(|e| format!("keychain error: {e}"))?;
     match entry.delete_credential() {
         // Deleting a token that was never stored is a no-op success.
-        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring_core::Error::NoEntry) => {
+            wake.0.notify_one();
+            Ok(())
+        }
         Err(e) => Err(format!("keychain delete failed: {e}")),
     }
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State parameters"
+)]
+fn get_latest_metrics(
+    state: State<'_, LatestMetrics>,
+) -> Result<Option<metrics::MetricsUpdate>, String> {
+    let guard = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    Ok(guard.clone())
+}
+
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri::command macro requires owned State parameters"
+)]
+fn get_latest_alerts(
+    state: State<'_, LatestAlerts>,
+) -> Result<Option<metrics::AlertsUpdate>, String> {
+    let guard = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
+    Ok(guard.clone())
 }
 
 #[tauri::command]
@@ -373,12 +417,9 @@ fn setup_tray_and_window(
                         }
                         if let Some(state) = app.try_state::<TrayState>() {
                             state.icon_reset.store(true, Ordering::Release);
-                            state.last_tray_show_ms.store(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs().saturating_mul(1000)),
-                                Ordering::Release,
-                            );
+                            state
+                                .last_tray_show_ms
+                                .store(unix_now_ms(), Ordering::Release);
                         }
                         if let Err(e) = window.move_window(Position::TrayCenter) {
                             tracing::warn!("failed to position window: {e}");
@@ -416,9 +457,7 @@ fn setup_tray_and_window(
                 // click (within 500 ms grace period).
                 if let Some(state) = blur_handle.try_state::<TrayState>() {
                     let shown_at = state.last_tray_show_ms.load(Ordering::Acquire);
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs().saturating_mul(1000));
+                    let now = unix_now_ms();
                     if now.saturating_sub(shown_at) < 500 {
                         return;
                     }
@@ -461,6 +500,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_arc = Arc::new(Mutex::new(initial_config));
     let is_window_visible = Arc::new(AtomicBool::new(false));
     let poll_wake = Arc::new(Notify::new());
+    let latest_metrics = Arc::new(Mutex::new(None));
+    let latest_alerts = Arc::new(Mutex::new(None));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
@@ -472,6 +513,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_positioner::init())
         .manage(ConfigState(Arc::clone(&config_arc)))
         .manage(WakeState(Arc::clone(&poll_wake)))
+        .manage(LatestMetrics(Arc::clone(&latest_metrics)))
+        .manage(LatestAlerts(Arc::clone(&latest_alerts)))
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config_cmd,
@@ -484,6 +527,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             set_grafana_token,
             has_grafana_token,
             delete_grafana_token,
+            get_latest_metrics,
+            get_latest_alerts,
             open_url,
         ])
         .setup(move |app| {
@@ -495,8 +540,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let handle = app.handle().clone();
             let config_for_poller = Arc::clone(&config_arc);
             tauri::async_runtime::spawn(async move {
-                let mut poller =
-                    poller::Poller::new(handle, config_for_poller, is_window_visible, poll_wake);
+                let mut poller = poller::Poller::new(
+                    handle,
+                    config_for_poller,
+                    is_window_visible,
+                    poll_wake,
+                    latest_metrics,
+                    latest_alerts,
+                );
                 poller.run().await;
             });
 
@@ -505,4 +556,36 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .run(tauri::generate_context!())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
+mod tests {
+    use super::{unix_now_ms, validate_shell_safe};
+
+    #[test]
+    fn unix_now_ms_is_millisecond_resolution() {
+        let a = unix_now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let b = unix_now_ms();
+        assert!(b > a, "expected millisecond tick, got {a} then {b}");
+    }
+
+    #[test]
+    fn validate_shell_safe_accepts_typical_values() {
+        validate_shell_safe("prod-ctx", "context").expect("context");
+        validate_shell_safe("user_name", "user").expect("user");
+        validate_shell_safe("/home/user/.ssh/id_ed25519", "key").expect("key");
+        validate_shell_safe("10.0.0.5", "host").expect("host");
+    }
+
+    #[test]
+    fn validate_shell_safe_rejects_quotes_and_semicolons() {
+        assert!(validate_shell_safe("foo;rm", "host").is_err());
+        assert!(validate_shell_safe("foo'bar", "user").is_err());
+        assert!(validate_shell_safe("", "host").is_err());
+    }
 }

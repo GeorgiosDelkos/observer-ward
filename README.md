@@ -58,8 +58,10 @@ Click the tray icon to open the popover. Click outside it to dismiss.
 
 1. Click **+**
 2. Leave **Type** on **Kubernetes**
-3. Fill in **Name**, **Context**, and **Namespace**. Leave kubeconfig blank to use `~/.kube/config`.
-4. Click **Add**
+3. Fill in **Name**. Leave kubeconfig blank to use `~/.kube/config`, or click **Browse…** to pick a file. **Context** suggests the kubeconfig's contexts and is prefilled with its current context.
+4. Fill in **Namespace** and click **Add**
+
+Adding checks the kubeconfig can be read and the context resolves to a cluster, so a mistyped path or context is reported in the form rather than saved. If a server goes offline later, its card shows why; right-click → **Copy Error** copies the full message.
 
 The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API.
 
@@ -99,7 +101,7 @@ Click **remove** on the card (or right-click → Remove). Confirm in the in-app 
 
 ## Configuration
 
-`~/.config/observer-ward/config.json`
+`~/Library/Application Support/observer-ward/config.json` on macOS (`~/.config/observer-ward/config.json` on Linux)
 
 ```json
 {

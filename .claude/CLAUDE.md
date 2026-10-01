@@ -8,7 +8,7 @@ Tray-based Kubernetes and SSH monitoring dashboard built with Tauri 2 + vanilla 
 |-----------|------|----------|
 | Backend | `src-tauri/src/` | Rust |
 | Frontend | `ui/` | JS/HTML/CSS |
-| Config file | `~/.config/observer-ward/config.json` | JSON |
+| Config file | `~/Library/Application Support/observer-ward/config.json` (macOS) | JSON |
 | Tauri config | `src-tauri/tauri.conf.json` | JSON |
 
 ## Build & Test

@@ -89,8 +89,8 @@ body {
 .header {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 13px var(--pad-x) 12px;
+  gap: 8px;
+  padding: 10px var(--pad-x);
   border-bottom: 1px solid var(--sep);
   flex-shrink: 0;
 }
@@ -100,17 +100,21 @@ body {
   justify-content: center;
   flex-shrink: 0;
 }
+/* Title and sync label share one line so the row centres on the title;
+   a stacked, invisible label used to push the title above the dot. */
 .header-center {
   flex: 1;
+  min-width: 0;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
+  align-items: baseline;
+  gap: 8px;
 }
 
 /* Ward dot (header live indicator) */
+/* Same 8px column as the row status dots, so the dot and title line up
+   with the dots and names below; the 9px dot overhangs by half a pixel. */
 .ward-eye {
-  width: 16px;
+  width: 8px;
   height: 16px;
   display: flex;
   align-items: center;
@@ -121,6 +125,8 @@ body {
   width: 9px;
   height: 9px;
   border-radius: 50%;
+  /* Wider than its 8px column; without this flex would squash it. */
+  flex-shrink: 0;
   background: var(--green);
   animation: breathe-ok 2.6s ease-in-out infinite;
 }
@@ -171,6 +177,9 @@ body {
 }
 #btn-open-add {
   color: var(--accent);
+  /* Pull the 28px hit area into the gutter so the glyph's right edge
+     meets the row content edge instead of sitting 7px inside it. */
+  margin-right: -7px;
 }
 #btn-open-add:hover {
   background: var(--accent-bg);
@@ -215,8 +224,20 @@ body {
 .server-card:hover {
   background: var(--bg-hover);
 }
-.server-card.offline {
+/* Dim the header row only, so the failure reason below stays legible. */
+.server-card.offline .server-card-header {
   opacity: 0.5;
+}
+.offline-reason {
+  margin: 6px 0 0 16px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .server-card-header {
   display: flex;
@@ -450,7 +471,27 @@ body {
 .form-group.hidden {
   display: none;
 }
+.input-with-button {
+  display: flex;
+  gap: 6px;
+}
+.input-with-button input {
+  flex: 1;
+  min-width: 0;
+}
+.input-with-button .btn-browse {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  background: transparent;
+  border-color: var(--sep);
+  color: var(--text-2);
+}
+.input-with-button .btn-browse:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
 .form-error {
+  overflow-wrap: anywhere;
   color: var(--red);
   font-size: 12px;
   margin-bottom: 8px;

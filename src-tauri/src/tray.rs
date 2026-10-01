@@ -1,6 +1,6 @@
 //! macOS tray icon, popover show/hide, and blur-grace handling.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::image::Image;
@@ -45,8 +45,10 @@ fn tray_left_click_action(
     TrayLeftClickAction::Show
 }
 
-fn should_skip_blur_hide(now_ms: u64, last_tray_show_ms: u64) -> bool {
-    now_ms.saturating_sub(last_tray_show_ms) < TRAY_SHOW_BLUR_GRACE_MS
+fn should_skip_blur_hide(now_ms: u64, last_tray_show_ms: u64, native_dialog_open: bool) -> bool {
+    // A native panel (file picker) takes key focus from the popover; hiding
+    // then would dismiss the form the user is filling in.
+    native_dialog_open || now_ms.saturating_sub(last_tray_show_ms) < TRAY_SHOW_BLUR_GRACE_MS
 }
 
 pub(crate) struct TrayState {
@@ -61,6 +63,40 @@ pub(crate) struct TrayState {
     /// ignore the trailing tray mouse-up after macOS 27 steals
     /// key focus on mouse-down.
     pub(crate) last_blur_hide_ms: AtomicU64,
+    /// Number of native dialogs opened from the popover that are still on
+    /// screen. A count, not a flag, so closing one of two overlapping
+    /// dialogs does not re-enable hide-on-blur under the other. Changed
+    /// only through [`NativeDialogGuard`].
+    pub(crate) native_dialogs_open: AtomicUsize,
+}
+
+/// Keeps the popover from hiding on blur while a native dialog is open.
+/// Clears the flag on drop, so an early return or a cancelled command
+/// future cannot leave hide-on-blur disabled.
+pub(crate) struct NativeDialogGuard(tauri::AppHandle);
+
+impl NativeDialogGuard {
+    pub(crate) fn open(app: &tauri::AppHandle) -> Self {
+        if let Some(state) = app.try_state::<TrayState>() {
+            state.native_dialogs_open.fetch_add(1, Ordering::AcqRel);
+        }
+        Self(app.clone())
+    }
+}
+
+impl Drop for NativeDialogGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.try_state::<TrayState>() {
+            // Saturating: TrayState is managed before any command can run,
+            // so open and drop always see it, but never wrap on a mismatch.
+            let _ =
+                state
+                    .native_dialogs_open
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        Some(n.saturating_sub(1))
+                    });
+        }
+    }
 }
 
 pub(crate) fn setup_tray_and_window(
@@ -98,6 +134,7 @@ pub(crate) fn setup_tray_and_window(
         icon_reset: AtomicBool::new(false),
         last_tray_show_ms: AtomicU64::new(0),
         last_blur_hide_ms: AtomicU64::new(0),
+        native_dialogs_open: AtomicUsize::new(0),
     });
 
     let blur_handle = app.handle().clone();
@@ -183,7 +220,8 @@ fn handle_window_blur(
     let now = unix_now_ms();
     if let Some(state) = app.try_state::<TrayState>() {
         let shown_at = state.last_tray_show_ms.load(Ordering::Acquire);
-        if should_skip_blur_hide(now, shown_at) {
+        let dialog_open = state.native_dialogs_open.load(Ordering::Acquire) > 0;
+        if should_skip_blur_hide(now, shown_at, dialog_open) {
             return;
         }
         state.last_blur_hide_ms.store(now, Ordering::Release);
@@ -264,11 +302,22 @@ mod tests {
         let shown_at = 5_000;
         assert!(should_skip_blur_hide(
             shown_at + TRAY_SHOW_BLUR_GRACE_MS - 1,
-            shown_at
+            shown_at,
+            false
         ));
         assert!(!should_skip_blur_hide(
             shown_at + TRAY_SHOW_BLUR_GRACE_MS,
-            shown_at
+            shown_at,
+            false
         ));
+    }
+
+    #[test]
+    fn blur_hide_is_skipped_while_native_dialog_is_open() {
+        // The file picker steals key focus long after the show grace.
+        let shown_at = 5_000;
+        let much_later = shown_at + 60_000;
+        assert!(should_skip_blur_hide(much_later, shown_at, true));
+        assert!(!should_skip_blur_hide(much_later, shown_at, false));
     }
 }

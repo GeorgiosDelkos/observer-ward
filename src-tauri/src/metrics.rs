@@ -40,6 +40,10 @@ pub struct ServerMetrics {
     /// instead of treating a fetch error as "zero pods".
     #[serde(default)]
     pub collected_pods: bool,
+    /// Why the last poll of an offline server failed, rendered with its
+    /// cause chain. `None` while online or before the first failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

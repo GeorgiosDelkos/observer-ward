@@ -46,21 +46,28 @@
 
           <!-- K8s-specific fields -->
           <div class="form-group field-k8s">
+            <label for="field-kubeconfig">
+              Kubeconfig (optional, default ~/.kube/config)
+            </label>
+            <div class="input-with-button">
+              <input id="field-kubeconfig" type="text"
+                     placeholder="~/.kube/config">
+              <button type="button" id="btn-browse-kubeconfig"
+                      class="btn btn-browse"
+                      aria-label="Browse for kubeconfig">Browse&hellip;</button>
+            </div>
+          </div>
+          <div class="form-group field-k8s">
             <label for="field-context">Context</label>
             <input id="field-context" type="text"
+                   list="context-options"
                    placeholder="e.g. prod-ctx">
+            <datalist id="context-options"></datalist>
           </div>
           <div class="form-group field-k8s">
             <label for="field-namespace">Namespace</label>
             <input id="field-namespace" type="text"
                    placeholder="e.g. default">
-          </div>
-          <div class="form-group field-k8s">
-            <label for="field-kubeconfig">
-              Kubeconfig path (optional)
-            </label>
-            <input id="field-kubeconfig" type="text"
-                   placeholder="~/.kube/config">
           </div>
 
           <!-- SSH-specific fields -->
@@ -81,11 +88,16 @@
           </div>
           <div class="form-group field-ssh hidden">
             <label for="field-keypath">Key path</label>
-            <input id="field-keypath" type="text"
-                   placeholder="~/.ssh/id_ed25519">
+            <div class="input-with-button">
+              <input id="field-keypath" type="text"
+                     placeholder="~/.ssh/id_ed25519">
+              <button type="button" id="btn-browse-keypath"
+                      class="btn btn-browse"
+                      aria-label="Browse for SSH key">Browse&hellip;</button>
+            </div>
           </div>
 
-          <div id="form-error" class="form-error"></div>
+          <div id="form-error" class="form-error" aria-live="polite"></div>
           <div class="form-actions">
             <button type="submit" id="btn-add"
                     class="btn btn-primary">Add</button>
@@ -219,6 +231,7 @@
     <div id="ctx-copy-kubectl" class="context-menu-item">Copy kubectl context</div>
     <div id="ctx-view-logs" class="context-menu-item">View Logs</div>
     <div id="ctx-copy-metrics" class="context-menu-item">Copy Metrics</div>
+    <div id="ctx-copy-error" class="context-menu-item">Copy Error</div>
     <div class="context-menu-separator"></div>
     <div id="ctx-remove" class="context-menu-item danger">Remove</div>
   </div>

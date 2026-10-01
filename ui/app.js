@@ -61,6 +61,12 @@ const addFormPanel = document.getElementById("add-form-panel");
 const addFormEl = document.getElementById("add-form");
 const btnCancel = document.getElementById("btn-cancel");
 const typeSelect = document.getElementById("field-type");
+const kubeconfigInput = document.getElementById("field-kubeconfig");
+const contextInput = document.getElementById("field-context");
+const contextOptions = document.getElementById("context-options");
+const btnBrowseKubeconfig = document.getElementById("btn-browse-kubeconfig");
+const keyPathInput = document.getElementById("field-keypath");
+const btnBrowseKeyPath = document.getElementById("btn-browse-keypath");
 const formError = document.getElementById("form-error");
 const contextMenu = document.getElementById("context-menu");
 
@@ -421,9 +427,15 @@ function renderServerCard(server) {
   }
 
   let offlineHtml = "";
+  let reasonHtml = "";
   if (isOffline) {
     offlineHtml =
       '<span class="offline-label">offline</span>';
+    if (metrics.reason) {
+      // Clamped; the full chain is in the tooltip and "Copy Error".
+      const reason = escapeHtml(metrics.reason);
+      reasonHtml = `<div class="offline-reason" title="${reason}">${reason}</div>`;
+    }
   }
 
   return `
@@ -438,6 +450,7 @@ function renderServerCard(server) {
         ${offlineHtml}
         ${renderRemoveButton(name)}
       </div>
+      ${reasonHtml}
       ${metricsHtml}
     </div>`;
 }
@@ -641,17 +654,113 @@ function toggleTypeFields() {
 }
 
 function openAddForm() {
+  inspectSeq += 1;
   addFormEl.reset();
+  contextOptions.replaceChildren();
   formError.textContent = "";
   toggleTypeFields();
   addFormPanel.classList.add("open");
   resizeToContent();
+  // The kubeconfig field starts empty, i.e. the default kubeconfig; offer
+  // its contexts too. Quiet, since having no default kubeconfig is fine.
+  loadKubeconfigContexts(null, { quiet: true });
 }
 
 function closeAddForm() {
+  inspectSeq += 1;
   addFormPanel.classList.remove("open");
   formError.textContent = "";
   resizeToContent();
+}
+
+// Bumped per inspect request and when the form opens or closes, so only
+// the latest response may touch the form.
+let inspectSeq = 0;
+// True while the visible form error came from an inspect, so a later
+// inspect may clear it without wiping a validation or submit error.
+let inspectErrorShown = false;
+
+// Backend errors carry the full cause chain and can wrap over several
+// lines, so the popover is resized to keep them visible.
+function showFormError(message) {
+  formError.textContent = message;
+  inspectErrorShown = false;
+  resizeToContent();
+}
+
+// Open a native file picker via `command` and write the chosen path into
+// `input`. Resolves to the path, or null when cancelled or failed.
+async function browseForPath(command, input, button) {
+  showFormError("");
+  // One picker at a time: the backend's blur guard is per dialog, so a
+  // second overlapping picker could let the popover hide under it.
+  btnBrowseKubeconfig.disabled = true;
+  btnBrowseKeyPath.disabled = true;
+  try {
+    const path = await invoke(command, {
+      current: input.value.trim() || null,
+    });
+    if (path) {
+      input.value = path;
+    }
+    return path;
+  } catch (err) {
+    showFormError(String(err));
+    return null;
+  } finally {
+    btnBrowseKubeconfig.disabled = false;
+    btnBrowseKeyPath.disabled = false;
+    button.focus();
+  }
+}
+
+async function browseKubeconfig() {
+  const path = await browseForPath(
+    "pick_kubeconfig", kubeconfigInput, btnBrowseKubeconfig,
+  );
+  if (path) {
+    await loadKubeconfigContexts(path);
+  }
+}
+
+function browseKeyPath() {
+  return browseForPath("pick_ssh_key", keyPathInput, btnBrowseKeyPath);
+}
+
+// Offer the kubeconfig's contexts as suggestions and prefill its
+// current-context, so the context name is picked rather than typed.
+// `path` null means the default kubeconfig; `quiet` hides failures.
+async function loadKubeconfigContexts(path, { quiet = false } = {}) {
+  inspectSeq += 1;
+  const seq = inspectSeq;
+  contextOptions.replaceChildren();
+  let summary;
+  try {
+    summary = await invoke("inspect_kubeconfig", { path });
+  } catch (err) {
+    if (seq === inspectSeq && !quiet) {
+      showFormError(String(err));
+      inspectErrorShown = true;
+    }
+    return;
+  }
+  if (seq !== inspectSeq) {
+    return;
+  }
+  if (inspectErrorShown) {
+    showFormError("");
+  }
+  for (const name of summary.contexts) {
+    const option = document.createElement("option");
+    option.value = name;
+    contextOptions.append(option);
+  }
+  // Replace a context this kubeconfig does not define (empty, or left
+  // over from a previously picked file); keep one it does.
+  const current = contextInput.value.trim();
+  if (summary.current_context && !summary.contexts.includes(current)) {
+    contextInput.value = summary.current_context;
+  }
 }
 
 function buildServerConfig() {
@@ -718,11 +827,11 @@ function buildServerConfig() {
 
 async function handleAddServer(e) {
   e.preventDefault();
-  formError.textContent = "";
+  showFormError("");
 
   const result = buildServerConfig();
   if (result.error) {
-    formError.textContent = result.error;
+    showFormError(result.error);
     return;
   }
 
@@ -734,7 +843,7 @@ async function handleAddServer(e) {
     renderAll();
     closeAddForm();
   } catch (err) {
-    formError.textContent = String(err);
+    showFormError(String(err));
   }
 }
 
@@ -744,6 +853,7 @@ const ctxOpenTerminal = document.getElementById("ctx-open-terminal");
 const ctxCopyKubectl = document.getElementById("ctx-copy-kubectl");
 const ctxViewLogs = document.getElementById("ctx-view-logs");
 const ctxCopyMetrics = document.getElementById("ctx-copy-metrics");
+const ctxCopyError = document.getElementById("ctx-copy-error");
 const ctxRemove = document.getElementById("ctx-remove");
 const ctxSeparator = contextMenu.querySelector(".context-menu-separator");
 
@@ -756,6 +866,21 @@ function renderRemoveButton(name) {
 function showContextMenu(e, target) {
   e.preventDefault();
   contextMenuTarget = target;
+
+  const isPod = target.cardType === "pod";
+  const isSSH = target.serverType === "ssh";
+  const isK8s = target.serverType === "k8s";
+  // Offline cards have no metrics to copy, only the failure reason.
+  const reason = metricsCache[target.name]?.reason;
+
+  // Choose items before measuring, so the clamp uses the real size.
+  ctxOpenTerminal.style.display = isSSH ? "" : "none";
+  ctxCopyKubectl.style.display = isK8s && !isPod ? "" : "none";
+  ctxViewLogs.style.display = isPod ? "" : "none";
+  ctxCopyMetrics.style.display = reason ? "none" : "";
+  ctxCopyError.style.display = reason ? "" : "none";
+  ctxSeparator.style.display = isPod ? "none" : "";
+  ctxRemove.style.display = isPod ? "none" : "";
 
   // Position then clamp to viewport
   contextMenu.style.left = "0px";
@@ -773,17 +898,6 @@ function showContextMenu(e, target) {
   if (y < 0) { y = 0; }
   contextMenu.style.left = `${x}px`;
   contextMenu.style.top = `${y}px`;
-
-  const isPod = target.cardType === "pod";
-  const isSSH = target.serverType === "ssh";
-  const isK8s = target.serverType === "k8s";
-
-  ctxOpenTerminal.style.display = isSSH ? "" : "none";
-  ctxCopyKubectl.style.display = isK8s && !isPod ? "" : "none";
-  ctxViewLogs.style.display = isPod ? "" : "none";
-  ctxCopyMetrics.style.display = "";
-  ctxSeparator.style.display = isPod ? "none" : "";
-  ctxRemove.style.display = isPod ? "none" : "";
 }
 
 function hideContextMenu() {
@@ -952,6 +1066,22 @@ async function handleViewLogs() {
     });
   } catch (err) {
     console.error("Failed to open pod logs:", err);
+  }
+}
+
+async function handleCopyError() {
+  if (!contextMenuTarget) {
+    return;
+  }
+  const reason = metricsCache[contextMenuTarget.name]?.reason;
+  hideContextMenu();
+  if (!reason) {
+    return;
+  }
+  try {
+    await invoke("copy_to_clipboard", { text: reason });
+  } catch (err) {
+    console.error("Failed to copy error:", err);
   }
 }
 
@@ -1171,7 +1301,7 @@ function handleMetricsUpdate(event) {
     }
 
     if (entry.status === "offline" || entry.status === "error") {
-      metricsCache[name] = { error: entry.status };
+      metricsCache[name] = { error: entry.status, reason: entry.error || "" };
     } else if (entry.status === "pending") {
       // Leave metricsCache[name] untouched so UI shows
       // "awaiting metrics..." until the first real poll
@@ -1417,11 +1547,25 @@ btnCancel.addEventListener("click", closeAddForm);
 
 typeSelect.addEventListener("change", toggleTypeFields);
 
+btnBrowseKubeconfig.addEventListener("click", browseKubeconfig);
+btnBrowseKeyPath.addEventListener("click", browseKeyPath);
+
+// A hand-typed path is checked as soon as the field is left, not only on Add.
+kubeconfigInput.addEventListener("change", () => {
+  const path = kubeconfigInput.value.trim();
+  if (path) {
+    loadKubeconfigContexts(path);
+  } else {
+    loadKubeconfigContexts(null, { quiet: true });
+  }
+});
+
 ctxRemove.addEventListener("click", handleRemoveServer);
 ctxOpenTerminal.addEventListener("click", handleOpenTerminal);
 ctxCopyKubectl.addEventListener("click", handleCopyKubectl);
 ctxViewLogs.addEventListener("click", handleViewLogs);
 ctxCopyMetrics.addEventListener("click", handleCopyMetrics);
+ctxCopyError.addEventListener("click", handleCopyError);
 
 document.getElementById("btn-settings")
   .addEventListener("click", openSettings);

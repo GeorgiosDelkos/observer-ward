@@ -89,8 +89,8 @@ body {
 .header {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 13px var(--pad-x) 12px;
+  gap: 8px;
+  padding: 10px var(--pad-x);
   border-bottom: 1px solid var(--sep);
   flex-shrink: 0;
 }
@@ -100,17 +100,21 @@ body {
   justify-content: center;
   flex-shrink: 0;
 }
+/* Title and sync label share one line so the row centres on the title;
+   a stacked, invisible label used to push the title above the dot. */
 .header-center {
   flex: 1;
+  min-width: 0;
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
+  align-items: baseline;
+  gap: 8px;
 }
 
 /* Ward dot (header live indicator) */
+/* Same 8px column as the row status dots, so the dot and title line up
+   with the dots and names below; the 9px dot overhangs by half a pixel. */
 .ward-eye {
-  width: 16px;
+  width: 8px;
   height: 16px;
   display: flex;
   align-items: center;
@@ -171,6 +175,9 @@ body {
 }
 #btn-open-add {
   color: var(--accent);
+  /* Pull the 28px hit area into the gutter so the glyph's right edge
+     meets the row content edge instead of sitting 7px inside it. */
+  margin-right: -7px;
 }
 #btn-open-add:hover {
   background: var(--accent-bg);

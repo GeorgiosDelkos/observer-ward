@@ -79,6 +79,24 @@ fn tray_alerts_after_grafana(fetch: Option<&AlertsUpdate>, last_good: &[Alert]) 
 struct FailureState {
     count: u32,
     last_attempt: Instant,
+    /// Kept so servers held in backoff still report why they are offline.
+    last_error: String,
+}
+
+impl FailureState {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            last_attempt: Instant::now(),
+            last_error: String::new(),
+        }
+    }
+
+    fn record(&mut self, error: String) {
+        self.count = self.count.saturating_add(1);
+        self.last_attempt = Instant::now();
+        self.last_error = error;
+    }
 }
 
 enum BackendEntry {
@@ -250,7 +268,8 @@ impl Poller {
             let stype = server.server_type().to_string();
 
             if self.in_backoff(&name) {
-                skipped.push(offline_metrics(&name, &stype));
+                let last_error = self.failures.get(&name).map(|f| f.last_error.clone());
+                skipped.push(offline_metrics(&name, &stype, last_error));
                 continue;
             }
 
@@ -292,8 +311,8 @@ impl Poller {
                 }
                 Err(e) => {
                     tracing::warn!("failed to collect metrics for {name}: {e}");
-                    self.record_failure(&name);
-                    all_metrics.push(offline_metrics(&name, &stype));
+                    all_metrics.push(offline_metrics(&name, &stype, Some(e.clone())));
+                    self.record_failure(&name, e);
                 }
             }
         }
@@ -366,16 +385,11 @@ impl Poller {
         }
     }
 
-    fn record_failure(&mut self, name: &str) {
-        let state = self
-            .failures
+    fn record_failure(&mut self, name: &str, error: String) {
+        self.failures
             .entry(name.to_string())
-            .or_insert_with(|| FailureState {
-                count: 0,
-                last_attempt: Instant::now(),
-            });
-        state.count = state.count.saturating_add(1);
-        state.last_attempt = Instant::now();
+            .or_insert_with(FailureState::new)
+            .record(error);
     }
 
     fn update_tray_icon(&mut self, metrics: &[ServerMetrics], alerts: &[Alert]) {
@@ -645,20 +659,25 @@ async fn collect_with_entry(
     (entry, result)
 }
 
-fn offline_metrics(name: &str, server_type: &str) -> ServerMetrics {
+fn offline_metrics(name: &str, server_type: &str, error: Option<String>) -> ServerMetrics {
     ServerMetrics {
         server_name: name.to_string(),
         server_type: server_type.to_string(),
         status: ServerStatus::Offline,
+        error,
         ..ServerMetrics::default()
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use super::{
-        BACKOFF_DURATION, BACKOFF_THRESHOLD, BackoffDecision, TrayIconKind, backoff_decision,
-        tray_alerts_after_grafana, tray_icon_kind,
+        BACKOFF_DURATION, BACKOFF_THRESHOLD, BackoffDecision, FailureState, TrayIconKind,
+        backoff_decision, offline_metrics, tray_alerts_after_grafana, tray_icon_kind,
     };
     use crate::metrics::{Alert, AlertSeverity, AlertState, AlertsUpdate, MetricLevel};
     use std::collections::BTreeMap;
@@ -762,5 +781,42 @@ mod tests {
     fn tray_alerts_disabled_grafana_is_empty() {
         let last_good = vec![sample_alert("stale")];
         assert!(tray_alerts_after_grafana(None, &last_good).is_empty());
+    }
+
+    #[test]
+    fn offline_metrics_carries_the_failure_reason_to_the_ui() {
+        let m = offline_metrics(
+            "hippius",
+            "k8s",
+            Some("failed to read kubeconfig /x.yaml: No such file".to_string()),
+        );
+
+        let json = serde_json::to_value(&m).expect("serialize offline metrics");
+
+        assert_eq!(json["status"], "offline");
+        assert_eq!(
+            json["error"],
+            "failed to read kubeconfig /x.yaml: No such file"
+        );
+    }
+
+    #[test]
+    fn online_metrics_omit_the_error_field() {
+        let m = crate::metrics::ServerMetrics::default();
+
+        let json = serde_json::to_value(&m).expect("serialize metrics");
+
+        assert!(json.get("error").is_none(), "{json}");
+    }
+
+    #[test]
+    fn failure_state_keeps_the_latest_error_for_backoff_rows() {
+        let mut state = FailureState::new();
+
+        state.record("connection refused".to_string());
+        state.record("timed out collecting metrics for bastion".to_string());
+
+        assert_eq!(state.count, 2);
+        assert_eq!(state.last_error, "timed out collecting metrics for bastion");
     }
 }

@@ -215,8 +215,23 @@ body {
 .server-card:hover {
   background: var(--bg-hover);
 }
-.server-card.offline {
+/* Dim the header row only, so the failure reason below stays legible. */
+.server-card.offline .server-card-header {
   opacity: 0.5;
+}
+.offline-reason {
+  margin: 6px 0 0 16px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 .server-card-header {
   display: flex;

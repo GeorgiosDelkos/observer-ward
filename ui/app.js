@@ -427,9 +427,15 @@ function renderServerCard(server) {
   }
 
   let offlineHtml = "";
+  let reasonHtml = "";
   if (isOffline) {
     offlineHtml =
       '<span class="offline-label">offline</span>';
+    if (metrics.reason) {
+      // Selectable and clamped; the full chain is in the tooltip.
+      const reason = escapeHtml(metrics.reason);
+      reasonHtml = `<div class="offline-reason" title="${reason}">${reason}</div>`;
+    }
   }
 
   return `
@@ -444,6 +450,7 @@ function renderServerCard(server) {
         ${offlineHtml}
         ${renderRemoveButton(name)}
       </div>
+      ${reasonHtml}
       ${metricsHtml}
     </div>`;
 }
@@ -1246,7 +1253,7 @@ function handleMetricsUpdate(event) {
     }
 
     if (entry.status === "offline" || entry.status === "error") {
-      metricsCache[name] = { error: entry.status };
+      metricsCache[name] = { error: entry.status, reason: entry.error || "" };
     } else if (entry.status === "pending") {
       // Leave metricsCache[name] untouched so UI shows
       // "awaiting metrics..." until the first real poll

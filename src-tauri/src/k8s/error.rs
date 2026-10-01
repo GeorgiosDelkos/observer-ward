@@ -15,10 +15,19 @@ pub(crate) enum K8sError {
     ReadKubeconfig {
         path: String,
         #[source]
+        source: std::io::Error,
+    },
+    /// Deliberately carries no source: serde's "invalid type" errors quote
+    /// the offending input, so a mis-picked private key or `.env` file would
+    /// be echoed into the UI and logs. Only the YAML position is kept.
+    #[error("{path} is not a valid kubeconfig{position}")]
+    NotAKubeconfig { path: String, position: String },
+    #[error("failed to load kubeconfig {path}")]
+    LoadKubeconfig {
+        path: String,
+        #[source]
         source: Box<kube::config::KubeconfigError>,
     },
-    #[error("failed to read default kubeconfig")]
-    ReadDefaultKubeconfig(#[source] Box<kube::config::KubeconfigError>),
     #[error("context {context} not found in kubeconfig (available: {available})")]
     UnknownContext { context: String, available: String },
     #[error("failed to build kube config for context {context}")]

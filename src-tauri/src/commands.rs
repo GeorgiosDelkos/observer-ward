@@ -55,19 +55,8 @@ pub(crate) async fn add_server(
     wake: State<'_, WakeState>,
     server: config::ServerConfig,
 ) -> Result<config::AppConfig, String> {
-    // Reject entries the poller could never connect with (a mistyped
-    // kubeconfig path or context) instead of saving a server that only
-    // ever shows "offline". Runs before the config lock is taken.
-    match &server {
-        config::ServerConfig::K8s {
-            kubeconfig,
-            context,
-            ..
-        } => k8s::validate_server(kubeconfig.clone(), context.clone())
-            .await
-            .map_err(|e| error::error_chain(&e))?,
-        config::ServerConfig::Ssh { .. } => {}
-    }
+    // Runs before the config lock is taken: no std::sync guard across await.
+    validate_new_server(&server).await?;
 
     let mut config = state.0.lock().map_err(|e| format!("lock error: {e}"))?;
     if config.servers.iter().any(|s| s.name() == server.name()) {
@@ -80,6 +69,22 @@ pub(crate) async fn add_server(
     drop(config);
     wake.0.notify_one();
     Ok(next)
+}
+
+/// Reject entries the poller could never connect with (a mistyped
+/// kubeconfig path or context) instead of saving a server that only ever
+/// shows "offline". SSH entries are checked by connecting, not here.
+async fn validate_new_server(server: &config::ServerConfig) -> Result<(), String> {
+    match server {
+        config::ServerConfig::K8s {
+            kubeconfig,
+            context,
+            ..
+        } => k8s::validate_server(kubeconfig.clone(), context.clone())
+            .await
+            .map_err(|e| error::error_chain(&e)),
+        config::ServerConfig::Ssh { .. } => Ok(()),
+    }
 }
 
 /// Show a native file picker for a kubeconfig and return the chosen path,
@@ -364,4 +369,47 @@ pub(crate) fn open_url(url: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to open url: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
+mod tests {
+    use super::validate_new_server;
+    use crate::config::ServerConfig;
+
+    #[tokio::test]
+    async fn new_k8s_server_with_missing_kubeconfig_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("hippius1-oct.yaml").display().to_string();
+        let server = ServerConfig::K8s {
+            name: "hippius".to_string(),
+            kubeconfig: Some(missing.clone()),
+            context: "hippius".to_string(),
+            namespace: "default".to_string(),
+        };
+
+        let err = validate_new_server(&server)
+            .await
+            .expect_err("missing kubeconfig must be rejected");
+
+        assert!(err.contains(&missing), "{err}");
+    }
+
+    #[tokio::test]
+    async fn new_ssh_server_is_not_validated_up_front() {
+        let server = ServerConfig::Ssh {
+            name: "bastion".to_string(),
+            host: "10.0.1.50".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            key_path: "/does/not/exist".to_string(),
+        };
+
+        validate_new_server(&server)
+            .await
+            .expect("ssh entries are checked by connecting, not on add");
+    }
 }

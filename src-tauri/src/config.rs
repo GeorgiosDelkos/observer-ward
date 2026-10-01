@@ -169,7 +169,9 @@ pub fn picker_start_dir(current: Option<&str>, fallback: Option<&Path>) -> Optio
     fallback.filter(|dir| dir.is_dir()).map(Path::to_path_buf)
 }
 
-/// Returns the config file path: `~/.config/observer-ward/config.json`
+/// Returns the config file path: `<config dir>/observer-ward/config.json`,
+/// i.e. `~/Library/Application Support/...` on macOS and
+/// `~/.config/...` on Linux (`dirs::config_dir`).
 fn config_path() -> Result<PathBuf, ConfigError> {
     let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
     Ok(config_dir.join("observer-ward").join("config.json"))

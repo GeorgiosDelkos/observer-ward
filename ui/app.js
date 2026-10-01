@@ -432,7 +432,7 @@ function renderServerCard(server) {
     offlineHtml =
       '<span class="offline-label">offline</span>';
     if (metrics.reason) {
-      // Selectable and clamped; the full chain is in the tooltip.
+      // Clamped; the full chain is in the tooltip and "Copy Error".
       const reason = escapeHtml(metrics.reason);
       reasonHtml = `<div class="offline-reason" title="${reason}">${reason}</div>`;
     }
@@ -654,24 +654,37 @@ function toggleTypeFields() {
 }
 
 function openAddForm() {
+  inspectSeq += 1;
   addFormEl.reset();
   contextOptions.replaceChildren();
   formError.textContent = "";
   toggleTypeFields();
   addFormPanel.classList.add("open");
   resizeToContent();
+  // The kubeconfig field starts empty, i.e. the default kubeconfig; offer
+  // its contexts too. Quiet, since having no default kubeconfig is fine.
+  loadKubeconfigContexts(null, { quiet: true });
 }
 
 function closeAddForm() {
+  inspectSeq += 1;
   addFormPanel.classList.remove("open");
   formError.textContent = "";
   resizeToContent();
 }
 
+// Bumped per inspect request and when the form opens or closes, so only
+// the latest response may touch the form.
+let inspectSeq = 0;
+// True while the visible form error came from an inspect, so a later
+// inspect may clear it without wiping a validation or submit error.
+let inspectErrorShown = false;
+
 // Backend errors carry the full cause chain and can wrap over several
 // lines, so the popover is resized to keep them visible.
 function showFormError(message) {
   formError.textContent = message;
+  inspectErrorShown = false;
   resizeToContent();
 }
 
@@ -716,22 +729,36 @@ function browseKeyPath() {
 
 // Offer the kubeconfig's contexts as suggestions and prefill its
 // current-context, so the context name is picked rather than typed.
-async function loadKubeconfigContexts(path) {
+// `path` null means the default kubeconfig; `quiet` hides failures.
+async function loadKubeconfigContexts(path, { quiet = false } = {}) {
+  inspectSeq += 1;
+  const seq = inspectSeq;
   contextOptions.replaceChildren();
   let summary;
   try {
     summary = await invoke("inspect_kubeconfig", { path });
   } catch (err) {
-    showFormError(String(err));
+    if (seq === inspectSeq && !quiet) {
+      showFormError(String(err));
+      inspectErrorShown = true;
+    }
     return;
   }
-  showFormError("");
+  if (seq !== inspectSeq) {
+    return;
+  }
+  if (inspectErrorShown) {
+    showFormError("");
+  }
   for (const name of summary.contexts) {
     const option = document.createElement("option");
     option.value = name;
     contextOptions.append(option);
   }
-  if (!contextInput.value.trim() && summary.current_context) {
+  // Replace a context this kubeconfig does not define (empty, or left
+  // over from a previously picked file); keep one it does.
+  const current = contextInput.value.trim();
+  if (summary.current_context && !summary.contexts.includes(current)) {
     contextInput.value = summary.current_context;
   }
 }
@@ -800,7 +827,7 @@ function buildServerConfig() {
 
 async function handleAddServer(e) {
   e.preventDefault();
-  formError.textContent = "";
+  showFormError("");
 
   const result = buildServerConfig();
   if (result.error) {
@@ -826,6 +853,7 @@ const ctxOpenTerminal = document.getElementById("ctx-open-terminal");
 const ctxCopyKubectl = document.getElementById("ctx-copy-kubectl");
 const ctxViewLogs = document.getElementById("ctx-view-logs");
 const ctxCopyMetrics = document.getElementById("ctx-copy-metrics");
+const ctxCopyError = document.getElementById("ctx-copy-error");
 const ctxRemove = document.getElementById("ctx-remove");
 const ctxSeparator = contextMenu.querySelector(".context-menu-separator");
 
@@ -838,6 +866,21 @@ function renderRemoveButton(name) {
 function showContextMenu(e, target) {
   e.preventDefault();
   contextMenuTarget = target;
+
+  const isPod = target.cardType === "pod";
+  const isSSH = target.serverType === "ssh";
+  const isK8s = target.serverType === "k8s";
+  // Offline cards have no metrics to copy, only the failure reason.
+  const reason = metricsCache[target.name]?.reason;
+
+  // Choose items before measuring, so the clamp uses the real size.
+  ctxOpenTerminal.style.display = isSSH ? "" : "none";
+  ctxCopyKubectl.style.display = isK8s && !isPod ? "" : "none";
+  ctxViewLogs.style.display = isPod ? "" : "none";
+  ctxCopyMetrics.style.display = reason ? "none" : "";
+  ctxCopyError.style.display = reason ? "" : "none";
+  ctxSeparator.style.display = isPod ? "none" : "";
+  ctxRemove.style.display = isPod ? "none" : "";
 
   // Position then clamp to viewport
   contextMenu.style.left = "0px";
@@ -855,17 +898,6 @@ function showContextMenu(e, target) {
   if (y < 0) { y = 0; }
   contextMenu.style.left = `${x}px`;
   contextMenu.style.top = `${y}px`;
-
-  const isPod = target.cardType === "pod";
-  const isSSH = target.serverType === "ssh";
-  const isK8s = target.serverType === "k8s";
-
-  ctxOpenTerminal.style.display = isSSH ? "" : "none";
-  ctxCopyKubectl.style.display = isK8s && !isPod ? "" : "none";
-  ctxViewLogs.style.display = isPod ? "" : "none";
-  ctxCopyMetrics.style.display = "";
-  ctxSeparator.style.display = isPod ? "none" : "";
-  ctxRemove.style.display = isPod ? "none" : "";
 }
 
 function hideContextMenu() {
@@ -1034,6 +1066,22 @@ async function handleViewLogs() {
     });
   } catch (err) {
     console.error("Failed to open pod logs:", err);
+  }
+}
+
+async function handleCopyError() {
+  if (!contextMenuTarget) {
+    return;
+  }
+  const reason = metricsCache[contextMenuTarget.name]?.reason;
+  hideContextMenu();
+  if (!reason) {
+    return;
+  }
+  try {
+    await invoke("copy_to_clipboard", { text: reason });
+  } catch (err) {
+    console.error("Failed to copy error:", err);
   }
 }
 
@@ -1508,7 +1556,7 @@ kubeconfigInput.addEventListener("change", () => {
   if (path) {
     loadKubeconfigContexts(path);
   } else {
-    contextOptions.replaceChildren();
+    loadKubeconfigContexts(null, { quiet: true });
   }
 });
 
@@ -1517,6 +1565,7 @@ ctxOpenTerminal.addEventListener("click", handleOpenTerminal);
 ctxCopyKubectl.addEventListener("click", handleCopyKubectl);
 ctxViewLogs.addEventListener("click", handleViewLogs);
 ctxCopyMetrics.addEventListener("click", handleCopyMetrics);
+ctxCopyError.addEventListener("click", handleCopyError);
 
 document.getElementById("btn-settings")
   .addEventListener("click", openSettings);

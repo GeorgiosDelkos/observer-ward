@@ -47,10 +47,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # never written to config.json). keyring 4.2's default `v1` feature
 # initializes the macOS Keychain on the first `Entry::new`.
 keyring = "4.2"
-# Native file picker for the kubeconfig field (a webview <input type=file>
-# cannot return a real filesystem path). Held on 2.7: 2.8 requires tauri
-# 2.12, which also bumps tray-icon, and that is its own change to test.
-tauri-plugin-dialog = "~2.7.3"
+# Native file pickers for the kubeconfig and SSH key fields (a webview
+# <input type=file> cannot return a real filesystem path). Cargo.lock holds
+# 2.7.3 with tauri 2.11.5: 2.8 requires tauri 2.12, which also bumps
+# tray-icon under the macOS 27 tray-click workarounds. Upgrade them together.
+tauri-plugin-dialog = "2.7"
 
 [dev-dependencies]
 tempfile = "3.25"

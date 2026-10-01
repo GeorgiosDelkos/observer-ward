@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Node, Pod};
+use kube::Client;
 use kube::api::{Api, ListParams, ObjectList};
-use kube::{Client, Config};
 
 use crate::metrics::{ServerMetrics, ServerStatus};
 
@@ -81,17 +81,7 @@ impl K8sBackend {
                 .await
                 .map_err(|_| K8sError::KubeconfigTask)??;
 
-        let options = kube::config::KubeConfigOptions {
-            context: Some(self.context.clone()),
-            ..Default::default()
-        };
-
-        let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
-            .await
-            .map_err(|source| K8sError::BuildConfig {
-                context: self.context.clone(),
-                source: Box::new(source),
-            })?;
+        let mut config = kubeconfig::build_config(kubeconfig, &self.context).await?;
         config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
         config.read_timeout = Some(KUBE_READ_TIMEOUT);
 

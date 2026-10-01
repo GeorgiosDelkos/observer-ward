@@ -1,6 +1,6 @@
 //! macOS tray icon, popover show/hide, and blur-grace handling.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::image::Image;
@@ -63,9 +63,11 @@ pub(crate) struct TrayState {
     /// ignore the trailing tray mouse-up after macOS 27 steals
     /// key focus on mouse-down.
     pub(crate) last_blur_hide_ms: AtomicU64,
-    /// True while a native dialog opened from the popover is on screen.
-    /// Set only through [`NativeDialogGuard`].
-    pub(crate) native_dialog_open: AtomicBool,
+    /// Number of native dialogs opened from the popover that are still on
+    /// screen. A count, not a flag, so closing one of two overlapping
+    /// dialogs does not re-enable hide-on-blur under the other. Changed
+    /// only through [`NativeDialogGuard`].
+    pub(crate) native_dialogs_open: AtomicUsize,
 }
 
 /// Keeps the popover from hiding on blur while a native dialog is open.
@@ -75,20 +77,25 @@ pub(crate) struct NativeDialogGuard(tauri::AppHandle);
 
 impl NativeDialogGuard {
     pub(crate) fn open(app: &tauri::AppHandle) -> Self {
-        set_native_dialog_open(app, true);
+        if let Some(state) = app.try_state::<TrayState>() {
+            state.native_dialogs_open.fetch_add(1, Ordering::AcqRel);
+        }
         Self(app.clone())
     }
 }
 
 impl Drop for NativeDialogGuard {
     fn drop(&mut self) {
-        set_native_dialog_open(&self.0, false);
-    }
-}
-
-fn set_native_dialog_open(app: &tauri::AppHandle, open: bool) {
-    if let Some(state) = app.try_state::<TrayState>() {
-        state.native_dialog_open.store(open, Ordering::Release);
+        if let Some(state) = self.0.try_state::<TrayState>() {
+            // Saturating: TrayState is managed before any command can run,
+            // so open and drop always see it, but never wrap on a mismatch.
+            let _ =
+                state
+                    .native_dialogs_open
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        Some(n.saturating_sub(1))
+                    });
+        }
     }
 }
 
@@ -127,7 +134,7 @@ pub(crate) fn setup_tray_and_window(
         icon_reset: AtomicBool::new(false),
         last_tray_show_ms: AtomicU64::new(0),
         last_blur_hide_ms: AtomicU64::new(0),
-        native_dialog_open: AtomicBool::new(false),
+        native_dialogs_open: AtomicUsize::new(0),
     });
 
     let blur_handle = app.handle().clone();
@@ -213,7 +220,7 @@ fn handle_window_blur(
     let now = unix_now_ms();
     if let Some(state) = app.try_state::<TrayState>() {
         let shown_at = state.last_tray_show_ms.load(Ordering::Acquire);
-        let dialog_open = state.native_dialog_open.load(Ordering::Acquire);
+        let dialog_open = state.native_dialogs_open.load(Ordering::Acquire) > 0;
         if should_skip_blur_hide(now, shown_at, dialog_open) {
             return;
         }

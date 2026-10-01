@@ -125,6 +125,8 @@ body {
   width: 9px;
   height: 9px;
   border-radius: 50%;
+  /* Wider than its 8px column; without this flex would squash it. */
+  flex-shrink: 0;
   background: var(--green);
   animation: breathe-ok 2.6s ease-in-out infinite;
 }
@@ -236,9 +238,6 @@ body {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  user-select: text;
-  -webkit-user-select: text;
-  cursor: text;
 }
 .server-card-header {
   display: flex;

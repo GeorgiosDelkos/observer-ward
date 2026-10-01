@@ -11,12 +11,14 @@ use crate::metrics::{ServerMetrics, ServerStatus};
 
 mod error;
 mod events;
+mod kubeconfig;
 mod metrics_api;
 mod pods;
 mod quantity;
 mod stats;
 
 pub(crate) use error::K8sError;
+pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
 use metrics_api::{NodeMetrics, PodMetrics};
@@ -73,22 +75,11 @@ impl K8sBackend {
     /// Build a `kube::Client` from the configured kubeconfig
     /// file and context.
     async fn connect(&mut self) -> Result<(), K8sError> {
-        let kubeconfig_path = self
-            .kubeconfig
-            .clone()
-            .map(|p| crate::config::expand_tilde(&p));
-        let kubeconfig = tokio::task::spawn_blocking(move || match kubeconfig_path {
-            Some(path) => kube::config::Kubeconfig::read_from(&path).map_err(|source| {
-                K8sError::ReadKubeconfig {
-                    path,
-                    source: Box::new(source),
-                }
-            }),
-            None => kube::config::Kubeconfig::read()
-                .map_err(|source| K8sError::ReadDefaultKubeconfig(Box::new(source))),
-        })
-        .await
-        .map_err(|_| K8sError::KubeconfigTask)??;
+        let kubeconfig_path = self.kubeconfig.clone();
+        let kubeconfig =
+            tokio::task::spawn_blocking(move || kubeconfig::load(kubeconfig_path.as_deref()))
+                .await
+                .map_err(|_| K8sError::KubeconfigTask)??;
 
         let options = kube::config::KubeConfigOptions {
             context: Some(self.context.clone()),

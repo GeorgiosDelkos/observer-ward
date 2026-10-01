@@ -20,8 +20,8 @@ use tokio::sync::Notify;
 use commands::{
     ConfigState, LatestAlerts, LatestMetrics, WakeState, add_server, copy_to_clipboard,
     delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics, has_grafana_token,
-    open_pod_logs, open_ssh_terminal, open_url, quit_app, remove_server, resize_window,
-    save_config_cmd, set_grafana_token,
+    inspect_kubeconfig, open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig, pick_ssh_key,
+    quit_app, remove_server, resize_window, save_config_cmd, set_grafana_token,
 };
 use poller::PollerHandles;
 use tray::setup_tray_and_window;
@@ -62,6 +62,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             None,
         ))
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_positioner::init())
         .manage(ConfigState(Arc::clone(&config_arc)))
@@ -72,6 +73,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             get_config,
             save_config_cmd,
             add_server,
+            pick_kubeconfig,
+            pick_ssh_key,
+            inspect_kubeconfig,
             remove_server,
             resize_window,
             open_ssh_terminal,

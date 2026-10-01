@@ -450,7 +450,27 @@ body {
 .form-group.hidden {
   display: none;
 }
+.input-with-button {
+  display: flex;
+  gap: 6px;
+}
+.input-with-button input {
+  flex: 1;
+  min-width: 0;
+}
+.input-with-button .btn-browse {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  background: transparent;
+  border-color: var(--sep);
+  color: var(--text-2);
+}
+.input-with-button .btn-browse:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
 .form-error {
+  overflow-wrap: anywhere;
   color: var(--red);
   font-size: 12px;
   margin-bottom: 8px;

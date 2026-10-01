@@ -61,6 +61,12 @@ const addFormPanel = document.getElementById("add-form-panel");
 const addFormEl = document.getElementById("add-form");
 const btnCancel = document.getElementById("btn-cancel");
 const typeSelect = document.getElementById("field-type");
+const kubeconfigInput = document.getElementById("field-kubeconfig");
+const contextInput = document.getElementById("field-context");
+const contextOptions = document.getElementById("context-options");
+const btnBrowseKubeconfig = document.getElementById("btn-browse-kubeconfig");
+const keyPathInput = document.getElementById("field-keypath");
+const btnBrowseKeyPath = document.getElementById("btn-browse-keypath");
 const formError = document.getElementById("form-error");
 const contextMenu = document.getElementById("context-menu");
 
@@ -642,6 +648,7 @@ function toggleTypeFields() {
 
 function openAddForm() {
   addFormEl.reset();
+  contextOptions.replaceChildren();
   formError.textContent = "";
   toggleTypeFields();
   addFormPanel.classList.add("open");
@@ -652,6 +659,74 @@ function closeAddForm() {
   addFormPanel.classList.remove("open");
   formError.textContent = "";
   resizeToContent();
+}
+
+// Backend errors carry the full cause chain and can wrap over several
+// lines, so the popover is resized to keep them visible.
+function showFormError(message) {
+  formError.textContent = message;
+  resizeToContent();
+}
+
+// Open a native file picker via `command` and write the chosen path into
+// `input`. Resolves to the path, or null when cancelled or failed.
+async function browseForPath(command, input, button) {
+  showFormError("");
+  // One picker at a time: the backend's blur guard is per dialog, so a
+  // second overlapping picker could let the popover hide under it.
+  btnBrowseKubeconfig.disabled = true;
+  btnBrowseKeyPath.disabled = true;
+  try {
+    const path = await invoke(command, {
+      current: input.value.trim() || null,
+    });
+    if (path) {
+      input.value = path;
+    }
+    return path;
+  } catch (err) {
+    showFormError(String(err));
+    return null;
+  } finally {
+    btnBrowseKubeconfig.disabled = false;
+    btnBrowseKeyPath.disabled = false;
+    button.focus();
+  }
+}
+
+async function browseKubeconfig() {
+  const path = await browseForPath(
+    "pick_kubeconfig", kubeconfigInput, btnBrowseKubeconfig,
+  );
+  if (path) {
+    await loadKubeconfigContexts(path);
+  }
+}
+
+function browseKeyPath() {
+  return browseForPath("pick_ssh_key", keyPathInput, btnBrowseKeyPath);
+}
+
+// Offer the kubeconfig's contexts as suggestions and prefill its
+// current-context, so the context name is picked rather than typed.
+async function loadKubeconfigContexts(path) {
+  contextOptions.replaceChildren();
+  let summary;
+  try {
+    summary = await invoke("inspect_kubeconfig", { path });
+  } catch (err) {
+    showFormError(String(err));
+    return;
+  }
+  showFormError("");
+  for (const name of summary.contexts) {
+    const option = document.createElement("option");
+    option.value = name;
+    contextOptions.append(option);
+  }
+  if (!contextInput.value.trim() && summary.current_context) {
+    contextInput.value = summary.current_context;
+  }
 }
 
 function buildServerConfig() {
@@ -722,7 +797,7 @@ async function handleAddServer(e) {
 
   const result = buildServerConfig();
   if (result.error) {
-    formError.textContent = result.error;
+    showFormError(result.error);
     return;
   }
 
@@ -734,7 +809,7 @@ async function handleAddServer(e) {
     renderAll();
     closeAddForm();
   } catch (err) {
-    formError.textContent = String(err);
+    showFormError(String(err));
   }
 }
 
@@ -1416,6 +1491,19 @@ addFormEl.addEventListener("submit", handleAddServer);
 btnCancel.addEventListener("click", closeAddForm);
 
 typeSelect.addEventListener("change", toggleTypeFields);
+
+btnBrowseKubeconfig.addEventListener("click", browseKubeconfig);
+btnBrowseKeyPath.addEventListener("click", browseKeyPath);
+
+// A hand-typed path is checked as soon as the field is left, not only on Add.
+kubeconfigInput.addEventListener("change", () => {
+  const path = kubeconfigInput.value.trim();
+  if (path) {
+    loadKubeconfigContexts(path);
+  } else {
+    contextOptions.replaceChildren();
+  }
+});
 
 ctxRemove.addEventListener("click", handleRemoveServer);
 ctxOpenTerminal.addEventListener("click", handleOpenTerminal);

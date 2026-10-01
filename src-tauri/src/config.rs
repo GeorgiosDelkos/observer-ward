@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -151,6 +151,24 @@ pub fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// Directory a file picker opens in: the folder of the path already in the
+/// form when that folder exists, else `fallback` (e.g. `~/.kube`) when it
+/// exists, else `None` for the OS default.
+#[must_use]
+pub fn picker_start_dir(current: Option<&str>, fallback: Option<&Path>) -> Option<PathBuf> {
+    let from_current = current
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| PathBuf::from(expand_tilde(p)))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .filter(|dir| dir.is_dir());
+    if from_current.is_some() {
+        return from_current;
+    }
+
+    fallback.filter(|dir| dir.is_dir()).map(Path::to_path_buf)
+}
+
 /// Returns the config file path: `~/.config/observer-ward/config.json`
 fn config_path() -> Result<PathBuf, ConfigError> {
     let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
@@ -210,6 +228,31 @@ pub fn save_config(config: &AppConfig) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn picker_starts_in_folder_of_current_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current = dir.path().join("does-not-need-to-exist.yaml");
+
+        let start = picker_start_dir(Some(&current.display().to_string()), None);
+
+        assert_eq!(start.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn picker_falls_back_only_to_an_existing_dir() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let fallback = home.path().join(".ssh");
+
+        assert_eq!(picker_start_dir(Some("  "), Some(&fallback)), None);
+
+        fs::create_dir(&fallback).expect("create fallback dir");
+        let missing_parent = home.path().join("gone").join("id_ed25519");
+
+        let start = picker_start_dir(Some(&missing_parent.display().to_string()), Some(&fallback));
+
+        assert_eq!(start, Some(fallback));
+    }
 
     #[test]
     fn expand_tilde_leaves_absolute_and_relative_paths() {

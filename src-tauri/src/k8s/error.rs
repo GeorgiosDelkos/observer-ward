@@ -19,6 +19,8 @@ pub(crate) enum K8sError {
     },
     #[error("failed to read default kubeconfig")]
     ReadDefaultKubeconfig(#[source] Box<kube::config::KubeconfigError>),
+    #[error("context {context} not found in kubeconfig (available: {available})")]
+    UnknownContext { context: String, available: String },
     #[error("failed to build kube config for context {context}")]
     BuildConfig {
         context: String,

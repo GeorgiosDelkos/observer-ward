@@ -172,11 +172,13 @@ impl SshBackend {
         let Some(session) = self.session.take() else {
             return;
         };
-        if let Err(e) = session
-            .disconnect(Disconnect::ByApplication, "closing", "")
-            .await
-        {
-            tracing::debug!("SSH disconnect from {} failed: {e}", self.target.host);
+        // Bounded like the channel close: a dead peer must not eat the time
+        // the poller allows for the whole collection.
+        let disconnect = session.disconnect(Disconnect::ByApplication, "closing", "");
+        match tokio::time::timeout(CLOSE_TIMEOUT, disconnect).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("SSH disconnect from {} failed: {e}", self.target.host),
+            Err(_) => tracing::debug!("SSH disconnect from {} timed out", self.target.host),
         }
     }
 }

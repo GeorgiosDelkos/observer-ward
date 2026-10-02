@@ -72,20 +72,95 @@ fn decide_host_key(check: HostKeyCheck) -> HostKeyDecision {
     }
 }
 
+/// The host pattern `known_hosts` uses: `host` on port 22, `[host]:port`
+/// otherwise.
+fn known_hosts_pattern(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// A `known_hosts` line that names the host but that russh's parser does
+/// not evaluate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UncheckedEntry {
+    /// `@cert-authority` / `@revoked`: russh ignores markers, so a revoked
+    /// key could otherwise be accepted.
+    Marker,
+    /// A wildcard pattern or a line not separated by single spaces, which
+    /// russh skips. Treating the host as unknown would let TOFU replace a
+    /// key the user did record.
+    Unparsed,
+}
+
+/// Scan `contents` for lines naming `pattern` that russh cannot check.
+/// Hashed (`|1|`) entries are left to russh, which does check them when
+/// they are written in OpenSSH's own format.
+fn unchecked_entry(contents: &str, pattern: &str) -> Option<UncheckedEntry> {
+    let mut found = None;
+    for raw in contents.lines() {
+        let mut fields = raw.split_whitespace();
+        let Some(first) = fields.next().filter(|f| !f.starts_with('#')) else {
+            continue;
+        };
+        let (marker, hosts) = if first.starts_with('@') {
+            (true, fields.next().unwrap_or_default())
+        } else {
+            (false, first)
+        };
+        if !hosts.split(',').any(|p| names_host(p, pattern)) {
+            continue;
+        }
+        if marker {
+            return Some(UncheckedEntry::Marker);
+        }
+        // russh splits the raw line on single spaces and compares host
+        // patterns literally.
+        let russh_reads_it = !raw.contains('\t')
+            && raw.split(' ').next() == Some(hosts)
+            && !hosts.contains(['*', '?']);
+        if !russh_reads_it {
+            found = Some(UncheckedEntry::Unparsed);
+        }
+    }
+    found
+}
+
+/// Whether one host pattern (plain or `*`/`?` wildcard, not negated or
+/// hashed) matches `host`.
+fn names_host(pattern: &str, host: &str) -> bool {
+    if pattern.starts_with('!') || pattern.starts_with("|1|") {
+        return false;
+    }
+    glob_match(pattern.as_bytes(), host.as_bytes())
+}
+
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((b'*', rest)) => (0..=text.len()).any(|skip| glob_match(rest, &text[skip..])),
+        Some((&p, rest)) => text
+            .split_first()
+            .is_some_and(|(&t, text_rest)| (p == b'?' || p == t) && glob_match(rest, text_rest)),
+    }
+}
+
 /// Look `key` up in the `known_hosts` file at `path`.
 ///
 /// russh's lookup returns an empty list for *any* open failure, which
 /// would make a permission error indistinguishable from a missing file,
 /// so the file is opened here first and only `NotFound` counts as empty.
 fn check_known_hosts(path: &Path, host: &str, port: u16, key: &PublicKey) -> HostKeyCheck {
-    match std::fs::File::open(path) {
-        Ok(_) => {}
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HostKeyCheck::Unknown,
         Err(e) => {
             tracing::warn!("cannot read {}: {e}", path.display());
             return HostKeyCheck::LookupFailed;
         }
-    }
+    };
 
     let recorded = match known_host_keys_path(host, port, path) {
         Ok(recorded) => recorded,
@@ -94,6 +169,26 @@ fn check_known_hosts(path: &Path, host: &str, port: u16, key: &PublicKey) -> Hos
             return HostKeyCheck::LookupFailed;
         }
     };
+
+    match unchecked_entry(&contents, &known_hosts_pattern(host, port)) {
+        Some(UncheckedEntry::Marker) => {
+            tracing::warn!(
+                "{} has a @cert-authority/@revoked line for {host}:{port}, which is \
+                 not supported; refusing to decide",
+                path.display()
+            );
+            return HostKeyCheck::LookupFailed;
+        }
+        Some(UncheckedEntry::Unparsed) if recorded.is_empty() => {
+            tracing::warn!(
+                "{} names {host}:{port} in a line russh cannot check (tabs, extra \
+                 spaces or a wildcard); refusing to learn a new key",
+                path.display()
+            );
+            return HostKeyCheck::LookupFailed;
+        }
+        Some(UncheckedEntry::Unparsed) | None => {}
+    }
 
     if recorded.is_empty() {
         return HostKeyCheck::Unknown;
@@ -141,10 +236,18 @@ impl client::Handler for SshHandler {
             }
             HostKeyDecision::Learn => {
                 tracing::info!("no known_hosts entry for {host}:{port}, learning key (TOFU)");
-                if let Err(e) = learn_known_hosts_path(host, port, server_public_key, path) {
-                    tracing::warn!("failed to save host key for {host}:{port}: {e}");
+                // Accepting a key that could not be recorded would make every
+                // later connection a "first" one, accepting any key forever.
+                match learn_known_hosts_path(host, port, server_public_key, path) {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        tracing::error!(
+                            "refusing {host}:{port}: could not record its host key in {}: {e}",
+                            path.display()
+                        );
+                        Ok(false)
+                    }
                 }
-                Ok(true)
             }
         }
     }
@@ -307,6 +410,64 @@ mod tests {
             check_known_hosts(&path, "box", 22, &key(ED_B)),
             HostKeyCheck::LookupFailed
         );
+    }
+
+    #[test]
+    fn tab_separated_entry_blocks_learning() {
+        let (_dir, path) = known_hosts(&format!("box\tssh-ed25519 {ED_A}\n"));
+
+        assert_eq!(
+            check_known_hosts(&path, "box", 22, &key(ED_B)),
+            HostKeyCheck::LookupFailed
+        );
+    }
+
+    #[test]
+    fn wildcard_entry_blocks_learning() {
+        let (_dir, path) = known_hosts(&format!("*.prod.internal ssh-ed25519 {ED_A}\n"));
+
+        assert_eq!(
+            check_known_hosts(&path, "web.prod.internal", 22, &key(ED_B)),
+            HostKeyCheck::LookupFailed
+        );
+        assert_eq!(
+            check_known_hosts(&path, "web.staging.internal", 22, &key(ED_B)),
+            HostKeyCheck::Unknown
+        );
+    }
+
+    #[test]
+    fn marker_lines_for_the_host_fail_closed() {
+        let (_dir, path) = known_hosts(&format!(
+            "box ssh-ed25519 {ED_A}\n@revoked box ssh-ed25519 {ED_A}\n"
+        ));
+
+        assert_eq!(
+            check_known_hosts(&path, "box", 22, &key(ED_A)),
+            HostKeyCheck::LookupFailed
+        );
+    }
+
+    #[test]
+    fn unrelated_odd_lines_do_not_interfere() {
+        let (_dir, path) = known_hosts(&format!(
+            "other\tssh-ed25519 {ED_B}\n!box,* ssh-ed25519 {ED_B}\nbox ssh-ed25519 {ED_A}\n"
+        ));
+
+        assert_eq!(
+            check_known_hosts(&path, "box", 22, &key(ED_A)),
+            HostKeyCheck::Match
+        );
+    }
+
+    #[test]
+    fn glob_patterns() {
+        assert!(glob_match(b"*.example.com", b"a.example.com"));
+        assert!(glob_match(b"web-?", b"web-1"));
+        assert!(!glob_match(b"web-?", b"web-12"));
+        assert!(glob_match(b"[box]:2222", b"[box]:2222"));
+        assert!(!names_host("!box", "box"));
+        assert_eq!(known_hosts_pattern("box", 2222), "[box]:2222");
     }
 
     #[test]

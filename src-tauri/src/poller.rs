@@ -68,6 +68,8 @@ fn tray_alerts_after_grafana(fetch: Option<&AlertsUpdate>, last_good: &[Alert]) 
 }
 
 struct FailureState {
+    /// The config the failures were seen with; an edit starts afresh.
+    server: ServerConfig,
     count: u32,
     last_attempt: Instant,
     /// Kept so servers held in backoff still report why they are offline.
@@ -75,8 +77,9 @@ struct FailureState {
 }
 
 impl FailureState {
-    fn new() -> Self {
+    fn new(server: ServerConfig) -> Self {
         Self {
+            server,
             count: 0,
             last_attempt: Instant::now(),
             last_error: String::new(),
@@ -186,7 +189,7 @@ struct ServerPool {
 
 /// What a collection task hands back: the backend to reuse (dropped on
 /// timeout, as its connection state is unknown) and the report.
-type TaskOutput = (ServerName, Option<Backend>, ServerReport);
+type TaskOutput = (Option<Backend>, ServerReport);
 
 impl ServerPool {
     /// Forget servers that are no longer configured.
@@ -206,53 +209,54 @@ impl ServerPool {
         let mut task_servers: HashMap<Id, &ServerConfig> = HashMap::new();
 
         for server in servers {
-            if let Some(last_error) = self.backoff_error(server.name()) {
+            if let Some(last_error) = self.backoff_error(server) {
                 reports.push(offline_report(server, last_error));
                 continue;
             }
             let backend = self.take_backend(server);
-            let id = tasks
-                .spawn(collect_task(server.name().clone(), backend))
-                .id();
+            let id = tasks.spawn(collect_task(server.clone(), backend)).id();
             task_servers.insert(id, server);
         }
 
         while let Some(joined) = tasks.join_next_with_id().await {
-            let report = match joined {
-                Ok((_, (name, backend, report))) => {
+            let (id, outcome) = match joined {
+                Ok((id, output)) => (id, Ok(output)),
+                Err(e) => (e.id(), Err(e)),
+            };
+            let Some(&server) = task_servers.get(&id) else {
+                tracing::error!("poll task {id} finished but was never spawned");
+                continue;
+            };
+            let report = match outcome {
+                Ok((backend, report)) => {
                     if let Some(backend) = backend {
-                        self.backends.insert(name, backend);
+                        self.backends.insert(server.name().clone(), backend);
                     }
                     report
                 }
                 Err(e) => {
-                    let Some(server) = task_servers.get(&e.id()) else {
-                        tracing::error!("poll task {} failed: {e}", e.id());
-                        continue;
-                    };
                     tracing::error!("poll task for {} failed: {e}", server.name());
                     offline_report(server, format!("metrics collection failed: {e}"))
                 }
             };
-            self.record(&report);
+            self.record(server, &report);
             reports.push(report);
         }
 
-        // Tasks finish in any order; keep the payload and the notification
-        // order stable by reporting in config order.
-        let position: HashMap<&str, usize> = servers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.name().as_str(), i))
-            .collect();
-        reports.sort_by_key(|r| position.get(r.name().as_str()).copied());
+        order_by_config(&mut reports, servers);
         reports
     }
 
-    /// The last error if `name` is in backoff. An expired backoff resets
-    /// the counter for a fresh set of attempts.
-    fn backoff_error(&mut self, name: &ServerName) -> Option<String> {
-        let state = self.failures.get_mut(name)?;
+    /// The last error if `server` is in backoff. An expired backoff resets
+    /// the counter for a fresh set of attempts, and so does any change to
+    /// the server's config: a corrected entry (removed and re-added under
+    /// the same name) must be contacted right away.
+    fn backoff_error(&mut self, server: &ServerConfig) -> Option<String> {
+        let state = self.failures.get_mut(server.name())?;
+        if state.server != *server {
+            self.failures.remove(server.name());
+            return None;
+        }
         match backoff_decision(state.count, state.last_attempt.elapsed()) {
             BackoffDecision::Ready => None,
             BackoffDecision::Hold => Some(state.last_error.clone()),
@@ -270,39 +274,40 @@ impl ServerPool {
         }
     }
 
-    fn record(&mut self, report: &ServerReport) {
+    fn record(&mut self, server: &ServerConfig, report: &ServerReport) {
         match offline_error(report) {
             None => {
-                self.failures.remove(report.name());
+                self.failures.remove(server.name());
             }
             Some(error) => {
-                tracing::warn!("failed to collect metrics for {}: {error}", report.name());
+                tracing::warn!("failed to collect metrics for {}: {error}", server.name());
                 self.failures
-                    .entry(report.name().clone())
-                    .or_insert_with(FailureState::new)
+                    .entry(server.name().clone())
+                    .or_insert_with(|| FailureState::new(server.clone()))
                     .record(error.to_string());
             }
         }
     }
 }
 
-async fn collect_task(name: ServerName, mut backend: Backend) -> TaskOutput {
-    let collected = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name.clone())).await;
-    let Ok(report) = collected else {
-        let error = format!("timed out collecting metrics for {name}");
-        let report = match backend {
-            Backend::Ssh(_) => ServerReport::Ssh {
-                name: name.clone(),
-                health: Health::Offline { error },
-            },
-            Backend::K8s(_) => ServerReport::K8s {
-                name: name.clone(),
-                health: Health::Offline { error },
-            },
-        };
-        return (name, None, report);
+/// Sort `reports` into the order of `servers`. Tasks finish in any order;
+/// this keeps the payload and the notification order stable.
+fn order_by_config(reports: &mut [ServerReport], servers: &[ServerConfig]) {
+    let position: HashMap<&str, usize> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name().as_str(), i))
+        .collect();
+    reports.sort_by_key(|r| position.get(r.name().as_str()).copied());
+}
+
+async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput {
+    let name = server.name().clone();
+    let Ok(report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
+        let error = format!("timed out collecting metrics for {}", server.name());
+        return (None, offline_report(&server, error));
     };
-    (name, Some(backend), report)
+    (Some(backend), report)
 }
 
 /// Replace the cached value. The slot holds a value replaced wholesale, so
@@ -325,7 +330,7 @@ struct Notice {
 struct Notifier {
     /// Last levels of each online card. A card that goes offline or
     /// disappears is dropped, so it notifies again when it returns.
-    levels: HashMap<String, [MetricLevel; 3]>,
+    levels: HashMap<String, [MetricLevel; USAGE_METRICS.len()]>,
     /// Active alert fingerprints from the last successful Grafana fetch.
     alert_fingerprints: HashSet<String>,
 }
@@ -342,7 +347,7 @@ impl Notifier {
                 .levels
                 .get(&label)
                 .copied()
-                .unwrap_or([MetricLevel::Ok; 3]);
+                .unwrap_or([MetricLevel::Ok; USAGE_METRICS.len()]);
             for (((metric, level), prev), value) in USAGE_METRICS
                 .iter()
                 .zip(now)
@@ -357,6 +362,25 @@ impl Notifier {
                 }
             }
             levels.insert(label, now);
+        }
+
+        // A cluster that is online but could not list its pods says
+        // nothing about them: keep their levels so the next good listing
+        // does not re-announce every pod that is still hot.
+        for report in reports {
+            if let ServerReport::K8s {
+                name,
+                health: Health::Online { metrics },
+            } = report
+                && metrics.pods.is_none()
+            {
+                let prefix = format!("{name}/");
+                for (label, level) in &self.levels {
+                    if label.starts_with(&prefix) {
+                        levels.insert(label.clone(), *level);
+                    }
+                }
+            }
         }
 
         self.levels = levels;
@@ -543,8 +567,10 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SshTarget;
     use crate::metrics::tests::{cluster, host, make_alert, offline, pod, usage};
     use crate::metrics::{AlertSeverity, AlertState};
+    use std::path::PathBuf;
 
     #[test]
     fn backoff_ready_below_threshold() {
@@ -630,7 +656,7 @@ mod tests {
 
     #[test]
     fn failure_state_keeps_the_latest_error_for_backoff_rows() {
-        let mut state = FailureState::new();
+        let mut state = FailureState::new(ssh_server("bastion", "h"));
 
         state.record("connection refused".to_string());
         state.record("timed out collecting metrics for bastion".to_string());
@@ -639,21 +665,90 @@ mod tests {
         assert_eq!(state.last_error, "timed out collecting metrics for bastion");
     }
 
+    fn ssh_server(name: &str, host: &str) -> ServerConfig {
+        ServerConfig::Ssh(SshTarget {
+            name: name.into(),
+            host: host.to_string(),
+            port: 22,
+            user: "ops".to_string(),
+            key_path: PathBuf::from("/k"),
+        })
+    }
+
     #[test]
     fn pool_records_failures_and_clears_on_success() {
         let mut pool = ServerPool::default();
-        let name = ServerName::from("bastion");
+        let server = ssh_server("bastion", "10.0.0.1");
 
         for _ in 0..BACKOFF_THRESHOLD {
-            pool.record(&offline("bastion"));
+            pool.record(&server, &offline("bastion"));
         }
         assert_eq!(
-            pool.backoff_error(&name).as_deref(),
+            pool.backoff_error(&server).as_deref(),
             Some("connection refused")
         );
 
-        pool.record(&host("bastion", usage(1.0, 1.0, 1.0)));
-        assert!(pool.backoff_error(&name).is_none());
+        pool.record(&server, &host("bastion", usage(1.0, 1.0, 1.0)));
+        assert!(pool.backoff_error(&server).is_none());
+    }
+
+    #[test]
+    fn edited_server_is_not_held_in_the_old_backoff() {
+        let mut pool = ServerPool::default();
+        let broken = ssh_server("bastion", "10.0.0.1");
+        for _ in 0..BACKOFF_THRESHOLD {
+            pool.record(&broken, &offline("bastion"));
+        }
+
+        let fixed = ssh_server("bastion", "10.0.0.2");
+
+        assert!(pool.backoff_error(&fixed).is_none());
+        assert!(pool.backoff_error(&broken).is_none(), "state was reset");
+    }
+
+    #[test]
+    fn reports_follow_config_order() {
+        let servers = [
+            ssh_server("a", "h"),
+            ssh_server("b", "h"),
+            ssh_server("c", "h"),
+        ];
+        let mut reports = vec![offline("c"), offline("a"), offline("b")];
+
+        order_by_config(&mut reports, &servers);
+
+        let names: Vec<&str> = reports.iter().map(|r| r.name().as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn panicked_or_timed_out_tasks_report_the_right_kind() {
+        let report = offline_report(&ssh_server("a", "h"), "boom".to_string());
+        assert!(matches!(
+            report,
+            ServerReport::Ssh {
+                health: Health::Offline { ref error },
+                ..
+            } if error == "boom"
+        ));
+    }
+
+    #[test]
+    fn pod_levels_survive_a_failed_pod_listing() {
+        let mut notifier = Notifier::default();
+        let hot = [cluster(
+            "prod",
+            usage(1.0, 1.0, 1.0),
+            Some(vec![pod("web", 0, Some(usage(95.0, 1.0, 1.0)))]),
+        )];
+        assert_eq!(notifier.metric_notices(&hot).len(), 1);
+
+        notifier.metric_notices(&[cluster("prod", usage(1.0, 1.0, 1.0), None)]);
+
+        assert!(
+            notifier.metric_notices(&hot).is_empty(),
+            "no repeat after a listing gap"
+        );
     }
 
     #[test]

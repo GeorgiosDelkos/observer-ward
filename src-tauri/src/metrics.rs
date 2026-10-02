@@ -241,12 +241,12 @@ pub const USAGE_METRICS: [&str; 3] = ["CPU", "MEM", "DISK"];
 
 impl Usage {
     #[must_use]
-    pub fn percents(&self) -> [f64; 3] {
+    pub fn percents(&self) -> [f64; USAGE_METRICS.len()] {
         [self.cpu_percent, self.memory_percent, self.disk_percent]
     }
 
     #[must_use]
-    pub fn levels(&self) -> [MetricLevel; 3] {
+    pub fn levels(&self) -> [MetricLevel; USAGE_METRICS.len()] {
         self.percents().map(classify_level)
     }
 }

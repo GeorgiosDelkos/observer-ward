@@ -68,11 +68,13 @@ impl AppConfig {
         self.servers.iter().find(|s| s.name().as_str() == name)
     }
 
-    /// Check the invariants a write must keep (poll intervals in the form's
+    /// Check the config invariants a write must keep (poll intervals in the form's
     /// range; unique server names without `/`), but only for what differs
     /// from `previous`: changed intervals and servers that were not there
     /// before. A legacy file (a `/` in a name, a hand-edited interval) must
-    /// not block unrelated edits such as removing a different server.
+    /// not block unrelated edits such as removing a different server. The
+    /// Grafana URL is checked separately, by `grafana::validate_url`, when
+    /// settings are saved.
     ///
     /// # Errors
     ///
@@ -773,6 +775,49 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Invalid { .. })));
         assert!(store.snapshot().await.servers.is_empty());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_save_leaves_the_current_config_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, "file where the config dir should be").expect("write");
+        let store = ConfigStore::new(blocker.join("config.json"), AppConfig::default());
+
+        let result = store
+            .update(|c| {
+                c.servers.push(ssh("a"));
+                Ok::<_, ConfigError>(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(ConfigError::CreateDir { .. })));
+        assert!(store.snapshot().await.servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_updates_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let store = std::sync::Arc::new(ConfigStore::new(path.clone(), AppConfig::default()));
+
+        let edits = (0..8).map(|i| {
+            let store = std::sync::Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .update(|c| {
+                        c.servers.push(ssh(&format!("s{i}")));
+                        Ok::<_, ConfigError>(())
+                    })
+                    .await
+            })
+        });
+        for edit in edits.collect::<Vec<_>>() {
+            edit.await.expect("join").expect("update");
+        }
+
+        assert_eq!(store.snapshot().await.servers.len(), 8);
+        assert_eq!(load_config_from(&path).expect("load").servers.len(), 8);
     }
 
     #[tokio::test]

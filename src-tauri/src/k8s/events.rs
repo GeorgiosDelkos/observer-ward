@@ -1,11 +1,14 @@
 //! Latest event per pod, shown on each pod card.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Event;
 use k8s_openapi::jiff::Timestamp;
 use kube::Client;
 use kube::api::{Api, ListParams};
+use tokio::time::Instant;
 
 use super::error::K8sError;
 
@@ -15,6 +18,11 @@ const EVENT_PAGE_SIZE: u32 = 500;
 /// Pages read per poll before giving up on the rest. Events expire after
 /// an hour by default, so this only bounds a namespace in an event storm.
 const MAX_EVENT_PAGES: usize = 10;
+
+/// Time allowed for all pages together. Events are optional decoration;
+/// a slow listing must not push the whole cluster poll past its timeout
+/// and mark the cluster offline.
+const EVENT_BUDGET: Duration = Duration::from_secs(10);
 
 fn event_list_params(continue_token: Option<&str>) -> ListParams {
     let params = ListParams::default()
@@ -27,41 +35,78 @@ fn event_list_params(continue_token: Option<&str>) -> ListParams {
     }
 }
 
+/// One page of the event list and the token for the next, if any.
+struct EventPage {
+    items: Vec<Event>,
+    next: Option<String>,
+}
+
 /// Fetch recent events for pods in `namespace`, keyed by pod name, each
 /// formatted as `"{type}: {reason}"`.
 ///
 /// The list comes back in name order, not time order, so every page is
-/// read (up to [`MAX_EVENT_PAGES`]) before picking the newest per pod.
+/// read (within [`MAX_EVENT_PAGES`] and [`EVENT_BUDGET`]) before the
+/// newest per pod is known.
 pub(super) async fn fetch_pod_events(
     client: &Client,
     namespace: &str,
 ) -> Result<HashMap<String, String>, K8sError> {
     let api: Api<Event> = Api::namespaced(client.clone(), namespace);
-    let mut events = Vec::new();
-    let mut continue_token: Option<String> = None;
+    let fetch = |token: Option<String>| {
+        let api = api.clone();
+        async move {
+            let page = api
+                .list(&event_list_params(token.as_deref()))
+                .await
+                .map_err(|source| K8sError::ListEvents {
+                    namespace: namespace.to_string(),
+                    source: Box::new(source),
+                })?;
+            Ok(EventPage {
+                items: page.items,
+                next: page.metadata.continue_,
+            })
+        }
+    };
+
+    let latest = collect_pages(fetch, Instant::now() + EVENT_BUDGET, namespace).await?;
+    Ok(latest.into_map())
+}
+
+/// Read pages through `fetch` until there is no continue token, folding
+/// each into the newest-per-pod map as it arrives. Stops early, keeping
+/// what it has, at [`MAX_EVENT_PAGES`] or at `deadline`.
+async fn collect_pages<F, Fut>(
+    mut fetch: F,
+    deadline: Instant,
+    namespace: &str,
+) -> Result<LatestEvents, K8sError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<EventPage, K8sError>>,
+{
+    let mut latest = LatestEvents::default();
+    let mut token = None;
 
     for _ in 0..MAX_EVENT_PAGES {
-        let page = api
-            .list(&event_list_params(continue_token.as_deref()))
-            .await
-            .map_err(|source| K8sError::ListEvents {
-                namespace: namespace.to_string(),
-                source: Box::new(source),
-            })?;
-        events.extend(page.items);
+        let Ok(page) = tokio::time::timeout_at(deadline, fetch(token)).await else {
+            tracing::warn!("listing pod events in {namespace} ran out of time; showing partial");
+            return Ok(latest);
+        };
+        let page = page?;
+        latest.add(&page.items);
 
-        continue_token = page.metadata.continue_.filter(|token| !token.is_empty());
-        if continue_token.is_none() {
-            return Ok(latest_event_per_pod(&events));
+        token = page.next.filter(|t| !t.is_empty());
+        if token.is_none() {
+            return Ok(latest);
         }
     }
 
     tracing::warn!(
-        "namespace {namespace} has more than {} pod events; using the first {}",
-        EVENT_PAGE_SIZE as usize * MAX_EVENT_PAGES,
-        events.len()
+        "namespace {namespace} has more than {} pod events; showing the newest of those read",
+        EVENT_PAGE_SIZE as usize * MAX_EVENT_PAGES
     );
-    Ok(latest_event_per_pod(&events))
+    Ok(latest)
 }
 
 /// When an event last happened. Core/v1 events from newer components
@@ -83,32 +128,40 @@ fn observed_at(event: &Event) -> Option<Timestamp> {
     candidates.into_iter().flatten().max()
 }
 
-/// Pick the newest event for each pod. An event with no timestamp at all
-/// only wins when the pod has nothing better.
-fn latest_event_per_pod(events: &[Event]) -> HashMap<String, String> {
-    let mut latest: HashMap<&str, (&Event, Option<Timestamp>)> = HashMap::new();
+/// The newest event seen so far for each pod, as its description and
+/// timestamp.
+#[derive(Default)]
+struct LatestEvents(HashMap<String, (String, Option<Timestamp>)>);
 
-    for event in events {
-        if event.involved_object.kind.as_deref() != Some("Pod") {
-            continue;
-        }
-        let Some(pod_name) = event.involved_object.name.as_deref() else {
-            continue;
-        };
+impl LatestEvents {
+    /// Fold in a batch of events. An event with no timestamp at all only
+    /// wins when the pod has nothing better.
+    fn add(&mut self, events: &[Event]) {
+        for event in events {
+            if event.involved_object.kind.as_deref() != Some("Pod") {
+                continue;
+            }
+            let Some(pod_name) = event.involved_object.name.as_deref() else {
+                continue;
+            };
 
-        let at = observed_at(event);
-        let is_newer = latest
-            .get(pod_name)
-            .is_none_or(|&(_, prev_at)| at >= prev_at);
-        if is_newer {
-            latest.insert(pod_name, (event, at));
+            let at = observed_at(event);
+            let is_newer = self
+                .0
+                .get(pod_name)
+                .is_none_or(|&(_, prev_at)| at >= prev_at);
+            if is_newer {
+                self.0.insert(pod_name.to_string(), (describe(event), at));
+            }
         }
     }
 
-    latest
-        .into_iter()
-        .map(|(pod, (event, _))| (pod.to_string(), describe(event)))
-        .collect()
+    fn into_map(self) -> HashMap<String, String> {
+        self.0
+            .into_iter()
+            .map(|(pod, (description, _))| (pod, description))
+            .collect()
+    }
 }
 
 fn describe(event: &Event) -> String {
@@ -148,6 +201,98 @@ mod tests {
     fn at_last_timestamp(mut event: Event, second: i64) -> Event {
         event.last_timestamp = Some(Time(ts(second)));
         event
+    }
+
+    fn latest_event_per_pod(events: &[Event]) -> HashMap<String, String> {
+        let mut latest = LatestEvents::default();
+        latest.add(events);
+        latest.into_map()
+    }
+
+    /// Serves `pages` in order, recording the continue token of each call.
+    fn paged<'a>(
+        pages: Vec<(Vec<Event>, Option<&'static str>)>,
+        tokens: &'a std::sync::Mutex<Vec<Option<String>>>,
+    ) -> impl FnMut(Option<String>) -> std::future::Ready<Result<EventPage, K8sError>> + 'a {
+        let mut pages = pages.into_iter();
+        move |token| {
+            tokens.lock().expect("lock").push(token);
+            let (items, next) = pages.next().expect("no request past the last page");
+            std::future::ready(Ok(EventPage {
+                items,
+                next: next.map(str::to_string),
+            }))
+        }
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    #[tokio::test]
+    async fn pages_are_followed_until_the_token_runs_out() {
+        let tokens = std::sync::Mutex::new(Vec::new());
+        let fetch = paged(
+            vec![
+                (
+                    vec![at_last_timestamp(pod_event("web", "Old"), 100)],
+                    Some("p2"),
+                ),
+                (
+                    vec![at_last_timestamp(pod_event("web", "New"), 200)],
+                    Some(""),
+                ),
+            ],
+            &tokens,
+        );
+
+        let latest = collect_pages(fetch, far_deadline(), "ns")
+            .await
+            .expect("pages");
+
+        assert_eq!(latest.into_map()["web"], "Warning: New");
+        assert_eq!(
+            *tokens.lock().expect("lock"),
+            [None, Some("p2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn paging_stops_at_the_page_cap() {
+        let tokens = std::sync::Mutex::new(Vec::new());
+        let pages = (0..MAX_EVENT_PAGES + 5)
+            .map(|_| (vec![pod_event("web", "Spam")], Some("more")))
+            .collect();
+
+        let latest = collect_pages(paged(pages, &tokens), far_deadline(), "ns")
+            .await
+            .expect("pages");
+
+        assert_eq!(tokens.lock().expect("lock").len(), MAX_EVENT_PAGES);
+        assert_eq!(latest.into_map().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_page_keeps_what_was_read() {
+        let mut calls = 0;
+        let fetch = move |_token: Option<String>| {
+            calls += 1;
+            let first = calls == 1;
+            async move {
+                if !first {
+                    std::future::pending::<()>().await;
+                }
+                Ok(EventPage {
+                    items: vec![pod_event("web", "Seen")],
+                    next: Some("more".to_string()),
+                })
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let latest = collect_pages(fetch, deadline, "ns").await.expect("partial");
+
+        assert_eq!(latest.into_map()["web"], "Warning: Seen");
     }
 
     #[test]

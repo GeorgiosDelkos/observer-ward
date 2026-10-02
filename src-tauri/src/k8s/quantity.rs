@@ -58,7 +58,13 @@ fn suffix_scale(suffix: &str) -> Option<Scale> {
         // `e<int>` / `E<int>`; a bare `E` is the exa suffix above.
         _ => {
             let exponent = suffix.strip_prefix(['e', 'E'])?;
-            Scale::Decimal(exponent.parse().ok()?)
+            // Bounded so negating it in `apply` cannot overflow; no real
+            // quantity comes anywhere near.
+            let exponent: i32 = exponent.parse().ok()?;
+            if exponent.unsigned_abs() > 300 {
+                return None;
+            }
+            Scale::Decimal(exponent)
         }
     };
     Some(scale)
@@ -185,7 +191,17 @@ mod tests {
     #[test]
     fn invalid_quantities_are_rejected() {
         for bad in [
-            "", "abc", "abcm", "badMi", "1.5.5", "1Xi", "1e", "--1", "Mi",
+            "",
+            "abc",
+            "abcm",
+            "badMi",
+            "1.5.5",
+            "1Xi",
+            "1e",
+            "--1",
+            "Mi",
+            "1e-2147483648",
+            "1e999",
         ] {
             assert!(parse_memory_quantity(&q(bad)).is_err(), "{bad:?}");
             assert!(parse_cpu_quantity(&q(bad)).is_err(), "{bad:?}");

@@ -249,7 +249,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::api::ObjectMeta;
 
-    use super::super::metrics_api::{ContainerMetrics, ContainerMetricsUsage};
+    use crate::k8s::metrics_api::{ContainerMetrics, ContainerMetricsUsage};
 
     fn q(s: &str) -> Quantity {
         Quantity(s.to_string())

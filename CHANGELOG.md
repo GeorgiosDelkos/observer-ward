@@ -12,11 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `save_config_cmd` is replaced by `save_settings`, which never touches the server list; terminal commands take a server name instead of connection details
 - Config changes are validated (new names unique and without `/`, changed poll intervals in range); the `poll_interval_secs` alias is gone
 - Grafana token is cached and re-read only after a change or a 401/403
+- Grafana URLs must be https (http only for loopback), so the token never crosses the network in cleartext
+- A host key that cannot be written to `known_hosts` is refused instead of accepted unrecorded
 - CI runs the full `cargo deny check` (licenses, bans, sources, advisories)
 
 ### Fixed
 
-- SSH host-key check failed open when `known_hosts` was unreadable or had an unparseable entry for the host
+- SSH host-key check failed open when `known_hosts` was unreadable or had an unparseable entry for the host, or named the host only in a line russh skips (tabs, wildcards, `@revoked`)
 - Tray click and blur grace windows used the wall clock and could swallow clicks after a clock step
 - Memory limits stored as milli-bytes (e.g. `1.2Gi` canonicalised by the API server) were ignored
 - Pod "last event" could be stale: events are now paged and compared across all timestamp fields

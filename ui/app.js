@@ -1095,11 +1095,12 @@ async function handleCopyMetrics() {
 // ── Pod Logs ──────────────────────────────────
 
 async function openPodLogs(fullName) {
-  const slashIdx = fullName.indexOf("/");
+  // Pod names never contain "/", so the last one splits the key, even for
+  // a cluster name from before "/" was rejected.
+  const slashIdx = fullName.lastIndexOf("/");
   if (slashIdx < 0) {
     return;
   }
-  // Server names cannot contain "/", so the first one splits the key.
   const clusterName = fullName.substring(0, slashIdx);
   const podName = fullName.substring(slashIdx + 1);
   try {
@@ -1222,8 +1223,8 @@ async function saveSettings() {
         enabled: grafanaEnabled,
       };
     }
-    await invoke("save_settings", { settings });
-    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
+    // Store the token first: if the Keychain refuses it, nothing is saved,
+    // instead of a saved URL that then polls without a token.
     const tokenValue = grafanaTokenInput.value.trim();
     if (tokenValue) {
       await invoke("set_grafana_token", {
@@ -1231,6 +1232,8 @@ async function saveSettings() {
         token: tokenValue,
       });
     }
+    await invoke("save_settings", { settings });
+    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
     if (!grafanaConfigured) {
       alertsSection.classList.add("hidden");
     }
@@ -1367,13 +1370,18 @@ function handleMetricsUpdate(event) {
     }
   }
 
+  // Keys are server names or "cluster/pod". A legacy server name may
+  // contain "/" too, so server keys are recognised by name, not by shape.
+  const activeServerNames = new Set(servers.map((s) => s.name));
+  const isPodKey = (key) => !activeServerNames.has(key) && key.includes("/");
+
   // Clean up stale pod entries only from clusters that were
   // actually polled — preserve pods from offline/backoff clusters
   for (const key of Object.keys(metricsCache)) {
-    if (!key.includes("/")) {
+    if (!isPodKey(key)) {
       continue;
     }
-    const cluster = key.substring(0, key.indexOf("/"));
+    const cluster = key.substring(0, key.lastIndexOf("/"));
     if (polledClusters.has(cluster) && !receivedPodNames.has(key)) {
       delete metricsCache[key];
       delete metricsHistory[key];
@@ -1381,10 +1389,11 @@ function handleMetricsUpdate(event) {
     }
   }
 
-  // Prune history/anomaly for servers no longer configured
-  const activeServerNames = new Set(servers.map((s) => s.name));
+  // Prune history/anomaly for servers no longer configured; a removed
+  // cluster's pods go too, since their cluster is no longer polled.
   for (const key of Object.keys(metricsHistory)) {
-    if (!key.includes("/") && !activeServerNames.has(key)) {
+    const owner = isPodKey(key) ? key.substring(0, key.lastIndexOf("/")) : key;
+    if (!activeServerNames.has(owner)) {
       delete metricsHistory[key];
       delete anomalyState[key];
     }
@@ -1406,8 +1415,8 @@ function handleMetricsUpdate(event) {
     if (m.error) {
       continue;
     }
-    const isActivePod = key.includes("/") && activePodNames.has(key);
-    const isActiveServer = !key.includes("/") && activeServerNames.has(key);
+    const isActivePod = isPodKey(key) && activePodNames.has(key);
+    const isActiveServer = activeServerNames.has(key);
     if (!isActivePod && !isActiveServer) {
       continue;
     }
@@ -1671,7 +1680,7 @@ serverListEl.addEventListener("contextmenu", (e) => {
   const isPod = card.dataset.cardType === "pod";
   let serverType = card.dataset.serverType || "";
   if (isPod) {
-    const slashIdx = name.indexOf("/");
+    const slashIdx = name.lastIndexOf("/");
     const clusterName = slashIdx >= 0 ? name.substring(0, slashIdx) : "";
     const cfg = findServerConfig(clusterName);
     serverType = cfg ? cfg.type : "k8s";
@@ -1724,7 +1733,7 @@ serverListEl.addEventListener("dblclick", (e) => {
     const podCard = nameEl.closest("[data-card-type='pod']");
     let fallback = fullName;
     if (podCard) {
-      const slashIdx = fullName.indexOf("/");
+      const slashIdx = fullName.lastIndexOf("/");
       fallback = slashIdx >= 0
         ? fullName.substring(slashIdx + 1)
         : fullName;

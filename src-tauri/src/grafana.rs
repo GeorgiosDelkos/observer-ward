@@ -297,22 +297,44 @@ impl GrafanaBackend {
 
 /// The Grafana-embedded Alertmanager alerts endpoint (note the
 /// `/api/alertmanager/grafana/...` prefix, not the raw Alertmanager
-/// `/api/v2/alerts` path). Only http(s) is accepted: the request carries
-/// a bearer token.
+/// `/api/v2/alerts` path).
+///
+/// The request carries a bearer token, so it must use https; plain http
+/// is allowed only to a loopback host, where nothing crosses the network.
 fn alerts_url(base: &str) -> Result<Url, GrafanaError> {
     let joined = format!(
         "{}/api/alertmanager/grafana/api/v2/alerts",
         base.trim().trim_end_matches('/')
     );
     let url = Url::parse(&joined).map_err(|source| GrafanaError::InvalidUrl {
-        url: base.to_string(),
+        url: redact_userinfo(base),
         source,
     })?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
     match url.scheme() {
-        "http" | "https" => Ok(url),
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
         _ => Err(GrafanaError::UnsupportedScheme {
-            url: base.to_string(),
+            url: redact_userinfo(base),
         }),
+    }
+}
+
+/// `base` with any `user:password@` replaced, for error messages shown in
+/// the UI and logs.
+fn redact_userinfo(base: &str) -> String {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return base.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
+        None => base.to_string(),
     }
 }
 
@@ -328,6 +350,10 @@ pub(crate) fn validate_url(base: &str) -> Result<(), GrafanaError> {
 
 // -- Poll-loop source ------------------------------------------------------
 
+/// Reads a token from the keychain. A plain function so tests can count
+/// or delay reads without touching the real Keychain.
+type TokenReader = fn(&str) -> Result<String, GrafanaError>;
+
 /// The token last read from the keychain, and for which connection name
 /// and epoch, so it is re-read only when something changed.
 struct CachedToken {
@@ -336,8 +362,6 @@ struct CachedToken {
     token: String,
 }
 
-/// Owns everything the poll loop needs to fetch alerts: the cached token,
-/// the HTTP backend, and the epoch shared with the token commands.
 /// A keychain read in flight, kept across polls.
 struct PendingRead {
     name: String,
@@ -345,8 +369,12 @@ struct PendingRead {
     handle: tokio::task::JoinHandle<Result<String, GrafanaError>>,
 }
 
+/// Owns everything the poll loop needs to fetch alerts: the cached token,
+/// any keychain read in flight, the HTTP backend, and the epoch shared
+/// with the token commands.
 pub(crate) struct AlertSource {
     epoch: Arc<TokenEpoch>,
+    read_token: TokenReader,
     token: Option<CachedToken>,
     pending_read: Option<PendingRead>,
     backend: Option<GrafanaBackend>,
@@ -354,8 +382,13 @@ pub(crate) struct AlertSource {
 
 impl AlertSource {
     pub(crate) fn new(epoch: Arc<TokenEpoch>) -> Self {
+        Self::with_reader(epoch, read_token)
+    }
+
+    fn with_reader(epoch: Arc<TokenEpoch>, read_token: TokenReader) -> Self {
         Self {
             epoch,
+            read_token,
             token: None,
             pending_read: None,
             backend: None,
@@ -383,12 +416,7 @@ impl AlertSource {
                 source_error: None,
             },
             Err(e) => {
-                if let GrafanaError::Status { code } = e
-                    && (code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN)
-                {
-                    // The token may have been rotated outside the app.
-                    self.token = None;
-                }
+                self.note_failure(&e);
                 AlertsUpdate {
                     alerts: Vec::new(),
                     source_error: Some(crate::error::error_chain(&e)),
@@ -396,6 +424,16 @@ impl AlertSource {
             }
         };
         Some(update)
+    }
+
+    /// A 401/403 may mean the token was rotated outside the app, so the
+    /// next poll reads it from the keychain again.
+    fn note_failure(&mut self, error: &GrafanaError) {
+        if let GrafanaError::Status { code } = error
+            && (*code == StatusCode::UNAUTHORIZED || *code == StatusCode::FORBIDDEN)
+        {
+            self.token = None;
+        }
     }
 
     async fn fetch(&mut self, config: &GrafanaConfig) -> Result<Vec<Alert>, GrafanaError> {
@@ -419,31 +457,26 @@ impl AlertSource {
         {
             return Ok(cached.token.clone());
         }
-
         self.token = None;
 
         // A read still running from a timed-out poll (say, a Keychain
         // prompt left open) is awaited again rather than joined by another
         // blocking thread every cycle.
-        let reusable = self
-            .pending_read
-            .as_ref()
-            .is_some_and(|p| p.name == name && p.epoch == epoch);
-        if !reusable {
-            let owned_name = name.to_string();
-            self.pending_read = Some(PendingRead {
-                name: name.to_string(),
-                epoch,
-                handle: tokio::task::spawn_blocking(move || read_token(&owned_name)),
-            });
-        }
-        let Some(pending) = self.pending_read.as_mut() else {
-            return Err(GrafanaError::MissingToken {
-                name: name.to_string(),
-            });
+        let pending = match self.pending_read.take() {
+            Some(pending) if pending.name == name && pending.epoch == epoch => pending,
+            Some(_) | None => {
+                let read = self.read_token;
+                let owned_name = name.to_string();
+                PendingRead {
+                    name: name.to_string(),
+                    epoch,
+                    handle: tokio::task::spawn_blocking(move || read(&owned_name)),
+                }
+            }
         };
-        // Cancellation-safe: if this await is dropped, the handle stays in
-        // `pending_read` for the next poll.
+        // Cancellation-safe: the handle lives in `pending_read` while it is
+        // awaited, so a dropped poll leaves it for the next one.
+        let pending = self.pending_read.insert(pending);
         let joined = (&mut pending.handle).await;
         self.pending_read = None;
         let token = joined.map_err(GrafanaError::KeychainTask)??;
@@ -464,6 +497,8 @@ impl AlertSource {
 )]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicUsize;
 
     fn parse(body: &str) -> Vec<Alert> {
         parse_alerts(body.as_bytes()).expect("parse")
@@ -595,21 +630,51 @@ mod tests {
     }
 
     #[test]
-    fn alerts_url_is_joined_once_and_requires_http() {
+    fn alerts_url_requires_https_except_on_loopback() {
         let url = alerts_url("https://grafana.internal/").expect("valid");
         assert_eq!(
             url.as_str(),
             "https://grafana.internal/api/alertmanager/grafana/api/v2/alerts"
         );
+        for local in [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+        ] {
+            alerts_url(local).expect(local);
+        }
 
-        assert!(matches!(
-            alerts_url("file:///etc/passwd"),
-            Err(GrafanaError::UnsupportedScheme { .. })
-        ));
+        for refused in [
+            "http://grafana.internal",
+            "file:///etc/passwd",
+            "ftp://g.internal",
+        ] {
+            assert!(
+                matches!(
+                    alerts_url(refused),
+                    Err(GrafanaError::UnsupportedScheme { .. })
+                ),
+                "{refused}"
+            );
+        }
         assert!(matches!(
             alerts_url("grafana.internal"),
             Err(GrafanaError::InvalidUrl { .. })
         ));
+    }
+
+    #[test]
+    fn url_errors_never_echo_credentials() {
+        let err = alerts_url("http://admin:hunter2@grafana.internal/x").expect_err("http refused");
+
+        let rendered = crate::error::error_chain(&err);
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("***@grafana.internal/x"), "{rendered}");
+        assert_eq!(
+            redact_userinfo("https://g.internal/a@b"),
+            "https://g.internal/a@b"
+        );
     }
 
     #[tokio::test]
@@ -625,25 +690,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_token_is_reused_until_the_epoch_moves() {
+    async fn token_is_read_once_until_the_epoch_moves() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn reader(_: &str) -> Result<String, GrafanaError> {
+            let n = READS.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("token-{n}"))
+        }
         let epoch = Arc::new(TokenEpoch::default());
-        let mut source = AlertSource::new(Arc::clone(&epoch));
-        source.token = Some(CachedToken {
-            name: "home".to_string(),
-            epoch: epoch.current(),
-            token: "cached".to_string(),
-        });
+        let mut source = AlertSource::with_reader(Arc::clone(&epoch), reader);
 
-        let token = source.token("home").await.expect("served from cache");
-        assert_eq!(token, "cached");
+        assert_eq!(source.token("home").await.expect("read"), "token-0");
+        assert_eq!(source.token("home").await.expect("cached"), "token-0");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
 
         epoch.bump();
-        assert!(
-            source
-                .token
-                .as_ref()
-                .is_some_and(|c| c.epoch != epoch.current()),
-            "a bump must make the cached token stale"
-        );
+        assert_eq!(source.token("home").await.expect("re-read"), "token-1");
+
+        assert_eq!(source.token("other").await.expect("new name"), "token-2");
+        assert_eq!(READS.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_forces_a_reread() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn reader(_: &str) -> Result<String, GrafanaError> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Ok("token".to_string())
+        }
+        let mut source = AlertSource::with_reader(Arc::default(), reader);
+        source.token("home").await.expect("read");
+
+        source.note_failure(&GrafanaError::Status { code: 500 });
+        source.token("home").await.expect("still cached");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+
+        source.note_failure(&GrafanaError::Status { code: 401 });
+        source.token("home").await.expect("re-read");
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_left_running_by_a_timeout_is_reused() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn slow_reader(_: &str) -> Result<String, GrafanaError> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Ok("token".to_string())
+        }
+        let mut source = AlertSource::with_reader(Arc::default(), slow_reader);
+
+        let first = tokio::time::timeout(Duration::from_millis(20), source.token("home")).await;
+        assert!(first.is_err(), "the first poll times out mid-read");
+        assert!(source.pending_read.is_some());
+
+        assert_eq!(source.token("home").await.expect("joined"), "token");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "no second blocking read");
+        assert!(source.pending_read.is_none());
     }
 }

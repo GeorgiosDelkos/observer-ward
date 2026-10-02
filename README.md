@@ -81,7 +81,7 @@ Password auth is not supported. The remote host must provide `top`, `free`, `df`
 2. Open **Settings**, enable **Grafana alerts**, enter the base URL, and paste the token.
 3. Save. Firing alerts appear on the next poll.
 
-The token is stored in the macOS Keychain, never in `config.json`. Observer Ward only reads alerts (it never silences them). Alerts must be Grafana-managed; the client calls `/api/alertmanager/grafana/api/v2/alerts`.
+The token is stored in the macOS Keychain, never in `config.json`. Observer Ward only reads alerts (it never silences them). Alerts must be Grafana-managed; the client calls `/api/alertmanager/grafana/api/v2/alerts`. The URL must use `https://` (plain `http://` is accepted only for `localhost` and loopback addresses), because every request carries the API token.
 
 To rotate the token, paste the new value in Settings and Save. The poller re-reads the keychain each cycle.
 

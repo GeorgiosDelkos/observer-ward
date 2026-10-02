@@ -2,6 +2,16 @@
 
 use super::error::MetricsParseError;
 
+/// Keep a parsed percentage in 0..=100. `f64::from_str` accepts `NaN`
+/// and `inf`, which would otherwise flow into the bars and the levels.
+fn clamp_percent(value: f64, what: &'static str) -> Result<f64, MetricsParseError> {
+    if value.is_finite() {
+        Ok(value.clamp(0.0, 100.0))
+    } else {
+        Err(MetricsParseError::NotFinite { what })
+    }
+}
+
 /// Extract CPU usage from `top -bn1` output.
 ///
 /// Looks for the `%Cpu(s):` line and computes 100 - idle%.
@@ -21,7 +31,7 @@ pub(super) fn parse_cpu(top_output: &str) -> Result<f64, MetricsParseError> {
                     .ok_or(MetricsParseError::NoCpuIdle)?
                     .parse()
                     .map_err(MetricsParseError::CpuIdle)?;
-                return Ok(100.0 - idle);
+                return clamp_percent(100.0 - idle, "CPU idle");
             }
         }
 
@@ -64,7 +74,7 @@ pub(super) fn parse_memory(free_output: &str) -> Result<f64, MetricsParseError> 
             return Err(MetricsParseError::MemTotalZero);
         }
 
-        return Ok(used / total * 100.0);
+        return clamp_percent(used / total * 100.0, "memory usage");
     }
 
     Err(MetricsParseError::NoMemLine)
@@ -83,8 +93,8 @@ pub(super) fn parse_disk(df_output: &str) -> Result<f64, MetricsParseError> {
     let data_line = lines[1];
     for part in data_line.split_whitespace() {
         if let Some(pct) = part.strip_suffix('%') {
-            let val: f64 = pct.parse().map_err(MetricsParseError::DiskPercent)?;
-            return Ok(val);
+            let pct: f64 = pct.parse().map_err(MetricsParseError::DiskPercent)?;
+            return clamp_percent(pct, "disk usage");
         }
     }
 
@@ -158,6 +168,18 @@ mod tests {
             (left - right).abs() < epsilon,
             "expected ~{right}, got {left}"
         );
+    }
+
+    #[test]
+    fn non_finite_and_out_of_range_values_are_contained() {
+        assert!(parse_cpu("%Cpu(s): 1.0 us, NaN id").is_err());
+        assert!(parse_disk("Filesystem Use%\n/dev/sda1 inf%").is_err());
+        assert_f64_near(
+            parse_cpu("%Cpu(s): 1.0 us, 120.0 id").expect("cpu"),
+            0.0,
+            1e-9,
+        );
+        assert_f64_near(parse_memory("Mem: 100 150").expect("mem"), 100.0, 1e-9);
     }
 
     // --- CPU parsing ---

@@ -32,9 +32,9 @@ cargo tauri build                                   # production build
 - `commands.rs` -- Tauri IPC commands
 - `tray.rs` -- tray icon, popover show/hide, blur grace
 - `terminal.rs` -- open ssh/kubectl in Warp or Terminal.app
-- `config.rs` -- `AppConfig`/`ServerConfig` models, JSON persistence
+- `config.rs` -- `AppConfig`/`ServerConfig` models, `ConfigStore` (validated, serialized writes), JSON persistence
 - `error.rs` -- error-chain formatting at the Tauri command boundary
-- `metrics.rs` -- `ServerMetrics`/`ServerStatus` data types
+- `metrics.rs` -- `ServerReport` (per-kind `Health<HostMetrics|ClusterMetrics>`, pods nested in clusters), levels, alert types
 - `poller.rs` -- async poll loop with failure tracking and backoff
 - `k8s.rs` + `k8s/` -- Kubernetes Metrics API + kubelet stats
 - `ssh.rs` + `ssh/` -- SSH remote command parsing (top/free/df/proc)

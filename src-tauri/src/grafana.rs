@@ -8,40 +8,142 @@
 //! body to the pure `parse_alerts`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 
 use crate::config::GrafanaConfig;
-use crate::metrics::{Alert, AlertSeverity, AlertState};
+use crate::metrics::{Alert, AlertSeverity, AlertState, AlertsUpdate};
 
 /// Keychain service name under which Grafana tokens are stored, keyed by
 /// the connection's `name`.
-pub(crate) const KEYCHAIN_SERVICE: &str = "observer-ward.grafana";
+const KEYCHAIN_SERVICE: &str = "observer-ward.grafana";
+
+/// Ceiling on the alerts response body. A few hundred alerts are tens of
+/// KB; this bounds memory if the endpoint misbehaves.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Upper bound on one poll, keychain read included. The HTTP client has
+/// its own 20s limit; this also covers a Keychain prompt nobody answers.
+const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure categories for Grafana alert ingestion. Each variant keeps
-/// its underlying cause in the source chain (mirrors `ConfigError`),
-/// so the poll loop can render it with `error::error_chain` at the edge.
+/// its underlying cause in the source chain, so the poll loop can render
+/// it with `error::error_chain` at the edge.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum GrafanaError {
     #[error("no Grafana API token stored for connection '{name}'")]
     MissingToken { name: String },
     #[error("keychain access failed")]
     Keychain(#[source] keyring::Error),
+    #[error("keychain task failed")]
+    KeychainTask(#[source] tokio::task::JoinError),
+    #[error("invalid Grafana URL {url}")]
+    InvalidUrl {
+        url: String,
+        #[source]
+        source: url::ParseError,
+    },
+    #[error("Grafana URL {url} must use http or https")]
+    UnsupportedScheme { url: String },
     #[error("failed to build the Grafana HTTP client")]
     Client(#[source] reqwest::Error),
     #[error("request to Grafana failed")]
     Http(#[source] reqwest::Error),
     #[error("Grafana returned HTTP status {code}")]
     Status { code: u16 },
+    #[error("timed out polling Grafana")]
+    Timeout,
+    #[error("Grafana response exceeded {limit} bytes")]
+    BodyTooLarge { limit: usize },
     #[error("failed to parse the Grafana alert response")]
     Parse(#[source] serde_json::Error),
 }
 
-/// Alertmanager v2 `GettableAlert` — only the fields the app uses.
-/// `#[serde(default)]` on the maps and strings tolerates instances that
-/// omit optional members.
+// -- Keychain --------------------------------------------------------------
+
+fn keychain_entry(name: &str) -> Result<keyring::Entry, GrafanaError> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)
+}
+
+/// Read the stored API token for the connection named `name`.
+///
+/// Blocking: the macOS Keychain may show a prompt. Call from a blocking
+/// context.
+///
+/// # Errors
+///
+/// [`GrafanaError::MissingToken`] if none is stored, or
+/// [`GrafanaError::Keychain`] if the keychain cannot be accessed.
+pub(crate) fn read_token(name: &str) -> Result<String, GrafanaError> {
+    match keychain_entry(name)?.get_password() {
+        Ok(token) => Ok(token),
+        Err(keyring::Error::NoEntry) => Err(GrafanaError::MissingToken {
+            name: name.to_string(),
+        }),
+        Err(source) => Err(GrafanaError::Keychain(source)),
+    }
+}
+
+/// Store `token` for `name`, replacing any previous one. Blocking.
+///
+/// # Errors
+///
+/// [`GrafanaError::Keychain`] if the keychain cannot be written.
+pub(crate) fn store_token(name: &str, token: &str) -> Result<(), GrafanaError> {
+    keychain_entry(name)?
+        .set_password(token)
+        .map_err(GrafanaError::Keychain)
+}
+
+/// Remove the token for `name`. Removing a token that was never stored
+/// succeeds. Blocking.
+///
+/// # Errors
+///
+/// [`GrafanaError::Keychain`] if the keychain cannot be written.
+pub(crate) fn delete_token(name: &str) -> Result<(), GrafanaError> {
+    match keychain_entry(name)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(source) => Err(GrafanaError::Keychain(source)),
+    }
+}
+
+/// Whether a token is stored for `name`, without returning it. Blocking.
+///
+/// # Errors
+///
+/// [`GrafanaError::Keychain`] if the keychain cannot be read.
+pub(crate) fn has_token(name: &str) -> Result<bool, GrafanaError> {
+    match read_token(name) {
+        Ok(_) => Ok(true),
+        Err(GrafanaError::MissingToken { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Bumped whenever the app writes or deletes a token, so the poller knows
+/// its cached copy is stale without reading the keychain every cycle.
+#[derive(Debug, Default)]
+pub(crate) struct TokenEpoch(AtomicU64);
+
+impl TokenEpoch {
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+// -- Wire format -----------------------------------------------------------
+
+/// Alertmanager v2 `GettableAlert`, only the fields the app uses.
+/// `#[serde(default)]` tolerates instances that omit optional members.
 #[derive(Debug, Deserialize)]
 struct GettableAlert {
     #[serde(default)]
@@ -60,36 +162,58 @@ struct GettableAlert {
 
 #[derive(Debug, Deserialize, Default)]
 struct AlertStatus {
-    /// One of "active", "suppressed", "unprocessed".
     #[serde(default)]
-    state: String,
+    state: WireAlertState,
+}
+
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WireAlertState {
+    #[default]
+    Active,
+    Suppressed,
+    Unprocessed,
+    /// A state newer than this code; shown as firing rather than hidden.
+    #[serde(other)]
+    Other,
+}
+
+/// Grafana's fingerprint, or a stable stand-in built from the labels
+/// (which identify an alert in Alertmanager). Without the stand-in every
+/// fingerprint-less alert would share the key `""` and only the first
+/// would ever notify.
+fn fingerprint(raw: &GettableAlert) -> String {
+    if !raw.fingerprint.is_empty() {
+        return raw.fingerprint.clone();
+    }
+    let labels: Vec<String> = raw.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("labels:{}", labels.join(","))
 }
 
 fn to_alert(raw: GettableAlert) -> Alert {
+    let fingerprint = fingerprint(&raw);
     let name = raw
         .labels
         .get("alertname")
         .cloned()
         .unwrap_or_else(|| "(unnamed)".to_string());
     let severity = AlertSeverity::from_label(raw.labels.get("severity").map(String::as_str));
-    // Only "suppressed" means silenced/inhibited; "active" and the
-    // transient "unprocessed" are both treated as actively firing.
-    let state = if raw.status.state == "suppressed" {
-        AlertState::Suppressed
-    } else {
-        AlertState::Active
+    // Only "suppressed" means silenced/inhibited; anything else is
+    // treated as actively firing.
+    let state = match raw.status.state {
+        WireAlertState::Suppressed => AlertState::Suppressed,
+        WireAlertState::Active | WireAlertState::Unprocessed | WireAlertState::Other => {
+            AlertState::Active
+        }
     };
+    let mut annotations = raw.annotations;
     Alert {
-        fingerprint: raw.fingerprint,
+        fingerprint,
         name,
         severity,
         state,
-        summary: raw.annotations.get("summary").cloned().unwrap_or_default(),
-        description: raw
-            .annotations
-            .get("description")
-            .cloned()
-            .unwrap_or_default(),
+        summary: annotations.remove("summary").unwrap_or_default(),
+        description: annotations.remove("description").unwrap_or_default(),
         starts_at: raw.starts_at,
         labels: raw.labels,
         generator_url: raw.generator_url,
@@ -102,101 +226,51 @@ fn to_alert(raw: GettableAlert) -> Alert {
 ///
 /// Returns [`GrafanaError::Parse`] if `body` is not a JSON array of
 /// Alertmanager v2 alert objects.
-pub(crate) fn parse_alerts(body: &str) -> Result<Vec<Alert>, GrafanaError> {
-    let raw: Vec<GettableAlert> = serde_json::from_str(body).map_err(GrafanaError::Parse)?;
+fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, GrafanaError> {
+    let raw: Vec<GettableAlert> = serde_json::from_slice(body).map_err(GrafanaError::Parse)?;
     Ok(raw.into_iter().map(to_alert).collect())
 }
 
-/// Read the stored API token for the connection named `name` from the OS
-/// keychain.
-///
-/// # Errors
-///
-/// Returns [`GrafanaError::MissingToken`] if no token has been stored for
-/// this connection, or [`GrafanaError::Keychain`] if the platform
-/// keychain cannot be accessed.
-pub(crate) fn read_token(name: &str) -> Result<String, GrafanaError> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, name).map_err(GrafanaError::Keychain)?;
-    match entry.get_password() {
-        Ok(token) => Ok(token),
-        Err(keyring::Error::NoEntry) => Err(GrafanaError::MissingToken {
-            name: name.to_string(),
-        }),
-        Err(source) => Err(GrafanaError::Keychain(source)),
-    }
-}
+// -- HTTP client -----------------------------------------------------------
 
-/// HTTP client bound to one Grafana instance. Owns its `reqwest::Client`,
-/// base URL, and the token (held in memory only, loaded from the keychain
-/// at construction). Cached in the `Poller` and reused across cycles.
-pub(crate) struct GrafanaBackend {
-    base_url: String,
+/// HTTP client bound to one Grafana instance and token.
+struct GrafanaBackend {
+    alerts_url: Url,
     verify_tls: bool,
     token: String,
     client: reqwest::Client,
 }
 
 impl GrafanaBackend {
-    /// Build a client for `config` using the already-resolved `token`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GrafanaError::Client`] if the HTTP client cannot be built
-    /// (e.g. the TLS backend fails to initialize).
-    pub(crate) fn new(config: &GrafanaConfig, token: String) -> Result<Self, GrafanaError> {
+    fn new(config: &GrafanaConfig, token: String) -> Result<Self, GrafanaError> {
+        let alerts_url = alerts_url(&config.url)?;
         let client = reqwest::Client::builder()
             // verify_tls == false opts out of certificate validation for a
             // trusted self-signed instance; default config keeps it on.
             .danger_accept_invalid_certs(!config.verify_tls)
             .connect_timeout(Duration::from_secs(10))
+            // Covers the whole exchange, body included.
             .timeout(Duration::from_secs(20))
             .build()
             .map_err(GrafanaError::Client)?;
         Ok(Self {
-            base_url: config.url.clone(),
+            alerts_url,
             verify_tls: config.verify_tls,
             token,
             client,
         })
     }
 
-    /// True if this backend was built for the same endpoint as `config`.
-    /// The token is intentionally excluded: a token change is handled by
-    /// rebuilding from the keychain, not compared here.
-    #[must_use]
-    pub(crate) fn matches_config(&self, config: &GrafanaConfig) -> bool {
-        self.base_url == config.url && self.verify_tls == config.verify_tls
+    fn matches(&self, config: &GrafanaConfig, token: &str) -> bool {
+        alerts_url(&config.url).is_ok_and(|url| url == self.alerts_url)
+            && self.verify_tls == config.verify_tls
+            && self.token == token
     }
 
-    /// True if this backend is using `token`. Compared on each poll so a
-    /// keychain rotation rebuilds the client without a URL change.
-    #[must_use]
-    pub(crate) fn uses_token(&self, token: &str) -> bool {
-        self.token == token
-    }
-
-    /// The Grafana-embedded Alertmanager alerts endpoint (note the
-    /// `/api/alertmanager/grafana/...` prefix — NOT the raw Alertmanager
-    /// `/api/v2/alerts` path).
-    fn alerts_url(&self) -> String {
-        format!(
-            "{}/api/alertmanager/grafana/api/v2/alerts",
-            self.base_url.trim_end_matches('/')
-        )
-    }
-
-    /// Fetch the currently active alerts from Grafana.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GrafanaError::Http`] on transport failure,
-    /// [`GrafanaError::Status`] on a non-2xx response (e.g. 401 for a bad
-    /// token), or [`GrafanaError::Parse`] if the body is not valid
-    /// Alertmanager v2 JSON.
-    pub(crate) async fn fetch_alerts(&self) -> Result<Vec<Alert>, GrafanaError> {
-        let response = self
+    async fn fetch_alerts(&self) -> Result<Vec<Alert>, GrafanaError> {
+        let mut response = self
             .client
-            .get(self.alerts_url())
+            .get(self.alerts_url.clone())
             .bearer_auth(&self.token)
             .send()
             .await
@@ -207,8 +281,212 @@ impl GrafanaBackend {
                 code: status.as_u16(),
             });
         }
-        let body = response.text().await.map_err(GrafanaError::Http)?;
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(GrafanaError::Http)? {
+            if body.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+                return Err(GrafanaError::BodyTooLarge {
+                    limit: MAX_BODY_BYTES,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
         parse_alerts(&body)
+    }
+}
+
+/// The Grafana-embedded Alertmanager alerts endpoint (note the
+/// `/api/alertmanager/grafana/...` prefix, not the raw Alertmanager
+/// `/api/v2/alerts` path).
+///
+/// The request carries a bearer token, so it must use https; plain http
+/// is allowed only to a loopback host, where nothing crosses the network.
+fn alerts_url(base: &str) -> Result<Url, GrafanaError> {
+    let joined = format!(
+        "{}/api/alertmanager/grafana/api/v2/alerts",
+        base.trim().trim_end_matches('/')
+    );
+    let url = Url::parse(&joined).map_err(|source| GrafanaError::InvalidUrl {
+        url: redact_userinfo(base),
+        source,
+    })?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        _ => Err(GrafanaError::UnsupportedScheme {
+            url: redact_userinfo(base),
+        }),
+    }
+}
+
+/// `base` with any `user:password@` replaced, for error messages shown in
+/// the UI and logs.
+fn redact_userinfo(base: &str) -> String {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return base.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://***@{}", &rest[at + 1..]),
+        None => base.to_string(),
+    }
+}
+
+/// Check that `base` can form the alerts URL, so a bad URL is rejected
+/// when saved rather than failing every poll.
+///
+/// # Errors
+///
+/// [`GrafanaError::InvalidUrl`] or [`GrafanaError::UnsupportedScheme`].
+pub(crate) fn validate_url(base: &str) -> Result<(), GrafanaError> {
+    alerts_url(base).map(drop)
+}
+
+// -- Poll-loop source ------------------------------------------------------
+
+/// Reads a token from the keychain. A plain function so tests can count
+/// or delay reads without touching the real Keychain.
+type TokenReader = fn(&str) -> Result<String, GrafanaError>;
+
+/// The token last read from the keychain, and for which connection name
+/// and epoch, so it is re-read only when something changed.
+struct CachedToken {
+    name: String,
+    epoch: u64,
+    token: String,
+}
+
+/// A keychain read in flight, kept across polls.
+struct PendingRead {
+    name: String,
+    epoch: u64,
+    handle: tokio::task::JoinHandle<Result<String, GrafanaError>>,
+}
+
+/// Owns everything the poll loop needs to fetch alerts: the cached token,
+/// any keychain read in flight, the HTTP backend, and the epoch shared
+/// with the token commands.
+pub(crate) struct AlertSource {
+    epoch: Arc<TokenEpoch>,
+    read_token: TokenReader,
+    token: Option<CachedToken>,
+    pending_read: Option<PendingRead>,
+    backend: Option<GrafanaBackend>,
+}
+
+impl AlertSource {
+    pub(crate) fn new(epoch: Arc<TokenEpoch>) -> Self {
+        Self::with_reader(epoch, read_token)
+    }
+
+    fn with_reader(epoch: Arc<TokenEpoch>, read_token: TokenReader) -> Self {
+        Self {
+            epoch,
+            read_token,
+            token: None,
+            pending_read: None,
+            backend: None,
+        }
+    }
+
+    /// Fetch active alerts. `None` when no connection is configured or it
+    /// is disabled. Failures come back as an update with `source_error`
+    /// set, so the UI can show "unreachable" instead of "all clear".
+    pub(crate) async fn poll(&mut self, config: Option<&GrafanaConfig>) -> Option<AlertsUpdate> {
+        let Some(config) = config.filter(|c| c.enabled) else {
+            self.token = None;
+            self.backend = None;
+            return None;
+        };
+
+        // Bounds the keychain read too: an unanswered Keychain prompt must
+        // not hold up the metrics the poller publishes alongside alerts.
+        let fetched = tokio::time::timeout(POLL_TIMEOUT, self.fetch(config))
+            .await
+            .unwrap_or(Err(GrafanaError::Timeout));
+        let update = match fetched {
+            Ok(alerts) => AlertsUpdate {
+                alerts,
+                source_error: None,
+            },
+            Err(e) => {
+                self.note_failure(&e);
+                AlertsUpdate {
+                    alerts: Vec::new(),
+                    source_error: Some(crate::error::error_chain(&e)),
+                }
+            }
+        };
+        Some(update)
+    }
+
+    /// A 401/403 may mean the token was rotated outside the app, so the
+    /// next poll reads it from the keychain again.
+    fn note_failure(&mut self, error: &GrafanaError) {
+        if let GrafanaError::Status { code } = error
+            && (*code == StatusCode::UNAUTHORIZED || *code == StatusCode::FORBIDDEN)
+        {
+            self.token = None;
+        }
+    }
+
+    async fn fetch(&mut self, config: &GrafanaConfig) -> Result<Vec<Alert>, GrafanaError> {
+        let token = self.token(&config.name).await?;
+
+        let backend = match self.backend.take() {
+            Some(backend) if backend.matches(config, &token) => backend,
+            Some(_) | None => GrafanaBackend::new(config, token)?,
+        };
+        let result = backend.fetch_alerts().await;
+        self.backend = Some(backend);
+        result
+    }
+
+    /// The token for `name`, from the cache when the epoch is unchanged.
+    async fn token(&mut self, name: &str) -> Result<String, GrafanaError> {
+        let epoch = self.epoch.current();
+        if let Some(cached) = &self.token
+            && cached.name == name
+            && cached.epoch == epoch
+        {
+            return Ok(cached.token.clone());
+        }
+        self.token = None;
+
+        // A read still running from a timed-out poll (say, a Keychain
+        // prompt left open) is awaited again rather than joined by another
+        // blocking thread every cycle.
+        let pending = match self.pending_read.take() {
+            Some(pending) if pending.name == name && pending.epoch == epoch => pending,
+            Some(_) | None => {
+                let read = self.read_token;
+                let owned_name = name.to_string();
+                PendingRead {
+                    name: name.to_string(),
+                    epoch,
+                    handle: tokio::task::spawn_blocking(move || read(&owned_name)),
+                }
+            }
+        };
+        // Cancellation-safe: the handle lives in `pending_read` while it is
+        // awaited, so a dropped poll leaves it for the next one.
+        let pending = self.pending_read.insert(pending);
+        let joined = (&mut pending.handle).await;
+        self.pending_read = None;
+        let token = joined.map_err(GrafanaError::KeychainTask)??;
+
+        self.token = Some(CachedToken {
+            name: name.to_string(),
+            epoch,
+            token: token.clone(),
+        });
+        Ok(token)
     }
 }
 
@@ -220,9 +498,25 @@ impl GrafanaBackend {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::AtomicUsize;
+
+    fn parse(body: &str) -> Vec<Alert> {
+        parse_alerts(body.as_bytes()).expect("parse")
+    }
+
+    fn config(url: &str) -> GrafanaConfig {
+        GrafanaConfig {
+            name: "home".to_string(),
+            url: url.to_string(),
+            verify_tls: true,
+            enabled: true,
+        }
+    }
+
     #[test]
     fn parses_one_active_alert() {
-        let body = r#"[
+        let alerts = parse(
+            r#"[
             {
                 "labels": {"alertname": "HighCPU", "severity": "critical", "instance": "web-1"},
                 "annotations": {"summary": "CPU above 90%", "description": "web-1 at 95%"},
@@ -231,8 +525,8 @@ mod tests {
                 "fingerprint": "abc123",
                 "status": {"state": "active"}
             }
-        ]"#;
-        let alerts = parse_alerts(body).expect("parse");
+        ]"#,
+        );
         assert_eq!(alerts.len(), 1);
         let a = &alerts[0];
         assert_eq!(a.fingerprint, "abc123");
@@ -249,55 +543,55 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_state_maps_to_suppressed() {
-        let body = r#"[{"labels": {"alertname": "X"}, "status": {"state": "suppressed"}}]"#;
-        let alerts = parse_alerts(body).expect("parse");
-        assert_eq!(alerts[0].state, AlertState::Suppressed);
+    fn alert_states_map_to_active_or_suppressed() {
+        let state = |s: &str| {
+            let body =
+                format!(r#"[{{"labels": {{"alertname": "X"}}, "status": {{"state": "{s}"}}}}]"#);
+            parse(&body)[0].state
+        };
+        assert_eq!(state("active"), AlertState::Active);
+        assert_eq!(state("suppressed"), AlertState::Suppressed);
+        assert_eq!(state("unprocessed"), AlertState::Active);
+        assert_eq!(state("some-future-state"), AlertState::Active);
     }
 
     #[test]
-    fn unprocessed_state_maps_to_active() {
-        let body = r#"[{"labels": {"alertname": "X"}, "status": {"state": "unprocessed"}}]"#;
-        let alerts = parse_alerts(body).expect("parse");
-        assert_eq!(alerts[0].state, AlertState::Active);
-    }
+    fn missing_fields_get_defaults() {
+        let alerts = parse(r#"[{"labels": {"severity": "warning"}}]"#);
+        let a = &alerts[0];
+        assert_eq!(a.name, "(unnamed)");
+        assert_eq!(a.state, AlertState::Active);
+        assert_eq!(a.summary, "");
+        assert_eq!(a.description, "");
 
-    #[test]
-    fn missing_severity_label_is_unknown() {
-        let body = r#"[{"labels": {"alertname": "X"}, "status": {"state": "active"}}]"#;
-        let alerts = parse_alerts(body).expect("parse");
+        let alerts = parse(r#"[{"labels": {"alertname": "X"}}]"#);
         assert_eq!(alerts[0].severity, AlertSeverity::Unknown);
     }
 
     #[test]
-    fn missing_annotations_become_empty_strings() {
-        let body = r#"[{"labels": {"alertname": "X"}, "status": {"state": "active"}}]"#;
-        let alerts = parse_alerts(body).expect("parse");
-        assert_eq!(alerts[0].summary, "");
-        assert_eq!(alerts[0].description, "");
+    fn fingerprintless_alerts_get_distinct_label_keys() {
+        let alerts = parse(
+            r#"[
+            {"labels": {"alertname": "A", "instance": "web-1"}},
+            {"labels": {"alertname": "A", "instance": "web-2"}},
+            {"labels": {"alertname": "A", "instance": "web-1"}, "fingerprint": ""}
+        ]"#,
+        );
+        assert_ne!(alerts[0].fingerprint, alerts[1].fingerprint);
+        assert_eq!(alerts[0].fingerprint, alerts[2].fingerprint);
+        assert!(!alerts[0].fingerprint.is_empty());
     }
 
     #[test]
-    fn missing_alertname_falls_back() {
-        let body = r#"[{"labels": {"severity": "warning"}, "status": {"state": "active"}}]"#;
-        let alerts = parse_alerts(body).expect("parse");
-        assert_eq!(alerts[0].name, "(unnamed)");
-    }
-
-    #[test]
-    fn empty_array_is_no_alerts() {
-        let alerts = parse_alerts("[]").expect("parse");
-        assert!(alerts.is_empty());
-    }
-
-    #[test]
-    fn invalid_json_errors() {
-        assert!(parse_alerts("not json").is_err());
+    fn empty_and_invalid_bodies() {
+        assert!(parse("[]").is_empty());
+        assert!(parse_alerts(b"not json").is_err());
     }
 
     #[test]
     fn parses_multiple_alerts_independently() {
-        let body = r#"[
+        let alerts = parse(
+            r#"[
             {
                 "labels": {"alertname": "HighCPU", "severity": "critical"},
                 "fingerprint": "fp1",
@@ -308,8 +602,8 @@ mod tests {
                 "fingerprint": "fp2",
                 "status": {"state": "suppressed"}
             }
-        ]"#;
-        let alerts = parse_alerts(body).expect("parse");
+        ]"#,
+        );
         assert_eq!(alerts.len(), 2);
         assert_eq!(alerts[0].fingerprint, "fp1");
         assert_eq!(alerts[0].severity, AlertSeverity::Critical);
@@ -320,37 +614,149 @@ mod tests {
     }
 
     #[test]
-    fn backend_builds_and_matches_config() {
-        let cfg = GrafanaConfig {
-            name: "home".to_string(),
-            url: "https://grafana.internal".to_string(),
-            verify_tls: true,
-            enabled: true,
-        };
+    fn backend_matches_endpoint_tls_and_token() {
+        let cfg = config("https://grafana.internal");
         let backend = GrafanaBackend::new(&cfg, "token".to_string()).expect("build");
-        assert!(backend.matches_config(&cfg));
-        assert!(backend.uses_token("token"));
-        assert!(!backend.uses_token("other"));
 
-        let changed = GrafanaConfig {
-            url: "https://other.internal".to_string(),
-            ..cfg.clone()
+        assert!(backend.matches(&cfg, "token"));
+        assert!(backend.matches(&config("https://grafana.internal/"), "token"));
+        assert!(!backend.matches(&cfg, "rotated"));
+        assert!(!backend.matches(&config("https://other.internal"), "token"));
+        let insecure = GrafanaConfig {
+            verify_tls: false,
+            ..cfg
         };
-        assert!(!backend.matches_config(&changed));
+        assert!(!backend.matches(&insecure, "token"));
     }
 
     #[test]
-    fn alerts_url_has_no_double_slash() {
-        let cfg = GrafanaConfig {
-            name: "home".to_string(),
-            url: "https://grafana.internal/".to_string(),
-            verify_tls: true,
-            enabled: true,
-        };
-        let backend = GrafanaBackend::new(&cfg, "token".to_string()).expect("build");
+    fn alerts_url_requires_https_except_on_loopback() {
+        let url = alerts_url("https://grafana.internal/").expect("valid");
         assert_eq!(
-            backend.alerts_url(),
+            url.as_str(),
             "https://grafana.internal/api/alertmanager/grafana/api/v2/alerts"
         );
+        for local in [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+        ] {
+            alerts_url(local).expect(local);
+        }
+
+        for refused in [
+            "http://grafana.internal",
+            "file:///etc/passwd",
+            "ftp://g.internal",
+        ] {
+            assert!(
+                matches!(
+                    alerts_url(refused),
+                    Err(GrafanaError::UnsupportedScheme { .. })
+                ),
+                "{refused}"
+            );
+        }
+        assert!(matches!(
+            alerts_url("grafana.internal"),
+            Err(GrafanaError::InvalidUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn url_errors_never_echo_credentials() {
+        let err = alerts_url("http://admin:hunter2@grafana.internal/x").expect_err("http refused");
+
+        let rendered = crate::error::error_chain(&err);
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("***@grafana.internal/x"), "{rendered}");
+        assert_eq!(
+            redact_userinfo("https://g.internal/a@b"),
+            "https://g.internal/a@b"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_or_missing_config_yields_no_update() {
+        let mut source = AlertSource::new(Arc::default());
+        assert!(source.poll(None).await.is_none());
+
+        let disabled = GrafanaConfig {
+            enabled: false,
+            ..config("https://grafana.internal")
+        };
+        assert!(source.poll(Some(&disabled)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_is_read_once_until_the_epoch_moves() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn reader(_: &str) -> Result<String, GrafanaError> {
+            let n = READS.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("token-{n}"))
+        }
+        let epoch = Arc::new(TokenEpoch::default());
+        let mut source = AlertSource::with_reader(Arc::clone(&epoch), reader);
+
+        assert_eq!(source.token("home").await.expect("read"), "token-0");
+        assert_eq!(source.token("home").await.expect("cached"), "token-0");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+
+        epoch.bump();
+        assert_eq!(source.token("home").await.expect("re-read"), "token-1");
+
+        assert_eq!(source.token("other").await.expect("new name"), "token-2");
+        assert_eq!(READS.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_forces_a_reread() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn reader(_: &str) -> Result<String, GrafanaError> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Ok("token".to_string())
+        }
+        let mut source = AlertSource::with_reader(Arc::default(), reader);
+        source.token("home").await.expect("read");
+
+        source.note_failure(&GrafanaError::Status { code: 500 });
+        source.token("home").await.expect("still cached");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+
+        source.note_failure(&GrafanaError::Status { code: 401 });
+        source.token("home").await.expect("re-read");
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_left_running_by_a_timeout_is_reused() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "must match the TokenReader signature"
+        )]
+        fn slow_reader(_: &str) -> Result<String, GrafanaError> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Ok("token".to_string())
+        }
+        let mut source = AlertSource::with_reader(Arc::default(), slow_reader);
+
+        let first = tokio::time::timeout(Duration::from_millis(20), source.token("home")).await;
+        assert!(first.is_err(), "the first poll times out mid-read");
+        assert!(source.pending_read.is_some());
+
+        assert_eq!(source.token("home").await.expect("joined"), "token");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "no second blocking read");
+        assert!(source.pending_read.is_none());
     }
 }

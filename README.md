@@ -81,7 +81,7 @@ Password auth is not supported. The remote host must provide `top`, `free`, `df`
 2. Open **Settings**, enable **Grafana alerts**, enter the base URL, and paste the token.
 3. Save. Firing alerts appear on the next poll.
 
-The token is stored in the macOS Keychain, never in `config.json`. Observer Ward only reads alerts (it never silences them). Alerts must be Grafana-managed; the client calls `/api/alertmanager/grafana/api/v2/alerts`.
+The token is stored in the macOS Keychain, never in `config.json`. Observer Ward only reads alerts (it never silences them). Alerts must be Grafana-managed; the client calls `/api/alertmanager/grafana/api/v2/alerts`. The URL must use `https://` (plain `http://` is accepted only for `localhost` and loopback addresses), because every request carries the API token.
 
 To rotate the token, paste the new value in Settings and Save. The poller re-reads the keychain each cycle.
 
@@ -134,7 +134,7 @@ Click **remove** on the card (or right-click → Remove). Confirm in the in-app 
 }
 ```
 
-`poll_interval_secs` is still accepted as an alias for `foreground_poll_secs`. The Grafana token is not in this file.
+Every change made through the app is validated: new server names must be unique and must not contain `/`, and changed intervals must be 5–120 s (`foreground_poll_secs`) and 30–600 s (`background_poll_secs`). Existing entries that break these rules still load and do not block other edits. If the file cannot be read or parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
 
 ## Architecture
 
@@ -149,7 +149,7 @@ observer-ward/
 │       ├── terminal.rs         # Open ssh/kubectl in Warp or Terminal
 │       ├── config.rs           # Config models and persistence
 │       ├── error.rs            # Error-chain formatting
-│       ├── metrics.rs          # Metric and alert types
+│       ├── metrics.rs          # Per-kind report types, levels, alerts
 │       ├── poller.rs           # Poll loop, backoff, tray icon
 │       ├── k8s.rs / k8s/       # Kubernetes Metrics API + kubelet stats
 │       ├── ssh.rs / ssh/       # SSH session, TOFU, command parsers
@@ -169,7 +169,7 @@ cd src-tauri
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo deny check advisories
+cargo deny check
 ```
 
 Clippy denies `unwrap`, `panic`, `todo`, and `dbg!` in production code. Logging uses `tracing`.

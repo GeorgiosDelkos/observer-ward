@@ -8,7 +8,8 @@ use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::load_secret_key;
 use russh::{Channel, ChannelMsg, Disconnect};
 
-use crate::metrics::{ServerMetrics, ServerStatus};
+use crate::config::{SshTarget, expand_tilde};
+use crate::metrics::{HostMetrics, NetSample, Usage};
 
 mod error;
 mod host_key;
@@ -23,10 +24,13 @@ use parse::{parse_cpu, parse_disk, parse_memory, parse_network};
 const SEPARATOR: &str = "---SEPARATOR---";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How long a channel close may take before it is abandoned.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Hard ceiling on bytes buffered from a single SSH command. The metrics
 /// command emits a few KB; this cap bounds memory if a compromised or
 /// misbehaving server streams unbounded output within the command
-/// timeout (boundary-validation, axiom `rust_api_axiom_25`).
+/// timeout.
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Bracket an unbracketed IPv6 literal for OpenSSH/`russh` address forms.
@@ -44,181 +48,169 @@ fn ssh_connect_addr(host: &str, port: u16) -> String {
     format!("{}:{port}", ssh_cli_host(host))
 }
 
+/// Run on the remote host; the sections are split on [`SEPARATOR`].
 const METRICS_COMMAND: &str = "\
     top -bn1 | head -5; \
     echo '---SEPARATOR---'; \
     free -b; \
     echo '---SEPARATOR---'; \
-    df -B1 /; \
+    df -P -B1 /; \
     echo '---SEPARATOR---'; \
     cat /proc/net/dev";
 
-/// SSH backend that collects metrics from a single remote server.
+/// SSH backend that collects metrics from a single remote server, keeping
+/// the session open between polls.
 pub(crate) struct SshBackend {
+    target: SshTarget,
     session: Option<client::Handle<SshHandler>>,
-    host: String,
-    port: u16,
-    user: String,
-    key_path: String,
-    prev_net_bytes: Option<(u64, u64)>,
-    prev_poll_time: Option<Instant>,
+    prev_net: Option<NetSample>,
 }
 
 impl SshBackend {
-    pub(crate) fn new(host: String, port: u16, user: String, key_path: String) -> Self {
+    pub(crate) fn new(target: SshTarget) -> Self {
         Self {
+            target,
             session: None,
-            host,
-            port,
-            user,
-            key_path,
-            prev_net_bytes: None,
-            prev_poll_time: None,
+            prev_net: None,
         }
     }
 
-    pub(crate) fn is_connected(&self) -> bool {
-        self.session.is_some()
+    pub(crate) fn target(&self) -> &SshTarget {
+        &self.target
     }
 
-    pub(crate) fn matches_config(&self, host: &str, port: u16, user: &str, key_path: &str) -> bool {
-        self.host == host && self.port == port && self.user == user && self.key_path == key_path
-    }
-
-    /// Establish an SSH connection and authenticate with a key.
+    /// Collect metrics, connecting first if needed. Any failure drops the
+    /// session so the next poll reconnects from scratch.
     ///
     /// # Errors
     ///
-    /// Returns [`SshError`] if the private key cannot be loaded, the TCP
-    /// connection or SSH handshake fails, or authentication is rejected.
-    pub(crate) async fn connect(&mut self) -> Result<(), SshError> {
-        let key_path = crate::config::expand_tilde(&self.key_path);
-        let key = tokio::task::spawn_blocking(move || load_secret_key(&key_path, None))
+    /// [`SshError`] if connecting, running the command, or parsing its
+    /// output fails.
+    pub(crate) async fn collect(&mut self) -> Result<HostMetrics, SshError> {
+        let result = self.try_collect().await;
+        if result.is_err() {
+            self.disconnect().await;
+        }
+        result
+    }
+
+    async fn try_collect(&mut self) -> Result<HostMetrics, SshError> {
+        if self.session.is_none() {
+            self.session = Some(self.connect().await?);
+        }
+        let output = self.exec_command(METRICS_COMMAND).await?;
+        let sample = parse_metrics_output(&output)?;
+
+        let now = NetSample {
+            rx_bytes: sample.rx_bytes,
+            tx_bytes: sample.tx_bytes,
+            at: Instant::now(),
+        };
+        let net = self.prev_net.and_then(|prev| now.rate_since(&prev));
+        self.prev_net = Some(now);
+
+        Ok(HostMetrics {
+            usage: sample.usage,
+            net,
+        })
+    }
+
+    /// Establish an SSH connection and authenticate with a key.
+    async fn connect(&self) -> Result<client::Handle<SshHandler>, SshError> {
+        let target = &self.target;
+        let key_path = expand_tilde(&target.key_path);
+        let load_path = key_path.clone();
+        let key = tokio::task::spawn_blocking(move || load_secret_key(&load_path, None))
             .await
-            .map_err(|_| SshError::KeyLoadCancelled)?
+            .map_err(SshError::KeyLoadTask)?
             .map_err(|source| SshError::LoadKey {
-                path: self.key_path.clone(),
+                path: key_path,
                 source,
             })?;
 
         let config = Arc::new(client::Config::default());
-        let addr = ssh_connect_addr(&self.host, self.port);
-
-        let handler = SshHandler {
-            host: self.host.clone(),
-            port: self.port,
-        };
-
+        let addr = ssh_connect_addr(&target.host, target.port);
+        let handler = SshHandler::new(&target.host, target.port);
         let mut handle = client::connect(config, &addr, handler)
             .await
             .map_err(|source| SshError::Connect { addr, source })?;
 
         let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), None);
-
         let auth_result = handle
-            .authenticate_publickey(&self.user, key_with_alg)
+            .authenticate_publickey(&target.user, key_with_alg)
             .await
             .map_err(SshError::Auth)?;
-
         if !auth_result.success() {
             return Err(SshError::AuthRejected {
-                user: self.user.clone(),
+                user: target.user.clone(),
             });
         }
 
-        self.session = Some(handle);
-        Ok(())
+        Ok(handle)
     }
 
-    /// Collect CPU, memory, disk, and network metrics.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "byte deltas fit comfortably in f64 \
-                  mantissa for rate calculation"
-    )]
-    pub(crate) async fn collect_metrics(
-        &mut self,
-        server_name: &str,
-    ) -> Result<ServerMetrics, SshError> {
-        let output = self.exec_command(METRICS_COMMAND).await?;
-        let sections: Vec<&str> = output.split(SEPARATOR).collect();
-
-        if sections.len() < 4 {
-            return Err(SshError::Parse(MetricsParseError::SectionCount {
-                expected: 4,
-                got: sections.len(),
-            }));
-        }
-
-        let cpu = parse_cpu(sections[0])?;
-        let memory = parse_memory(sections[1])?;
-        let disk = parse_disk(sections[2])?;
-        let (rx_bytes, tx_bytes) = parse_network(sections[3])?;
-
-        let now = Instant::now();
-        let (rx_per_sec, tx_per_sec) = match (self.prev_net_bytes, self.prev_poll_time) {
-            (Some((prev_rx, prev_tx)), Some(prev_time)) => {
-                let elapsed = now.duration_since(prev_time).as_secs_f64();
-                if elapsed > 0.0 {
-                    let rx_rate = rx_bytes.saturating_sub(prev_rx) as f64 / elapsed;
-                    let tx_rate = tx_bytes.saturating_sub(prev_tx) as f64 / elapsed;
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "rates from byte deltas are \
-                                  always small positive"
-                    )]
-                    (rx_rate as u64, tx_rate as u64)
-                } else {
-                    (0, 0)
-                }
-            }
-            (Some(_) | None, None) | (None, Some(_)) => (0, 0),
-        };
-
-        self.prev_net_bytes = Some((rx_bytes, tx_bytes));
-        self.prev_poll_time = Some(now);
-
-        Ok(ServerMetrics {
-            server_name: server_name.to_string(),
-            server_type: "ssh".to_string(),
-            status: ServerStatus::Online,
-            cpu_percent: cpu,
-            memory_percent: memory,
-            disk_percent: disk,
-            net_rx_bytes_per_sec: rx_per_sec,
-            net_tx_bytes_per_sec: tx_per_sec,
-            ..ServerMetrics::default()
-        })
-    }
-
-    /// Execute a command over SSH and return stdout.
-    ///
-    /// Applies an internal per-command timeout and explicitly
-    /// closes the channel to prevent resource leaks.
+    /// Execute a command over SSH and return stdout. The channel is
+    /// always closed afterwards so it cannot leak.
     async fn exec_command(&self, cmd: &str) -> Result<String, SshError> {
         let session = self.session.as_ref().ok_or(SshError::NotConnected)?;
-
         let mut channel: Channel<client::Msg> = session
             .channel_open_session()
             .await
             .map_err(SshError::OpenChannel)?;
-
         channel.exec(true, cmd).await.map_err(SshError::Exec)?;
 
         let result = read_channel_output(&mut channel).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
+        match tokio::time::timeout(CLOSE_TIMEOUT, channel.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("closing SSH channel failed: {e}"),
+            Err(_) => tracing::debug!("closing SSH channel timed out"),
+        }
         result
     }
 
-    /// Close the SSH session.
-    pub(crate) async fn disconnect(&mut self) {
-        if let Some(session) = self.session.take() {
-            let _ = session
-                .disconnect(Disconnect::ByApplication, "closing", "")
-                .await;
+    async fn disconnect(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Bounded like the channel close: a dead peer must not eat the time
+        // the poller allows for the whole collection.
+        let disconnect = session.disconnect(Disconnect::ByApplication, "closing", "");
+        match tokio::time::timeout(CLOSE_TIMEOUT, disconnect).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!("SSH disconnect from {} failed: {e}", self.target.host),
+            Err(_) => tracing::debug!("SSH disconnect from {} timed out", self.target.host),
         }
     }
+}
+
+/// Parsed output of [`METRICS_COMMAND`]: usage plus the cumulative
+/// network counters a rate is computed from.
+#[derive(Debug, PartialEq)]
+struct MetricsSample {
+    usage: Usage,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+fn parse_metrics_output(output: &str) -> Result<MetricsSample, MetricsParseError> {
+    let sections: Vec<&str> = output.split(SEPARATOR).collect();
+    let [top, free, df, net, ..] = sections[..] else {
+        return Err(MetricsParseError::SectionCount {
+            expected: 4,
+            got: sections.len(),
+        });
+    };
+
+    let (rx_bytes, tx_bytes) = parse_network(net)?;
+    Ok(MetricsSample {
+        usage: Usage {
+            cpu_percent: parse_cpu(top)?,
+            memory_percent: parse_memory(free)?,
+            disk_percent: parse_disk(df)?,
+        },
+        rx_bytes,
+        tx_bytes,
+    })
 }
 
 /// Read all stdout data from an SSH channel with a timeout.
@@ -226,8 +218,7 @@ impl SshBackend {
 /// Returns [`SshError::Timeout`] if the channel does not send EOF/Close
 /// within [`COMMAND_TIMEOUT`], or [`SshError::OutputTooLarge`] if the
 /// server streams more than [`MAX_OUTPUT_BYTES`]. The size check runs
-/// before each append so a hostile server cannot grow the buffer past
-/// the cap between the check and the copy.
+/// before each append so the buffer never grows past the cap.
 async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<String, SshError> {
     let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
     let mut stdout = Vec::new();
@@ -244,9 +235,7 @@ async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<Strin
             }
             Ok(Some(ChannelMsg::Eof | ChannelMsg::Close) | None) => break,
             Ok(Some(_)) => {}
-            Err(_) => {
-                return Err(SshError::Timeout);
-            }
+            Err(_) => return Err(SshError::Timeout),
         }
     }
 
@@ -254,6 +243,10 @@ async fn read_channel_output(channel: &mut Channel<client::Msg>) -> Result<Strin
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use super::*;
 
@@ -267,5 +260,37 @@ mod tests {
     fn ssh_connect_addr_brackets_ipv6() {
         assert_eq!(ssh_connect_addr("2001:db8::1", 22), "[2001:db8::1]:22");
         assert_eq!(ssh_connect_addr("[::1]", 22), "[::1]:22");
+    }
+
+    #[test]
+    fn parses_full_metrics_output() {
+        let output = format!(
+            "%Cpu(s):  3.0 us,  1.0 sy,  0.0 ni, 96.0 id\n{SEPARATOR}\n\
+             total used free\nMem: 1000 250 750\n{SEPARATOR}\n\
+             Filesystem 1-blocks Used Available Capacity Mounted\n\
+             /dev/sda1 100 42 58 42% /\n{SEPARATOR}\n\
+             Inter-|   Receive\n face |bytes packets\n\
+             eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n"
+        );
+
+        let sample = parse_metrics_output(&output).expect("parse");
+
+        assert!((sample.usage.cpu_percent - 4.0).abs() < 1e-9);
+        assert!((sample.usage.memory_percent - 25.0).abs() < 1e-9);
+        assert!((sample.usage.disk_percent - 42.0).abs() < 1e-9);
+        assert_eq!((sample.rx_bytes, sample.tx_bytes), (100, 200));
+    }
+
+    #[test]
+    fn missing_sections_are_reported() {
+        let err = parse_metrics_output("only one section").expect_err("too few sections");
+
+        assert!(matches!(
+            err,
+            MetricsParseError::SectionCount {
+                expected: 4,
+                got: 1
+            }
+        ));
     }
 }

@@ -13,7 +13,9 @@ rust-version = "1.98"
 
 [lib]
 name = "observer_ward_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop only: the staticlib/cdylib outputs exist for Tauri mobile
+# targets, which this macOS menu-bar app does not build.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
@@ -43,6 +45,9 @@ thiserror = "2"
 # TLS stack, not two. default-features = false drops the unused native-tls
 # default; a plain GET needs none of the dropped features.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Only for naming `url::ParseError` in GrafanaError; already in the tree
+# via reqwest, so it adds no new crate.
+url = "2.5"
 # OS keychain for the Grafana service-account token (a secret, so it is
 # never written to config.json). keyring 4.2's default `v1` feature
 # initializes the macOS Keychain on the first `Entry::new`.

@@ -770,6 +770,10 @@ function buildServerConfig() {
   if (!name) {
     return { error: "Name is required" };
   }
+  // Pod cards are keyed "cluster/pod"; the backend rejects "/" too.
+  if (name.includes("/")) {
+    return { error: "Name must not contain '/'" };
+  }
 
   if (type === "k8s") {
     const context = document
@@ -1009,12 +1013,7 @@ async function handleOpenTerminal() {
     return;
   }
   try {
-    await invoke("open_ssh_terminal", {
-      host: cfg.host,
-      port: cfg.port,
-      user: cfg.user,
-      keyPath: cfg.key_path,
-    });
+    await invoke("open_ssh_terminal", { name: cfg.name });
   } catch (err) {
     console.error("Failed to open SSH terminal:", err);
   }
@@ -1047,26 +1046,7 @@ async function handleViewLogs() {
   }
   const fullName = contextMenuTarget.name;
   hideContextMenu();
-  const slashIdx = fullName.indexOf("/");
-  if (slashIdx < 0) {
-    return;
-  }
-  const clusterName = fullName.substring(0, slashIdx);
-  const podName = fullName.substring(slashIdx + 1);
-  const cfg = findServerConfig(clusterName);
-  if (!cfg || cfg.type !== "k8s") {
-    return;
-  }
-  try {
-    await invoke("open_pod_logs", {
-      podName,
-      namespace: cfg.namespace,
-      context: cfg.context,
-      kubeconfig: cfg.kubeconfig || null,
-    });
-  } catch (err) {
-    console.error("Failed to open pod logs:", err);
-  }
+  await openPodLogs(fullName);
 }
 
 async function handleCopyError() {
@@ -1115,23 +1095,17 @@ async function handleCopyMetrics() {
 // ── Pod Logs ──────────────────────────────────
 
 async function openPodLogs(fullName) {
-  const slashIdx = fullName.indexOf("/");
+  // Pod names never contain "/", so the last one splits the key, even for
+  // a cluster name from before "/" was rejected.
+  const slashIdx = fullName.lastIndexOf("/");
   if (slashIdx < 0) {
     return;
   }
   const clusterName = fullName.substring(0, slashIdx);
   const podName = fullName.substring(slashIdx + 1);
-  const cfg = findServerConfig(clusterName);
-  if (!cfg || cfg.type !== "k8s") {
-    return;
-  }
   try {
-    await invoke("open_pod_logs", {
-      podName,
-      namespace: cfg.namespace,
-      context: cfg.context,
-      kubeconfig: cfg.kubeconfig || null,
-    });
+    // The backend resolves context, namespace and kubeconfig from config.
+    await invoke("open_pod_logs", { server: clusterName, pod: podName });
   } catch (err) {
     console.error("Failed to open pod logs:", err);
   }
@@ -1233,24 +1207,24 @@ async function saveSettings() {
   }
 
   try {
-    const config = await invoke("get_config");
-    config.foreground_poll_secs = fgInterval;
-    config.background_poll_secs = bgInterval;
-    config.notifications_enabled = notificationsToggle.checked;
+    const settings = {
+      foreground_poll_secs: fgInterval,
+      background_poll_secs: bgInterval,
+      notifications_enabled: notificationsToggle.checked,
+      grafana: null,
+    };
     const grafanaEnabled = grafanaEnabledToggle.checked;
     const grafanaUrl = grafanaUrlInput.value.trim();
     if (grafanaUrl) {
-      config.grafana = {
+      settings.grafana = {
         name: GRAFANA_CONN_NAME,
         url: grafanaUrl,
         verify_tls: grafanaVerifyTlsToggle.checked,
         enabled: grafanaEnabled,
       };
-    } else {
-      config.grafana = null;
     }
-    await invoke("save_config_cmd", { newConfig: config });
-    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
+    // Store the token first: if the Keychain refuses it, nothing is saved,
+    // instead of a saved URL that then polls without a token.
     const tokenValue = grafanaTokenInput.value.trim();
     if (tokenValue) {
       await invoke("set_grafana_token", {
@@ -1258,6 +1232,8 @@ async function saveSettings() {
         token: tokenValue,
       });
     }
+    await invoke("save_settings", { settings });
+    grafanaConfigured = grafanaEnabled && !!grafanaUrl;
     if (!grafanaConfigured) {
       alertsSection.classList.add("hidden");
     }
@@ -1284,6 +1260,52 @@ async function saveSettings() {
 
 // ── Metrics Event Listener ────────────────────
 
+// Flatten one card's report into the shape the renderers read. Missing
+// values (no sample yet, no PVC, first poll without a rate) become 0/"".
+function cardMetrics(src) {
+  const usage = src.usage || {};
+  return {
+    cpu: usage.cpu_percent ?? 0,
+    mem: usage.memory_percent ?? 0,
+    disk: usage.disk_percent ?? 0,
+    net_tx: src.net?.tx_bytes_per_sec ?? 0,
+    net_rx: src.net?.rx_bytes_per_sec ?? 0,
+    cpu_millicores: src.cpu_millicores ?? 0,
+    memory_bytes: src.memory_bytes ?? 0,
+    restart_count: src.restart_count ?? 0,
+    start_time: src.start_time ?? "",
+    pod_status: src.pod_status ?? "",
+    pvc_used_bytes: src.pvc_used_bytes ?? 0,
+    pvc_capacity_bytes: src.pvc_capacity_bytes ?? 0,
+    last_event: src.last_event ?? "",
+    disk_used_bytes: src.disk_used_bytes ?? 0,
+    disk_capacity_bytes: src.disk_capacity_bytes ?? 0,
+    node_count: src.node_count ?? 0,
+  };
+}
+
+// Append one sample to a card's sparkline history and refresh its
+// anomaly flags.
+function recordHistory(name, metrics) {
+  if (!metricsHistory[name]) {
+    metricsHistory[name] = { cpu: [], mem: [], disk: [] };
+  }
+  const h = metricsHistory[name];
+  h.cpu.push(metrics.cpu);
+  h.mem.push(metrics.mem);
+  h.disk.push(metrics.disk);
+  if (h.cpu.length > HISTORY_MAX) { h.cpu.shift(); }
+  if (h.mem.length > HISTORY_MAX) { h.mem.shift(); }
+  if (h.disk.length > HISTORY_MAX) { h.disk.shift(); }
+
+  anomalyState[name] = {
+    cpu: computeAnomaly(h.cpu).isAnomaly,
+    mem: computeAnomaly(h.mem).isAnomaly,
+    disk: computeAnomaly(h.disk).isAnomaly,
+  };
+}
+
+
 function handleMetricsUpdate(event) {
   const payload = event.payload;
   if (!payload || !Array.isArray(payload.servers)) {
@@ -1294,95 +1316,72 @@ function handleMetricsUpdate(event) {
   const receivedPodNames = new Set();
   const polledClusters = new Set();
 
-  for (const entry of payload.servers) {
-    const name = entry.server_name;
+  for (const report of payload.servers) {
+    const name = report.name;
     if (!name) {
       continue;
     }
 
-    if (entry.status === "offline" || entry.status === "error") {
-      metricsCache[name] = { error: entry.status, reason: entry.error || "" };
-    } else if (entry.status === "pending") {
-      // Leave metricsCache[name] untouched so UI shows
-      // "awaiting metrics..." until the first real poll
+    if (report.status !== "online") {
+      metricsCache[name] = { error: "offline", reason: report.error || "" };
       continue;
-    } else {
-      metricsCache[name] = {
-        cpu: entry.cpu_percent ?? 0,
-        mem: entry.memory_percent ?? 0,
-        disk: entry.disk_percent ?? 0,
-        net_tx: entry.net_tx_bytes_per_sec ?? 0,
-        net_rx: entry.net_rx_bytes_per_sec ?? 0,
-        cpu_millicores: entry.cpu_millicores ?? 0,
-        memory_bytes: entry.memory_bytes ?? 0,
-        restart_count: entry.restart_count ?? 0,
-        start_time: entry.start_time ?? "",
-        pod_status: entry.pod_status ?? "",
-        pvc_used_bytes: entry.pvc_used_bytes ?? 0,
-        pvc_capacity_bytes: entry.pvc_capacity_bytes ?? 0,
-        last_event: entry.last_event ?? "",
-        disk_used_bytes: entry.disk_used_bytes ?? 0,
-        disk_capacity_bytes: entry.disk_capacity_bytes ?? 0,
-        node_count: entry.node_count ?? 0,
-      };
     }
 
-    // Track history for sparklines
-    if (entry.status === "online") {
-      if (!metricsHistory[name]) {
-        metricsHistory[name] = { cpu: [], mem: [], disk: [] };
-      }
-      const h = metricsHistory[name];
-      h.cpu.push(entry.cpu_percent ?? 0);
-      h.mem.push(entry.memory_percent ?? 0);
-      h.disk.push(entry.disk_percent ?? 0);
-      if (h.cpu.length > HISTORY_MAX) { h.cpu.shift(); }
-      if (h.mem.length > HISTORY_MAX) { h.mem.shift(); }
-      if (h.disk.length > HISTORY_MAX) { h.disk.shift(); }
+    const m = report.metrics || {};
+    metricsCache[name] = cardMetrics({
+      usage: m,
+      net: m.net,
+      cpu_millicores: m.cpu_millicores,
+      memory_bytes: m.memory_bytes,
+      disk_used_bytes: m.disk?.used_bytes,
+      disk_capacity_bytes: m.disk?.capacity_bytes,
+      node_count: m.node_count,
+    });
+    recordHistory(name, metricsCache[name]);
 
-      anomalyState[name] = {
-        cpu: computeAnomaly(h.cpu).isAnomaly,
-        mem: computeAnomaly(h.mem).isAnomaly,
-        disk: computeAnomaly(h.disk).isAnomaly,
-      };
+    // `pods` is null when the backend failed to list them: only a
+    // successful listing is authoritative enough to prune old cards.
+    if (report.kind !== "k8s" || !Array.isArray(m.pods)) {
+      continue;
     }
-
-    // Only treat a k8s cluster as "pod inventory is authoritative"
-    // when the backend successfully listed pods. Offline / backoff
-    // rows and pod-list failures must not wipe the previous cards.
-    if (
-      entry.server_type === "k8s" &&
-      entry.status === "online" &&
-      entry.collected_pods
-    ) {
-      polledClusters.add(name);
-    }
-
-    if (entry.server_type === "pod") {
-      receivedPodNames.add(name);
-      const slashIdx = name.indexOf("/");
-      const displayName = slashIdx >= 0
-        ? name.substring(slashIdx + 1)
-        : name;
-      const cluster = slashIdx >= 0
-        ? name.substring(0, slashIdx)
-        : "";
+    polledClusters.add(name);
+    for (const pod of m.pods) {
+      const key = `${name}/${pod.name}`;
+      metricsCache[key] = cardMetrics({
+        usage: pod.usage,
+        net: pod.net,
+        cpu_millicores: pod.usage?.cpu_millicores,
+        memory_bytes: pod.usage?.memory_bytes,
+        restart_count: pod.restart_count,
+        start_time: pod.start_time,
+        pod_status: pod.status,
+        pvc_used_bytes: pod.pvc?.used_bytes,
+        pvc_capacity_bytes: pod.pvc?.capacity_bytes,
+        last_event: pod.last_event,
+      });
+      recordHistory(key, metricsCache[key]);
+      receivedPodNames.add(key);
       currentPods.push({
-        name,
-        displayName,
-        cluster,
+        name: key,
+        displayName: pod.name,
+        cluster: name,
         type: "pod",
       });
     }
   }
 
+  // Keys are server names or "cluster/pod". A legacy server name may
+  // contain "/" too, so server keys are recognised by name, not by shape.
+  const activeServerNames = new Set(servers.map((s) => s.name));
+  const isPodKey = (key) => !activeServerNames.has(key) && key.includes("/");
+
   // Clean up stale pod entries only from clusters that were
   // actually polled — preserve pods from offline/backoff clusters
   for (const key of Object.keys(metricsCache)) {
-    if (!key.includes("/")) {
+    if (!isPodKey(key)) {
       continue;
     }
-    const cluster = key.substring(0, key.indexOf("/"));
+    const cluster = key.substring(0, key.lastIndexOf("/"));
     if (polledClusters.has(cluster) && !receivedPodNames.has(key)) {
       delete metricsCache[key];
       delete metricsHistory[key];
@@ -1390,10 +1389,11 @@ function handleMetricsUpdate(event) {
     }
   }
 
-  // Prune history/anomaly for servers no longer configured
-  const activeServerNames = new Set(servers.map((s) => s.name));
+  // Prune history/anomaly for servers no longer configured; a removed
+  // cluster's pods go too, since their cluster is no longer polled.
   for (const key of Object.keys(metricsHistory)) {
-    if (!key.includes("/") && !activeServerNames.has(key)) {
+    const owner = isPodKey(key) ? key.substring(0, key.lastIndexOf("/")) : key;
+    if (!activeServerNames.has(owner)) {
       delete metricsHistory[key];
       delete anomalyState[key];
     }
@@ -1415,8 +1415,8 @@ function handleMetricsUpdate(event) {
     if (m.error) {
       continue;
     }
-    const isActivePod = key.includes("/") && activePodNames.has(key);
-    const isActiveServer = !key.includes("/") && activeServerNames.has(key);
+    const isActivePod = isPodKey(key) && activePodNames.has(key);
+    const isActiveServer = activeServerNames.has(key);
     if (!isActivePod && !isActiveServer) {
       continue;
     }
@@ -1680,7 +1680,7 @@ serverListEl.addEventListener("contextmenu", (e) => {
   const isPod = card.dataset.cardType === "pod";
   let serverType = card.dataset.serverType || "";
   if (isPod) {
-    const slashIdx = name.indexOf("/");
+    const slashIdx = name.lastIndexOf("/");
     const clusterName = slashIdx >= 0 ? name.substring(0, slashIdx) : "";
     const cfg = findServerConfig(clusterName);
     serverType = cfg ? cfg.type : "k8s";
@@ -1733,7 +1733,7 @@ serverListEl.addEventListener("dblclick", (e) => {
     const podCard = nameEl.closest("[data-card-type='pod']");
     let fallback = fullName;
     if (podCard) {
-      const slashIdx = fullName.indexOf("/");
+      const slashIdx = fullName.lastIndexOf("/");
       fallback = slashIdx >= 0
         ? fullName.substring(slashIdx + 1)
         : fullName;

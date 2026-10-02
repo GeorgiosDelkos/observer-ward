@@ -1,6 +1,8 @@
 //! Kubeconfig loading and validation, shared by the poller's connect path
 //! and the add-server form so both agree on what a usable kubeconfig is.
 
+use std::path::{Path, PathBuf};
+
 use kube::Config;
 use kube::config::{KubeConfigOptions, Kubeconfig, KubeconfigError};
 use serde::Serialize;
@@ -22,14 +24,15 @@ const DEFAULT_KUBECONFIG_LABEL: &str = "default kubeconfig ($KUBECONFIG or ~/.ku
 ///
 /// Blocking file IO: async callers go through [`validate_server`] or
 /// [`inspect`], which move it onto the blocking pool.
-pub(crate) fn load(path: Option<&str>) -> Result<Kubeconfig, K8sError> {
+pub(crate) fn load(path: Option<&Path>) -> Result<Kubeconfig, K8sError> {
     let Some(path) = path else {
         return Kubeconfig::read()
             .map_err(|source| classify_load_error(source, DEFAULT_KUBECONFIG_LABEL));
     };
 
     let path = crate::config::expand_tilde(path);
-    Kubeconfig::read_from(&path).map_err(|source| classify_load_error(source, &path))
+    let label = path.display().to_string();
+    Kubeconfig::read_from(&path).map_err(|source| classify_load_error(source, &label))
 }
 
 /// Map kube's load errors onto ours. kube's messages embed their cause and
@@ -115,7 +118,10 @@ fn ensure_context(kubeconfig: &Kubeconfig, context: &str) -> Result<(), K8sError
 /// poller will: readable kubeconfig, a defined context, and a context whose
 /// cluster, server URL and CA resolve. Does not contact the cluster, so
 /// adding a server works offline and never hangs the form.
-pub(crate) async fn validate_server(path: Option<String>, context: String) -> Result<(), K8sError> {
+pub(crate) async fn validate_server(
+    path: Option<PathBuf>,
+    context: String,
+) -> Result<(), K8sError> {
     let checked_context = context.clone();
     let kubeconfig = tokio::task::spawn_blocking(move || {
         let kubeconfig = load(path.as_deref())?;
@@ -125,16 +131,16 @@ pub(crate) async fn validate_server(path: Option<String>, context: String) -> Re
         Ok::<_, K8sError>(kubeconfig)
     })
     .await
-    .map_err(|_| K8sError::KubeconfigTask)??;
+    .map_err(K8sError::KubeconfigTask)??;
 
     build_config(kubeconfig, &context).await.map(drop)
 }
 
 /// Load the kubeconfig at `path` and list its contexts.
-pub(crate) async fn inspect(path: Option<String>) -> Result<KubeconfigSummary, K8sError> {
+pub(crate) async fn inspect(path: Option<PathBuf>) -> Result<KubeconfigSummary, K8sError> {
     tokio::task::spawn_blocking(move || load(path.as_deref()).map(|kc| summarize(&kc)))
         .await
-        .map_err(|_| K8sError::KubeconfigTask)?
+        .map_err(K8sError::KubeconfigTask)?
 }
 
 #[cfg(test)]
@@ -143,6 +149,8 @@ pub(crate) async fn inspect(path: Option<String>) -> Result<KubeconfigSummary, K
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{inspect, load, validate_server};
     use crate::error::error_chain;
 
@@ -169,10 +177,10 @@ contexts:
 current-context: "hippius"
 "#;
 
-    fn write_kubeconfig(dir: &tempfile::TempDir, contents: &str) -> String {
+    fn write_kubeconfig(dir: &tempfile::TempDir, contents: &str) -> PathBuf {
         let path = dir.path().join("kubeconfig.yaml");
         std::fs::write(&path, contents).expect("write test kubeconfig");
-        path.display().to_string()
+        path
     }
 
     #[test]
@@ -180,19 +188,24 @@ current-context: "hippius"
         // The reported bug: a one-character typo in the saved path made
         // every poll fail. The error must say which path was tried.
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("hippius1-oct.yaml").display().to_string();
+        let missing = dir.path().join("hippius1-oct.yaml");
 
         let err = load(Some(&missing)).expect_err("missing file must fail");
 
         assert_eq!(
             err.to_string(),
-            format!("failed to read kubeconfig {missing}")
+            format!("failed to read kubeconfig {}", missing.display())
         );
         let kind = std::error::Error::source(&err)
             .and_then(|cause| cause.downcast_ref::<std::io::Error>())
             .map(std::io::Error::kind);
         assert_eq!(kind, Some(std::io::ErrorKind::NotFound));
-        assert_eq!(error_chain(&err).matches(&missing).count(), 1);
+        assert_eq!(
+            error_chain(&err)
+                .matches(&*missing.display().to_string())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -205,7 +218,8 @@ current-context: "hippius"
         let rendered = error_chain(&err);
         assert!(
             rendered.starts_with(&format!(
-                "{path} is not a valid kubeconfig (YAML error at line"
+                "{} is not a valid kubeconfig (YAML error at line",
+                path.display()
             )),
             "{rendered}"
         );
@@ -227,7 +241,7 @@ current-context: "hippius"
         assert!(!rendered.contains("SECRETKEYMATERIAL"), "{rendered}");
         assert!(!rendered.contains("BEGIN OPENSSH"), "{rendered}");
         assert!(
-            rendered.starts_with(&format!("{path} is not a valid kubeconfig")),
+            rendered.starts_with(&format!("{} is not a valid kubeconfig", path.display())),
             "{rendered}"
         );
     }

@@ -18,20 +18,22 @@ use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
 use commands::{
-    ConfigState, LatestAlerts, LatestMetrics, WakeState, add_server, copy_to_clipboard,
+    LatestAlerts, LatestMetrics, TokenEpochState, WakeState, add_server, copy_to_clipboard,
     delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics, has_grafana_token,
     inspect_kubeconfig, open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig, pick_ssh_key,
-    quit_app, remove_server, resize_window, save_config_cmd, set_grafana_token,
+    quit_app, remove_server, resize_window, save_settings, set_grafana_token,
 };
-use poller::PollerHandles;
+use config::ConfigStore;
+use grafana::TokenEpoch;
+use poller::{Poller, PollerHandles};
 use tray::setup_tray_and_window;
 
 /// Run the Observer Ward application.
 ///
 /// # Errors
 ///
-/// Returns an error if the Tauri runtime fails to start, the tray
-/// icon cannot be created, or the default window icon is missing.
+/// Returns an error if the config directory cannot be determined, the
+/// Tauri runtime fails to start, or the tray icon cannot be created.
 #[expect(
     clippy::exit,
     reason = "tauri::generate_context! macro calls process::exit"
@@ -40,19 +42,12 @@ use tray::setup_tray_and_window;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let initial_config = match config::load_config() {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::error!(
-                "failed to load config, using defaults: {}",
-                error::error_chain(&e)
-            );
-            config::AppConfig::default()
-        }
-    };
-    let config_arc = Arc::new(Mutex::new(initial_config));
+    let config_path = config::config_path()?;
+    let initial_config = config::load_config_or_default(&config_path);
+    let config = Arc::new(ConfigStore::new(config_path, initial_config));
     let is_window_visible = Arc::new(AtomicBool::new(false));
     let poll_wake = Arc::new(Notify::new());
+    let token_epoch = Arc::new(TokenEpoch::default());
     let latest_metrics = Arc::new(Mutex::new(None));
     let latest_alerts = Arc::new(Mutex::new(None));
 
@@ -65,13 +60,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_positioner::init())
-        .manage(ConfigState(Arc::clone(&config_arc)))
+        .manage(Arc::clone(&config))
         .manage(WakeState(Arc::clone(&poll_wake)))
+        .manage(TokenEpochState(Arc::clone(&token_epoch)))
         .manage(LatestMetrics(Arc::clone(&latest_metrics)))
         .manage(LatestAlerts(Arc::clone(&latest_alerts)))
         .invoke_handler(tauri::generate_handler![
             get_config,
-            save_config_cmd,
+            save_settings,
             add_server,
             pick_kubeconfig,
             pick_ssh_key,
@@ -95,19 +91,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let handle = app.handle().clone();
-            let config_for_poller = Arc::clone(&config_arc);
-            tauri::async_runtime::spawn(async move {
-                let mut poller = poller::Poller::new(PollerHandles {
-                    app_handle: handle,
-                    config_state: config_for_poller,
-                    is_visible: is_window_visible,
-                    wake: poll_wake,
-                    latest_metrics,
-                    latest_alerts,
-                });
-                poller.run().await;
+            let mut poller = Poller::new(PollerHandles {
+                app_handle: app.handle().clone(),
+                config,
+                is_visible: is_window_visible,
+                wake: poll_wake,
+                token_epoch,
+                latest_metrics,
+                latest_alerts,
             });
+            tauri::async_runtime::spawn(async move { poller.run().await });
 
             Ok(())
         })

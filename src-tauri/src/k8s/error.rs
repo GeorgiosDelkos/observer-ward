@@ -9,7 +9,6 @@
 /// `Result<_, K8sError>` on the happy path — small to move (axiom
 /// `rust_quality_151`, clippy `result_large_err`).
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum K8sError {
     #[error("failed to read kubeconfig {path}")]
     ReadKubeconfig {
@@ -38,10 +37,8 @@ pub(crate) enum K8sError {
     },
     #[error("failed to create kube client")]
     CreateClient(#[source] Box<kube::Error>),
-    #[error("k8s client is not connected")]
-    NotConnected,
     #[error("kubeconfig load task failed")]
-    KubeconfigTask,
+    KubeconfigTask(#[source] tokio::task::JoinError),
     #[error("timed out fetching stats for node {node}")]
     NodeStatsTimeout { node: String },
     #[error("failed to list nodes")]
@@ -86,26 +83,17 @@ pub(crate) enum K8sError {
 /// Carries the offending value and underlying numeric-parse cause as
 /// typed fields rather than a formatted string (axiom `rust_quality_63`).
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum QuantityParseError {
-    #[error("invalid cpu quantity {value}")]
-    Cpu {
+    #[error("invalid quantity {value}: unknown suffix")]
+    Suffix { value: String },
+    #[error("invalid quantity {value}")]
+    Number {
         value: String,
         #[source]
         source: std::num::ParseFloatError,
     },
-    #[error("invalid memory quantity {value}")]
-    MemoryInt {
-        value: String,
-        #[source]
-        source: std::num::ParseIntError,
-    },
-    #[error("invalid memory quantity {value}")]
-    MemoryFloat {
-        value: String,
-        #[source]
-        source: std::num::ParseFloatError,
-    },
-    #[error("memory quantity {value} overflows u64")]
-    MemoryOverflow { value: String },
+    #[error("quantity {value} is negative")]
+    Negative { value: String },
+    #[error("quantity {value} overflows u64")]
+    Overflow { value: String },
 }

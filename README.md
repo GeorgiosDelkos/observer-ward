@@ -134,7 +134,7 @@ Click **remove** on the card (or right-click → Remove). Confirm in the in-app 
 }
 ```
 
-`poll_interval_secs` is still accepted as an alias for `foreground_poll_secs`. The Grafana token is not in this file.
+Every save is validated: server names must be unique and must not contain `/`, `foreground_poll_secs` must be 5–120 and `background_poll_secs` 30–600. If the file cannot be parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
 
 ## Architecture
 
@@ -149,7 +149,7 @@ observer-ward/
 │       ├── terminal.rs         # Open ssh/kubectl in Warp or Terminal
 │       ├── config.rs           # Config models and persistence
 │       ├── error.rs            # Error-chain formatting
-│       ├── metrics.rs          # Metric and alert types
+│       ├── metrics.rs          # Per-kind report types, levels, alerts
 │       ├── poller.rs           # Poll loop, backoff, tray icon
 │       ├── k8s.rs / k8s/       # Kubernetes Metrics API + kubelet stats
 │       ├── ssh.rs / ssh/       # SSH session, TOFU, command parsers
@@ -169,7 +169,7 @@ cd src-tauri
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo deny check advisories
+cargo deny check
 ```
 
 Clippy denies `unwrap`, `panic`, `todo`, and `dbg!` in production code. Logging uses `tracing`.

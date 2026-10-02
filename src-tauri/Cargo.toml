@@ -13,7 +13,9 @@ rust-version = "1.98"
 
 [lib]
 name = "observer_ward_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop only: the staticlib/cdylib outputs exist for Tauri mobile
+# targets, which this macOS menu-bar app does not build.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }

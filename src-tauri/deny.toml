@@ -1,5 +1,5 @@
 # cargo-deny configuration for the supply-chain CI gate.
-# Run with: cargo deny check advisories
+# Run with: cargo deny check
 
 [advisories]
 version = 2
@@ -16,3 +16,37 @@ ignore = [
     # rsa crate ships a mitigated release.
     "RUSTSEC-2023-0071",
 ]
+
+[licenses]
+version = 2
+# Permissive licenses plus MPL-2.0 (file-level copyleft, compatible with
+# distributing this MIT app). Copyleft licenses such as LGPL appear in the
+# tree only as an alternative in an OR expression, so they stay off the list.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# Build-time dependency of the GTK system-deps chain (Linux backend).
+[[licenses.exceptions]]
+crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
+[bans]
+# Tauri, russh and kube each pin their own versions of shared crates
+# (windows-*, crypto primitives, toml); this app cannot unify them.
+multiple-versions = "allow"

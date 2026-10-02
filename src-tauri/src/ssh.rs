@@ -104,10 +104,7 @@ impl SshBackend {
         let config = Arc::new(client::Config::default());
         let addr = ssh_connect_addr(&self.host, self.port);
 
-        let handler = SshHandler {
-            host: self.host.clone(),
-            port: self.port,
-        };
+        let handler = SshHandler::new(&self.host, self.port);
 
         let mut handle = client::connect(config, &addr, handler)
             .await

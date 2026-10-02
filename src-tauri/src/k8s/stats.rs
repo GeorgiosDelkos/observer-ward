@@ -1,12 +1,14 @@
 //! Kubelet `/stats/summary` types and node-stats collection.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::Node;
 use kube::Client;
 use serde::Deserialize;
 use tokio::task::JoinSet;
+
+use crate::metrics::{Capacity, NetSample};
 
 use super::error::K8sError;
 
@@ -114,105 +116,106 @@ pub(super) fn encode_path_segment(s: &str) -> String {
             }
             _ => {
                 use std::fmt::Write as _;
-                let _ = write!(out, "%{b:02X}");
+                // Writing to a String cannot fail.
+                let _infallible = write!(out, "%{b:02X}");
             }
         }
     }
     out
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "disk byte totals fit comfortably in f64"
-)]
-pub(super) fn compute_cluster_disk_net(summaries: &[StatsSummary]) -> (f64, u64, u64, u64, u64) {
-    let mut total_disk_used = 0_u64;
-    let mut total_disk_capacity = 0_u64;
-    let mut total_rx = 0_u64;
-    let mut total_tx = 0_u64;
+/// Node filesystem and network totals across the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClusterTotals {
+    pub(super) disk: Capacity,
+    pub(super) rx_bytes: u64,
+    pub(super) tx_bytes: u64,
+}
+
+pub(super) fn cluster_totals(summaries: &[StatsSummary]) -> ClusterTotals {
+    let mut totals = ClusterTotals {
+        disk: Capacity::default(),
+        rx_bytes: 0,
+        tx_bytes: 0,
+    };
 
     for summary in summaries {
         if let Some(fs) = &summary.node.fs {
-            total_disk_used = total_disk_used.saturating_add(fs.used_bytes.unwrap_or(0));
-            total_disk_capacity =
-                total_disk_capacity.saturating_add(fs.capacity_bytes.unwrap_or(0));
+            totals.disk.used_bytes = totals
+                .disk
+                .used_bytes
+                .saturating_add(fs.used_bytes.unwrap_or(0));
+            totals.disk.capacity_bytes = totals
+                .disk
+                .capacity_bytes
+                .saturating_add(fs.capacity_bytes.unwrap_or(0));
         }
         if let Some(net) = &summary.node.network {
             let (rx, tx) = net.effective_bytes();
-            total_rx = total_rx.saturating_add(rx);
-            total_tx = total_tx.saturating_add(tx);
+            totals.rx_bytes = totals.rx_bytes.saturating_add(rx);
+            totals.tx_bytes = totals.tx_bytes.saturating_add(tx);
         }
     }
 
-    let disk_pct = if total_disk_capacity > 0 {
-        total_disk_used as f64 / total_disk_capacity as f64 * 100.0
-    } else {
-        0.0
-    };
-
-    (
-        disk_pct,
-        total_rx,
-        total_tx,
-        total_disk_used,
-        total_disk_capacity,
-    )
+    totals
 }
 
-/// Extract PVC used/capacity bytes per pod from kubelet stats
-/// summaries, filtered to a specific namespace. Only volumes
-/// with a `pvcRef` are included.
+/// PVC used/capacity bytes per pod in `namespace`, summed over the pod's
+/// volumes that have a `pvcRef`. Pods without one are absent.
 pub(super) fn extract_pod_pvc(
     summaries: &[StatsSummary],
     namespace: &str,
-) -> HashMap<String, (u64, u64)> {
-    let mut result: HashMap<String, (u64, u64)> = HashMap::new();
+) -> HashMap<String, Capacity> {
+    let mut result: HashMap<String, Capacity> = HashMap::new();
 
-    for summary in summaries {
-        for pod in &summary.pods {
-            if pod.pod_ref.namespace != namespace {
-                continue;
-            }
-            for vol in &pod.volume {
-                if vol.pvc_ref.is_none() {
-                    continue;
-                }
-                let entry = result.entry(pod.pod_ref.name.clone()).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(vol.used_bytes.unwrap_or(0));
-                entry.1 = entry.1.saturating_add(vol.capacity_bytes.unwrap_or(0));
-            }
+    for pod in pods_in(summaries, namespace) {
+        for vol in pod.volume.iter().filter(|v| v.pvc_ref.is_some()) {
+            let entry = result.entry(pod.pod_ref.name.clone()).or_default();
+            entry.used_bytes = entry.used_bytes.saturating_add(vol.used_bytes.unwrap_or(0));
+            entry.capacity_bytes = entry
+                .capacity_bytes
+                .saturating_add(vol.capacity_bytes.unwrap_or(0));
         }
     }
 
     result
 }
 
-/// Extract cumulative network rx/tx bytes per pod from kubelet
-/// stats summaries, filtered to a specific namespace.
+/// Cumulative network counters per pod in `namespace`, stamped `at`.
 /// Host-networked pods lack top-level `rxBytes`/`txBytes`;
 /// `effective_bytes()` falls back to summing physical interfaces.
 pub(super) fn extract_pod_network(
     summaries: &[StatsSummary],
     namespace: &str,
-) -> HashMap<String, (u64, u64)> {
-    let mut result: HashMap<String, (u64, u64)> = HashMap::new();
+    at: Instant,
+) -> HashMap<String, NetSample> {
+    let mut result: HashMap<String, NetSample> = HashMap::new();
 
-    for summary in summaries {
-        for pod in &summary.pods {
-            if pod.pod_ref.namespace != namespace {
-                continue;
-            }
-            let Some(net) = &pod.network else {
-                continue;
-            };
-            let (rx, tx) = net.effective_bytes();
-            let entry = result.entry(pod.pod_ref.name.clone()).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(rx);
-            entry.1 = entry.1.saturating_add(tx);
-        }
+    for pod in pods_in(summaries, namespace) {
+        let Some(net) = &pod.network else {
+            continue;
+        };
+        let (rx, tx) = net.effective_bytes();
+        let entry = result.entry(pod.pod_ref.name.clone()).or_insert(NetSample {
+            rx_bytes: 0,
+            tx_bytes: 0,
+            at,
+        });
+        entry.rx_bytes = entry.rx_bytes.saturating_add(rx);
+        entry.tx_bytes = entry.tx_bytes.saturating_add(tx);
     }
 
     result
+}
+
+fn pods_in<'a>(
+    summaries: &'a [StatsSummary],
+    namespace: &'a str,
+) -> impl Iterator<Item = &'a PodStatsSummary> {
+    summaries
+        .iter()
+        .flat_map(|summary| &summary.pods)
+        .filter(move |pod| pod.pod_ref.namespace == namespace)
 }
 
 /// Fetch the kubelet stats summary for a single node via the
@@ -286,6 +289,61 @@ pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Vec
 )]
 mod tests {
     use super::*;
+
+    fn bytes(samples: &HashMap<String, NetSample>, pod: &str) -> Option<(u64, u64)> {
+        samples.get(pod).map(|s| (s.rx_bytes, s.tx_bytes))
+    }
+
+    fn summary_json(json: &str) -> StatsSummary {
+        serde_json::from_str(json).expect("parse stats")
+    }
+
+    #[test]
+    fn cluster_totals_sum_nodes() {
+        let a = summary_json(
+            r#"{"node": {"fs": {"usedBytes": 10, "capacityBytes": 100},
+                         "network": {"rxBytes": 1, "txBytes": 2}}}"#,
+        );
+        let b = summary_json(r#"{"node": {"fs": {"usedBytes": 30, "capacityBytes": 100}}}"#);
+
+        let totals = cluster_totals(&[a, b]);
+
+        assert_eq!(
+            totals.disk,
+            Capacity {
+                used_bytes: 40,
+                capacity_bytes: 200
+            }
+        );
+        assert_eq!((totals.rx_bytes, totals.tx_bytes), (1, 2));
+    }
+
+    #[test]
+    fn extract_pod_pvc_sums_only_pvc_volumes_in_namespace() {
+        let summary = summary_json(
+            r#"{"node": {}, "pods": [
+                {"podRef": {"name": "db-0", "namespace": "prod"}, "volume": [
+                    {"usedBytes": 5, "capacityBytes": 10, "pvcRef": {"name": "a"}},
+                    {"usedBytes": 1, "capacityBytes": 2, "pvcRef": {"name": "b"}},
+                    {"usedBytes": 99, "capacityBytes": 99}
+                ]},
+                {"podRef": {"name": "db-0", "namespace": "other"}, "volume": [
+                    {"usedBytes": 7, "capacityBytes": 7, "pvcRef": {"name": "c"}}
+                ]}
+            ]}"#,
+        );
+
+        let pvc = extract_pod_pvc(&[summary], "prod");
+
+        assert_eq!(
+            pvc.get("db-0"),
+            Some(&Capacity {
+                used_bytes: 6,
+                capacity_bytes: 12
+            })
+        );
+        assert_eq!(pvc.len(), 1);
+    }
 
     #[test]
     fn encode_path_segment_leaves_dns_names() {
@@ -527,10 +585,10 @@ mod tests {
             ]
         }"#;
         let summary: StatsSummary = serde_json::from_str(json).expect("parse");
-        let result = extract_pod_network(&[summary], "prod");
+        let result = extract_pod_network(&[summary], "prod", Instant::now());
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result.get("app-0"), Some(&(100, 200)));
+        assert_eq!(bytes(&result, "app-0"), Some((100, 200)));
         assert!(!result.contains_key("app-1"));
     }
 
@@ -580,11 +638,11 @@ mod tests {
             ]
         }"#;
         let summary: StatsSummary = serde_json::from_str(json).expect("parse");
-        let result = extract_pod_network(&[summary], "default");
+        let result = extract_pod_network(&[summary], "default", Instant::now());
 
         assert_eq!(result.len(), 1);
         // Only enp* interfaces are summed (physical NICs)
-        assert_eq!(result.get("gateway-0"), Some(&(1_500_000, 2_300_000)));
+        assert_eq!(bytes(&result, "gateway-0"), Some((1_500_000, 2_300_000)));
     }
 
     #[test]
@@ -602,7 +660,7 @@ mod tests {
             ]
         }"#;
         let summary: StatsSummary = serde_json::from_str(json).expect("parse");
-        let result = extract_pod_network(&[summary], "default");
+        let result = extract_pod_network(&[summary], "default", Instant::now());
 
         assert!(result.is_empty());
     }

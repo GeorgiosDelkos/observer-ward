@@ -1,19 +1,20 @@
 //! SSH backend error types.
 
+use std::path::PathBuf;
+
 /// Failure categories for the SSH backend. Each variant preserves its
-/// underlying cause in the source chain (axiom `rust_quality_57`); the
-/// poller flattens the chain only when logging.
+/// underlying cause in the source chain; the poller flattens the chain
+/// only when reporting.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum SshError {
-    #[error("failed to load SSH key {path}")]
+    #[error("failed to load SSH key {}", path.display())]
     LoadKey {
-        path: String,
+        path: PathBuf,
         #[source]
         source: russh::keys::Error,
     },
-    #[error("SSH key loading was cancelled")]
-    KeyLoadCancelled,
+    #[error("SSH key loading task failed")]
+    KeyLoadTask(#[source] tokio::task::JoinError),
     #[error("SSH connection to {addr} failed")]
     Connect {
         addr: String,
@@ -42,9 +43,8 @@ pub(crate) enum SshError {
 
 /// Failure categories for parsing the remote metrics command output.
 /// Carries the offending field and underlying numeric-parse cause as
-/// typed fields rather than a formatted string (axiom `rust_quality_63`).
+/// typed fields rather than a formatted string.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum MetricsParseError {
     #[error("expected {expected} sections in metrics output, got {got}")]
     SectionCount { expected: usize, got: usize },
@@ -72,6 +72,8 @@ pub(crate) enum MetricsParseError {
     DiskNoPercent,
     #[error("failed to parse disk percentage")]
     DiskPercent(#[source] std::num::ParseFloatError),
+    #[error("{what} is not a finite number")]
+    NotFinite { what: &'static str },
     #[error("no non-loopback interfaces found in /proc/net/dev")]
     NoInterfaces,
     #[error("failed to parse {what} bytes for interface {iface}")]

@@ -9,7 +9,6 @@
 /// `Result<_, K8sError>` on the happy path — small to move (axiom
 /// `rust_quality_151`, clippy `result_large_err`).
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum K8sError {
     #[error("failed to read kubeconfig {path}")]
     ReadKubeconfig {
@@ -38,10 +37,8 @@ pub(crate) enum K8sError {
     },
     #[error("failed to create kube client")]
     CreateClient(#[source] Box<kube::Error>),
-    #[error("k8s client is not connected")]
-    NotConnected,
     #[error("kubeconfig load task failed")]
-    KubeconfigTask,
+    KubeconfigTask(#[source] tokio::task::JoinError),
     #[error("timed out fetching stats for node {node}")]
     NodeStatsTimeout { node: String },
     #[error("failed to list nodes")]

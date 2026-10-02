@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - The `metrics-update` payload is typed per server kind (`kind`, `status`, `metrics` or `error`), with pods nested inside their cluster
 - `save_config_cmd` is replaced by `save_settings`, which never touches the server list; terminal commands take a server name instead of connection details
-- Config writes are validated (unique names without `/`, poll interval ranges); the `poll_interval_secs` alias is gone
+- Config changes are validated (new names unique and without `/`, changed poll intervals in range); the `poll_interval_secs` alias is gone
 - Grafana token is cached and re-read only after a change or a 401/403
 - CI runs the full `cargo deny check` (licenses, bans, sources, advisories)
 

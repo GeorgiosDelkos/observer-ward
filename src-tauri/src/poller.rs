@@ -238,6 +238,14 @@ impl ServerPool {
             reports.push(report);
         }
 
+        // Tasks finish in any order; keep the payload and the notification
+        // order stable by reporting in config order.
+        let position: HashMap<&str, usize> = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.name().as_str(), i))
+            .collect();
+        reports.sort_by_key(|r| position.get(r.name().as_str()).copied());
         reports
     }
 

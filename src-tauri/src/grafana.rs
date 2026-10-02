@@ -26,6 +26,10 @@ const KEYCHAIN_SERVICE: &str = "observer-ward.grafana";
 /// KB; this bounds memory if the endpoint misbehaves.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upper bound on one poll, keychain read included. The HTTP client has
+/// its own 20s limit; this also covers a Keychain prompt nobody answers.
+const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Failure categories for Grafana alert ingestion. Each variant keeps
 /// its underlying cause in the source chain, so the poll loop can render
 /// it with `error::error_chain` at the edge.
@@ -51,6 +55,8 @@ pub(crate) enum GrafanaError {
     Http(#[source] reqwest::Error),
     #[error("Grafana returned HTTP status {code}")]
     Status { code: u16 },
+    #[error("timed out polling Grafana")]
+    Timeout,
     #[error("Grafana response exceeded {limit} bytes")]
     BodyTooLarge { limit: usize },
     #[error("failed to parse the Grafana alert response")]
@@ -332,9 +338,17 @@ struct CachedToken {
 
 /// Owns everything the poll loop needs to fetch alerts: the cached token,
 /// the HTTP backend, and the epoch shared with the token commands.
+/// A keychain read in flight, kept across polls.
+struct PendingRead {
+    name: String,
+    epoch: u64,
+    handle: tokio::task::JoinHandle<Result<String, GrafanaError>>,
+}
+
 pub(crate) struct AlertSource {
     epoch: Arc<TokenEpoch>,
     token: Option<CachedToken>,
+    pending_read: Option<PendingRead>,
     backend: Option<GrafanaBackend>,
 }
 
@@ -343,6 +357,7 @@ impl AlertSource {
         Self {
             epoch,
             token: None,
+            pending_read: None,
             backend: None,
         }
     }
@@ -357,7 +372,12 @@ impl AlertSource {
             return None;
         };
 
-        let update = match self.fetch(config).await {
+        // Bounds the keychain read too: an unanswered Keychain prompt must
+        // not hold up the metrics the poller publishes alongside alerts.
+        let fetched = tokio::time::timeout(POLL_TIMEOUT, self.fetch(config))
+            .await
+            .unwrap_or(Err(GrafanaError::Timeout));
+        let update = match fetched {
             Ok(alerts) => AlertsUpdate {
                 alerts,
                 source_error: None,
@@ -401,10 +421,33 @@ impl AlertSource {
         }
 
         self.token = None;
-        let owned_name = name.to_string();
-        let token = tokio::task::spawn_blocking(move || read_token(&owned_name))
-            .await
-            .map_err(GrafanaError::KeychainTask)??;
+
+        // A read still running from a timed-out poll (say, a Keychain
+        // prompt left open) is awaited again rather than joined by another
+        // blocking thread every cycle.
+        let reusable = self
+            .pending_read
+            .as_ref()
+            .is_some_and(|p| p.name == name && p.epoch == epoch);
+        if !reusable {
+            let owned_name = name.to_string();
+            self.pending_read = Some(PendingRead {
+                name: name.to_string(),
+                epoch,
+                handle: tokio::task::spawn_blocking(move || read_token(&owned_name)),
+            });
+        }
+        let Some(pending) = self.pending_read.as_mut() else {
+            return Err(GrafanaError::MissingToken {
+                name: name.to_string(),
+            });
+        };
+        // Cancellation-safe: if this await is dropped, the handle stays in
+        // `pending_read` for the next poll.
+        let joined = (&mut pending.handle).await;
+        self.pending_read = None;
+        let token = joined.map_err(GrafanaError::KeychainTask)??;
+
         self.token = Some(CachedToken {
             name: name.to_string(),
             epoch,

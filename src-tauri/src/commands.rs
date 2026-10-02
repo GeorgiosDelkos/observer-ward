@@ -93,7 +93,8 @@ pub(crate) async fn save_settings(
     wake: State<'_, WakeState>,
     settings: Settings,
 ) -> CommandResult<AppConfig> {
-    if let Some(grafana) = &settings.grafana {
+    // A disabled connection is not polled, so its URL is not checked.
+    if let Some(grafana) = settings.grafana.as_ref().filter(|g| g.enabled) {
         grafana::validate_url(&grafana.url)?;
     }
     let next = store

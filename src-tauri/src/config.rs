@@ -68,37 +68,58 @@ impl AppConfig {
         self.servers.iter().find(|s| s.name().as_str() == name)
     }
 
-    /// Check the invariants every write must keep: poll intervals in the
-    /// form's range and unique, well-formed server names.
+    /// Check the invariants a write must keep (poll intervals in the form's
+    /// range; unique server names without `/`), but only for what differs
+    /// from `previous`: changed intervals and servers that were not there
+    /// before. A legacy file (a `/` in a name, a hand-edited interval) must
+    /// not block unrelated edits such as removing a different server.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Invalid`] describing the first violation.
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if !FOREGROUND_POLL_SECS.contains(&self.foreground_poll_secs) {
-            return Err(invalid(format!(
-                "foreground poll interval must be {}-{} seconds",
-                FOREGROUND_POLL_SECS.start(),
-                FOREGROUND_POLL_SECS.end()
-            )));
-        }
-        if !BACKGROUND_POLL_SECS.contains(&self.background_poll_secs) {
-            return Err(invalid(format!(
-                "background poll interval must be {}-{} seconds",
-                BACKGROUND_POLL_SECS.start(),
-                BACKGROUND_POLL_SECS.end()
-            )));
+    /// [`ConfigError::Invalid`] or [`ConfigError::DuplicateServer`] for the
+    /// first new violation.
+    pub fn validate_change_from(&self, previous: &AppConfig) -> Result<(), ConfigError> {
+        let intervals_changed = self.foreground_poll_secs != previous.foreground_poll_secs
+            || self.background_poll_secs != previous.background_poll_secs;
+        if intervals_changed {
+            check_intervals(self)?;
         }
 
-        let mut seen = std::collections::HashSet::new();
         for server in &self.servers {
-            server.name().validate()?;
-            if !seen.insert(server.name().as_str()) {
-                return Err(ConfigError::DuplicateServer(server.name().clone()));
+            if !previous.servers.contains(server) {
+                server.name().validate()?;
+            }
+            // A name shared by more servers than before is a new duplicate,
+            // even when the added entry is an exact copy of an existing one.
+            let name = server.name();
+            if count_named(self, name) > count_named(previous, name).max(1) {
+                return Err(ConfigError::DuplicateServer(name.clone()));
             }
         }
         Ok(())
     }
+}
+
+fn count_named(config: &AppConfig, name: &ServerName) -> usize {
+    config.servers.iter().filter(|s| s.name() == name).count()
+}
+
+fn check_intervals(config: &AppConfig) -> Result<(), ConfigError> {
+    if !FOREGROUND_POLL_SECS.contains(&config.foreground_poll_secs) {
+        return Err(invalid(format!(
+            "foreground poll interval must be {}-{} seconds",
+            FOREGROUND_POLL_SECS.start(),
+            FOREGROUND_POLL_SECS.end()
+        )));
+    }
+    if !BACKGROUND_POLL_SECS.contains(&config.background_poll_secs) {
+        return Err(invalid(format!(
+            "background poll interval must be {}-{} seconds",
+            BACKGROUND_POLL_SECS.start(),
+            BACKGROUND_POLL_SECS.end()
+        )));
+    }
+    Ok(())
 }
 
 fn clamp_to(value: u64, range: &std::ops::RangeInclusive<u64>) -> u64 {
@@ -333,7 +354,7 @@ impl ConfigStore {
         let mut current = self.current.lock().await;
         let mut next = current.clone();
         edit(&mut next)?;
-        next.validate()?;
+        next.validate_change_from(&current)?;
 
         let path = self.path.clone();
         let to_save = next.clone();
@@ -413,7 +434,7 @@ pub fn load_config_from(path: &Path) -> Result<AppConfig, ConfigError> {
 }
 
 /// Load the config, falling back to the default on any failure. A file
-/// that exists but cannot be parsed is first copied aside to
+/// that exists but cannot be read or parsed is first copied aside to
 /// `config.json.invalid`, so the next save cannot silently replace the
 /// user's servers with the empty default.
 #[must_use]
@@ -425,9 +446,9 @@ pub fn load_config_or_default(path: &Path) -> AppConfig {
                 "failed to load config, using defaults: {}",
                 crate::error::error_chain(&e)
             );
-            if let ConfigError::Parse { .. } = e {
-                preserve_invalid(path);
-            }
+            // NotFound already returned the default above, so any error means a
+            // file exists that the next save would replace.
+            preserve_invalid(path);
             AppConfig::default()
         }
     }
@@ -480,6 +501,17 @@ pub fn save_config_to(path: &Path, config: &AppConfig) -> Result<(), ConfigError
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Validate `config` as a brand-new file: every server and both
+    /// intervals count as changed.
+    fn validate_fresh(config: &AppConfig) -> Result<(), ConfigError> {
+        config.validate_change_from(&AppConfig {
+            foreground_poll_secs: 0,
+            background_poll_secs: 0,
+            servers: Vec::new(),
+            ..AppConfig::default()
+        })
+    }
 
     fn ssh(name: &str) -> ServerConfig {
         ServerConfig::Ssh(SshTarget {
@@ -612,7 +644,7 @@ mod tests {
         assert_eq!(config.background_poll_secs, 300);
         assert!(config.servers.is_empty());
         assert!(config.grafana.is_none());
-        config.validate().expect("defaults are valid");
+        validate_fresh(&config).expect("defaults are valid");
     }
 
     #[test]
@@ -633,18 +665,18 @@ mod tests {
             servers: vec![ssh("a"), k8s("b")],
             ..AppConfig::default()
         };
-        config.validate().expect("valid");
+        validate_fresh(&config).expect("valid");
 
         config.servers.push(ssh("a"));
         assert!(matches!(
-            config.validate(),
+            validate_fresh(&config),
             Err(ConfigError::DuplicateServer(name)) if name.as_str() == "a"
         ));
 
         for bad in ["", "   ", "prod/eu"] {
             config.servers = vec![k8s(bad)];
             assert!(
-                matches!(config.validate(), Err(ConfigError::Invalid { .. })),
+                matches!(validate_fresh(&config), Err(ConfigError::Invalid { .. })),
                 "{bad:?}"
             );
         }
@@ -659,7 +691,7 @@ mod tests {
         };
 
         assert!(matches!(
-            config.validate(),
+            validate_fresh(&config),
             Err(ConfigError::Invalid { .. })
         ));
         assert_eq!(config.foreground_interval(), Duration::from_secs(5));
@@ -741,6 +773,60 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Invalid { .. })));
         assert!(store.snapshot().await.servers.is_empty());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_entries_do_not_block_unrelated_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = AppConfig {
+            foreground_poll_secs: 1,
+            servers: vec![k8s("prod/eu"), ssh("other")],
+            ..AppConfig::default()
+        };
+        let store = ConfigStore::new(dir.path().join("config.json"), legacy);
+
+        let next = store
+            .update(|c| {
+                c.servers.retain(|s| s.name().as_str() != "other");
+                c.servers.push(ssh("new"));
+                Ok::<_, ConfigError>(())
+            })
+            .await
+            .expect("unrelated edit succeeds despite legacy entries");
+
+        assert_eq!(next.servers.len(), 2);
+
+        let rejected = store
+            .update(|c| {
+                c.servers.push(ssh("new"));
+                Ok::<_, ConfigError>(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(ConfigError::DuplicateServer(_))));
+
+        let rejected = store
+            .update(|c| {
+                c.background_poll_secs = 5;
+                Ok::<_, ConfigError>(())
+            })
+            .await;
+        assert!(matches!(rejected, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn unreadable_config_is_preserved_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(&path, [0xff, 0xfe, b'{']).expect("write");
+
+        assert!(matches!(
+            load_config_from(&path),
+            Err(ConfigError::Read { .. })
+        ));
+        let _ = load_config_or_default(&path);
+
+        let backup = fs::read(path.with_extension("json.invalid")).expect("backup");
+        assert_eq!(backup, [0xff, 0xfe, b'{']);
     }
 
     #[test]

@@ -134,7 +134,7 @@ Click **remove** on the card (or right-click → Remove). Confirm in the in-app 
 }
 ```
 
-Every save is validated: server names must be unique and must not contain `/`, `foreground_poll_secs` must be 5–120 and `background_poll_secs` 30–600. If the file cannot be parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
+Every change made through the app is validated: new server names must be unique and must not contain `/`, and changed intervals must be 5–120 s (`foreground_poll_secs`) and 30–600 s (`background_poll_secs`). Existing entries that break these rules still load and do not block other edits. If the file cannot be read or parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
 
 ## Architecture
 

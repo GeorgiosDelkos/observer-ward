@@ -1,19 +1,14 @@
 //! macOS tray icon, popover show/hide, and blur-grace handling.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use tauri::image::Image;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, Manager};
+use tauri::{App, AppHandle, Manager, WebviewWindow};
 use tauri_plugin_positioner::{Position, WindowExt};
 use tokio::sync::Notify;
-
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
 
 /// Skip hide-on-blur for this long after a tray click shows the window.
 /// macOS focuses out immediately after that show.
@@ -24,11 +19,68 @@ const TRAY_SHOW_BLUR_GRACE_MS: u64 = 500;
 /// hides the popover ~80ms before the mouse-up that would toggle it.
 const TRAY_CLICK_CLOSE_GRACE_MS: u64 = 250;
 
+/// Stored in a timestamp atomic that has never been written.
+const NEVER: u64 = u64::MAX;
+
+/// What the tray icon shows. Chosen by the poller, drawn here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrayIconKind {
+    Default,
+    Warn,
+    Crit,
+    Restart,
+}
+
+/// Tray PNGs, decoded once at startup.
+struct TrayIcons {
+    default: Image<'static>,
+    warn: Image<'static>,
+    crit: Image<'static>,
+    restart: Image<'static>,
+}
+
+impl TrayIcons {
+    fn decode() -> tauri::Result<Self> {
+        Ok(Self {
+            default: Image::from_bytes(include_bytes!("../icons/tray-default.png"))?,
+            warn: Image::from_bytes(include_bytes!("../icons/tray-warn.png"))?,
+            crit: Image::from_bytes(include_bytes!("../icons/tray-crit.png"))?,
+            restart: Image::from_bytes(include_bytes!("../icons/tray-restart.png"))?,
+        })
+    }
+
+    /// The image for `kind` and whether macOS should tint it as a
+    /// template (only the monochrome default icon).
+    fn get(&self, kind: TrayIconKind) -> (&Image<'static>, bool) {
+        match kind {
+            TrayIconKind::Default => (&self.default, true),
+            TrayIconKind::Warn => (&self.warn, false),
+            TrayIconKind::Crit => (&self.crit, false),
+            TrayIconKind::Restart => (&self.restart, false),
+        }
+    }
+}
+
+fn tooltip(kind: TrayIconKind) -> &'static str {
+    match kind {
+        TrayIconKind::Default => "Observer Ward — all clear",
+        TrayIconKind::Warn => "Observer Ward — warning",
+        TrayIconKind::Crit => "Observer Ward — critical",
+        TrayIconKind::Restart => "Observer Ward — restart detected",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayLeftClickAction {
     Show,
     Hide,
     AlreadyClosed,
+}
+
+/// Milliseconds between two readings of the monotonic clock, or `None`
+/// when `then` was never recorded.
+fn since(now_ms: u64, then_ms: u64) -> Option<u64> {
+    (then_ms != NEVER).then(|| now_ms.saturating_sub(then_ms))
 }
 
 fn tray_left_click_action(
@@ -39,46 +91,82 @@ fn tray_left_click_action(
     if window_visible {
         return TrayLeftClickAction::Hide;
     }
-    if now_ms.saturating_sub(last_blur_hide_ms) < TRAY_CLICK_CLOSE_GRACE_MS {
-        return TrayLeftClickAction::AlreadyClosed;
+    match since(now_ms, last_blur_hide_ms) {
+        Some(elapsed) if elapsed < TRAY_CLICK_CLOSE_GRACE_MS => TrayLeftClickAction::AlreadyClosed,
+        Some(_) | None => TrayLeftClickAction::Show,
     }
-    TrayLeftClickAction::Show
 }
 
 fn should_skip_blur_hide(now_ms: u64, last_tray_show_ms: u64, native_dialog_open: bool) -> bool {
     // A native panel (file picker) takes key focus from the popover; hiding
     // then would dismiss the form the user is filling in.
-    native_dialog_open || now_ms.saturating_sub(last_tray_show_ms) < TRAY_SHOW_BLUR_GRACE_MS
+    native_dialog_open
+        || since(now_ms, last_tray_show_ms).is_some_and(|elapsed| elapsed < TRAY_SHOW_BLUR_GRACE_MS)
 }
 
+/// Tray handle plus the click/blur bookkeeping, managed as Tauri state.
+///
+/// Timestamps are milliseconds since `epoch`, a monotonic `Instant`. Wall
+/// clock time would let an NTP step or sleep/wake adjustment backwards
+/// keep the grace windows open, swallowing clicks until it caught up.
 pub(crate) struct TrayState {
-    pub(crate) icon: Mutex<tauri::tray::TrayIcon>,
-    pub(crate) icon_reset: AtomicBool,
-    /// Millisecond timestamp of the last tray-click window show.
-    /// The blur handler skips hide events within a short grace
-    /// period to prevent the tray click from immediately
-    /// dismissing the window on macOS.
-    pub(crate) last_tray_show_ms: AtomicU64,
-    /// Millisecond timestamp of the last hide-on-blur. Used to
-    /// ignore the trailing tray mouse-up after macOS 27 steals
-    /// key focus on mouse-down.
-    pub(crate) last_blur_hide_ms: AtomicU64,
+    /// Behind a mutex so the icon, template flag and tooltip of one update
+    /// are applied together, never interleaved with another update.
+    icon: Mutex<TrayIcon>,
+    icons: TrayIcons,
+    epoch: Instant,
+    /// Set when a tray click resets the icon, so the poller re-applies
+    /// the current level even if it has not changed.
+    icon_reset: AtomicBool,
+    /// When a tray click last showed the window. The blur handler skips
+    /// hide events within a short grace period after it.
+    last_tray_show_ms: AtomicU64,
+    /// When hide-on-blur last ran. Used to ignore the trailing tray
+    /// mouse-up after macOS 27 steals key focus on mouse-down.
+    last_blur_hide_ms: AtomicU64,
     /// Number of native dialogs opened from the popover that are still on
     /// screen. A count, not a flag, so closing one of two overlapping
     /// dialogs does not re-enable hide-on-blur under the other. Changed
     /// only through [`NativeDialogGuard`].
-    pub(crate) native_dialogs_open: AtomicUsize,
+    native_dialogs_open: AtomicUsize,
+}
+
+impl TrayState {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(NEVER - 1)
+    }
+
+    /// Draw `kind` on the tray icon.
+    pub(crate) fn show_kind(&self, kind: TrayIconKind) {
+        let (image, is_template) = self.icons.get(kind);
+        let tray = self.icon.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if let Err(e) = tray.set_icon(Some(image.clone())) {
+            tracing::warn!("failed to set tray icon: {e}");
+        }
+        if let Err(e) = tray.set_icon_as_template(is_template) {
+            tracing::warn!("failed to set tray icon template flag: {e}");
+        }
+        if let Err(e) = tray.set_tooltip(Some(tooltip(kind))) {
+            tracing::warn!("failed to set tray tooltip: {e}");
+        }
+    }
+
+    /// True once after each tray click reset the icon.
+    pub(crate) fn take_icon_reset(&self) -> bool {
+        self.icon_reset.swap(false, Ordering::AcqRel)
+    }
 }
 
 /// Keeps the popover from hiding on blur while a native dialog is open.
 /// Clears the flag on drop, so an early return or a cancelled command
 /// future cannot leave hide-on-blur disabled.
-pub(crate) struct NativeDialogGuard(tauri::AppHandle);
+pub(crate) struct NativeDialogGuard(AppHandle);
 
 impl NativeDialogGuard {
-    pub(crate) fn open(app: &tauri::AppHandle) -> Self {
+    pub(crate) fn open(app: &AppHandle) -> Self {
         if let Some(state) = app.try_state::<TrayState>() {
-            state.native_dialogs_open.fetch_add(1, Ordering::AcqRel);
+            state.native_dialogs_open.fetch_add(1, Ordering::Relaxed);
         }
         Self(app.clone())
     }
@@ -89,10 +177,11 @@ impl Drop for NativeDialogGuard {
         if let Some(state) = self.0.try_state::<TrayState>() {
             // Saturating: TrayState is managed before any command can run,
             // so open and drop always see it, but never wrap on a mismatch.
-            let _ =
+            // The closure always returns Some, so the update cannot fail.
+            let _always_ok =
                 state
                     .native_dialogs_open
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
                     });
         }
@@ -104,7 +193,7 @@ pub(crate) fn setup_tray_and_window(
     is_visible: &Arc<AtomicBool>,
     wake: &Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = Image::from_bytes(include_bytes!("../icons/tray-default.png"))?;
+    let icons = TrayIcons::decode()?;
 
     // Do not attach an NSMenu to the status item. On macOS 27 AppKit
     // swallows mouse events while a menu is attached, so every click
@@ -113,8 +202,9 @@ pub(crate) fn setup_tray_and_window(
     let tray_visible = Arc::clone(is_visible);
     let tray_wake = Arc::clone(wake);
     let tray = TrayIconBuilder::new()
-        .icon(icon)
+        .icon(icons.default.clone())
         .icon_as_template(true)
+        .tooltip(tooltip(TrayIconKind::Default))
         .on_tray_icon_event(move |tray, event| {
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
 
@@ -124,16 +214,18 @@ pub(crate) fn setup_tray_and_window(
                 ..
             } = event
             {
-                handle_tray_left_click(tray, &tray_visible, &tray_wake);
+                handle_tray_left_click(tray.app_handle(), &tray_visible, &tray_wake);
             }
         })
         .build(app)?;
 
     app.manage(TrayState {
         icon: Mutex::new(tray),
+        icons,
+        epoch: Instant::now(),
         icon_reset: AtomicBool::new(false),
-        last_tray_show_ms: AtomicU64::new(0),
-        last_blur_hide_ms: AtomicU64::new(0),
+        last_tray_show_ms: AtomicU64::new(NEVER),
+        last_blur_hide_ms: AtomicU64::new(NEVER),
         native_dialogs_open: AtomicUsize::new(0),
     });
 
@@ -152,24 +244,24 @@ pub(crate) fn setup_tray_and_window(
     Ok(())
 }
 
-fn handle_tray_left_click(tray: &TrayIcon, tray_visible: &AtomicBool, tray_wake: &Notify) {
-    let app = tray.app_handle();
+fn handle_tray_left_click(app: &AppHandle, visible: &AtomicBool, wake: &Notify) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let visible = window.is_visible().unwrap_or(false);
-    let last_blur = app
-        .try_state::<TrayState>()
-        .map_or(0, |s| s.last_blur_hide_ms.load(Ordering::Acquire));
+    let Some(state) = app.try_state::<TrayState>() else {
+        return;
+    };
+    let window_visible = window.is_visible().unwrap_or(false);
+    let last_blur = state.last_blur_hide_ms.load(Ordering::Relaxed);
 
-    match tray_left_click_action(visible, unix_now_ms(), last_blur) {
-        TrayLeftClickAction::Hide => hide_tray_window(&window, tray_visible, tray_wake),
+    match tray_left_click_action(window_visible, state.now_ms(), last_blur) {
+        TrayLeftClickAction::Hide => hide_tray_window(&window, visible, wake),
         TrayLeftClickAction::AlreadyClosed => {}
-        TrayLeftClickAction::Show => show_tray_window(tray, &window, tray_visible, tray_wake),
+        TrayLeftClickAction::Show => show_tray_window(&state, &window, visible, wake),
     }
 }
 
-fn hide_tray_window(window: &tauri::WebviewWindow, visible: &AtomicBool, wake: &Notify) {
+fn hide_tray_window(window: &WebviewWindow, visible: &AtomicBool, wake: &Notify) {
     if let Err(e) = window.hide() {
         tracing::warn!("failed to hide window: {e}");
     }
@@ -177,24 +269,20 @@ fn hide_tray_window(window: &tauri::WebviewWindow, visible: &AtomicBool, wake: &
     wake.notify_one();
 }
 
+/// Show the popover. Opening it acknowledges the current state, so the
+/// icon drops back to the default until the poller sees a new level.
 fn show_tray_window(
-    tray: &TrayIcon,
-    window: &tauri::WebviewWindow,
+    state: &TrayState,
+    window: &WebviewWindow,
     visible: &AtomicBool,
     wake: &Notify,
 ) {
-    let app = tray.app_handle();
-    if let Ok(img) = Image::from_bytes(include_bytes!("../icons/tray-default.png")) {
-        let _ = tray.set_icon(Some(img));
-        let _ = tray.set_icon_as_template(true);
-        let _ = tray.set_tooltip(Some("Observer Ward"));
-    }
-    if let Some(state) = app.try_state::<TrayState>() {
-        state.icon_reset.store(true, Ordering::Release);
-        state
-            .last_tray_show_ms
-            .store(unix_now_ms(), Ordering::Release);
-    }
+    state.show_kind(TrayIconKind::Default);
+    state.icon_reset.store(true, Ordering::Release);
+    state
+        .last_tray_show_ms
+        .store(state.now_ms(), Ordering::Relaxed);
+
     if let Err(e) = window.move_window(Position::TrayCenter) {
         tracing::warn!("failed to position window: {e}");
     }
@@ -209,22 +297,22 @@ fn show_tray_window(
 }
 
 fn handle_window_blur(
-    app: &tauri::AppHandle,
-    window: &tauri::WebviewWindow,
+    app: &AppHandle,
+    window: &WebviewWindow,
     visible: &AtomicBool,
     wake: &Notify,
 ) {
     if !visible.load(Ordering::Acquire) {
         return;
     }
-    let now = unix_now_ms();
     if let Some(state) = app.try_state::<TrayState>() {
-        let shown_at = state.last_tray_show_ms.load(Ordering::Acquire);
-        let dialog_open = state.native_dialogs_open.load(Ordering::Acquire) > 0;
+        let now = state.now_ms();
+        let shown_at = state.last_tray_show_ms.load(Ordering::Relaxed);
+        let dialog_open = state.native_dialogs_open.load(Ordering::Relaxed) > 0;
         if should_skip_blur_hide(now, shown_at, dialog_open) {
             return;
         }
-        state.last_blur_hide_ms.store(now, Ordering::Release);
+        state.last_blur_hide_ms.store(now, Ordering::Relaxed);
     }
     hide_tray_window(window, visible, wake);
 }
@@ -232,22 +320,19 @@ fn handle_window_blur(
 #[cfg(test)]
 mod tests {
     use super::{
-        TRAY_CLICK_CLOSE_GRACE_MS, TRAY_SHOW_BLUR_GRACE_MS, TrayLeftClickAction,
-        should_skip_blur_hide, tray_left_click_action, unix_now_ms,
+        NEVER, TRAY_CLICK_CLOSE_GRACE_MS, TRAY_SHOW_BLUR_GRACE_MS, TrayIcons, TrayLeftClickAction,
+        should_skip_blur_hide, tray_left_click_action,
     };
 
     #[test]
-    fn unix_now_ms_is_millisecond_resolution() {
-        let a = unix_now_ms();
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        let b = unix_now_ms();
-        assert!(b > a, "expected millisecond tick, got {a} then {b}");
+    fn bundled_tray_icons_decode() {
+        assert!(TrayIcons::decode().is_ok());
     }
 
     #[test]
     fn tray_left_click_hides_when_window_is_visible() {
         assert_eq!(
-            tray_left_click_action(true, 10_000, 0),
+            tray_left_click_action(true, 10_000, NEVER),
             TrayLeftClickAction::Hide
         );
     }
@@ -255,9 +340,20 @@ mod tests {
     #[test]
     fn tray_left_click_shows_when_window_is_hidden() {
         assert_eq!(
-            tray_left_click_action(false, 10_000, 0),
+            tray_left_click_action(false, 10_000, NEVER),
             TrayLeftClickAction::Show
         );
+    }
+
+    #[test]
+    fn first_click_right_after_launch_shows() {
+        // With a process-relative clock "now" is tiny at startup; a
+        // never-recorded blur must not read as "just hidden".
+        assert_eq!(
+            tray_left_click_action(false, 5, NEVER),
+            TrayLeftClickAction::Show
+        );
+        assert!(!should_skip_blur_hide(5, NEVER, false));
     }
 
     #[test]
@@ -279,20 +375,6 @@ mod tests {
         let later = hidden_at + TRAY_CLICK_CLOSE_GRACE_MS;
         assert_eq!(
             tray_left_click_action(false, later, hidden_at),
-            TrayLeftClickAction::Show
-        );
-    }
-
-    #[test]
-    fn hidden_window_blur_must_not_block_next_show() {
-        // If last_blur_hide_ms is stamped while already hidden, a tray
-        // mouse-up within 250ms would be AlreadyClosed instead of Show.
-        assert_eq!(
-            tray_left_click_action(false, 10_080, 10_000),
-            TrayLeftClickAction::AlreadyClosed
-        );
-        assert_eq!(
-            tray_left_click_action(false, 10_080, 0),
             TrayLeftClickAction::Show
         );
     }

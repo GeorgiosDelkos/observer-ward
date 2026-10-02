@@ -3,18 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tauri::image::Image;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
-
-struct TrayIcons {
-    default: Image<'static>,
-    warn: Image<'static>,
-    crit: Image<'static>,
-    restart: Image<'static>,
-}
 
 use crate::config::{AppConfig, ServerConfig};
 use crate::grafana::{GrafanaBackend, read_token};
@@ -24,7 +16,7 @@ use crate::metrics::{
     ServerStatus, classify_level, has_restarts, newly_firing, worst_alert_level, worst_level,
 };
 use crate::ssh::SshBackend;
-use crate::tray::TrayState;
+use crate::tray::{TrayIconKind, TrayState};
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
@@ -45,14 +37,6 @@ fn backoff_decision(count: u32, elapsed: Duration) -> BackoffDecision {
         return BackoffDecision::Hold;
     }
     BackoffDecision::Expired
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrayIconKind {
-    Default,
-    Warn,
-    Crit,
-    Restart,
 }
 
 /// Crit always wins over a restart badge so a hot cluster is not
@@ -127,7 +111,6 @@ pub(crate) struct Poller {
     grafana_backend: Option<GrafanaBackend>,
     prev_alert_fingerprints: HashSet<String>,
     last_good_grafana_alerts: Vec<Alert>,
-    tray_icons: Option<TrayIcons>,
     prev_tray_state: Option<(MetricLevel, bool)>,
     latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
     latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
@@ -135,7 +118,6 @@ pub(crate) struct Poller {
 
 impl Poller {
     pub(crate) fn new(handles: PollerHandles) -> Self {
-        let tray_icons = Self::load_tray_icons();
         Self {
             app_handle: handles.app_handle,
             config_state: handles.config_state,
@@ -148,31 +130,10 @@ impl Poller {
             grafana_backend: None,
             prev_alert_fingerprints: HashSet::new(),
             last_good_grafana_alerts: Vec::new(),
-            tray_icons,
             prev_tray_state: None,
             latest_metrics: handles.latest_metrics,
             latest_alerts: handles.latest_alerts,
         }
-    }
-
-    /// Parse tray icon PNGs once at startup.
-    fn load_tray_icons() -> Option<TrayIcons> {
-        let icons = (|| {
-            let default = Image::from_bytes(include_bytes!("../icons/tray-default.png")).ok()?;
-            let warn = Image::from_bytes(include_bytes!("../icons/tray-warn.png")).ok()?;
-            let crit = Image::from_bytes(include_bytes!("../icons/tray-crit.png")).ok()?;
-            let restart = Image::from_bytes(include_bytes!("../icons/tray-restart.png")).ok()?;
-            Some(TrayIcons {
-                default,
-                warn,
-                crit,
-                restart,
-            })
-        })();
-        if icons.is_none() {
-            tracing::warn!("failed to decode one or more tray icon PNGs");
-        }
-        icons
     }
 
     pub(crate) async fn run(&mut self) {
@@ -393,56 +354,21 @@ impl Poller {
     }
 
     fn update_tray_icon(&mut self, metrics: &[ServerMetrics], alerts: &[Alert]) {
-        let Some(icons) = &self.tray_icons else {
-            return;
-        };
-
-        let level = worst_level(metrics).max(worst_alert_level(alerts));
-        let restarts = has_restarts(metrics);
-
         let Some(state) = self.app_handle.try_state::<TrayState>() else {
             return;
         };
-
-        if state.icon_reset.swap(false, Ordering::Acquire) {
+        if state.take_icon_reset() {
             self.prev_tray_state = None;
         }
 
-        let new_state = (level, restarts);
+        let level = worst_level(metrics).max(worst_alert_level(alerts));
+        let new_state = (level, has_restarts(metrics));
         if self.prev_tray_state == Some(new_state) {
             return;
         }
         self.prev_tray_state = Some(new_state);
 
-        let Ok(tray) = state.icon.lock() else {
-            return;
-        };
-
-        let kind = tray_icon_kind(level, restarts);
-        let tooltip = match kind {
-            TrayIconKind::Restart => "Observer Ward — restart detected",
-            TrayIconKind::Default => "Observer Ward — all clear",
-            TrayIconKind::Warn => "Observer Ward — warning",
-            TrayIconKind::Crit => "Observer Ward — critical",
-        };
-
-        if let Err(e) = tray.set_tooltip(Some(tooltip)) {
-            tracing::warn!("failed to set tray tooltip: {e}");
-        }
-
-        let (icon, is_template) = match kind {
-            TrayIconKind::Restart => (&icons.restart, false),
-            TrayIconKind::Default => (&icons.default, true),
-            TrayIconKind::Warn => (&icons.warn, false),
-            TrayIconKind::Crit => (&icons.crit, false),
-        };
-
-        if let Err(e) = tray.set_icon(Some(icon.clone())) {
-            tracing::warn!("failed to set tray icon: {e}");
-        }
-        if let Err(e) = tray.set_icon_as_template(is_template) {
-            tracing::warn!("failed to set icon template: {e}");
-        }
+        state.show_kind(tray_icon_kind(new_state.0, new_state.1));
     }
 
     fn check_and_notify(&mut self, enabled: bool, metrics: &[ServerMetrics]) {

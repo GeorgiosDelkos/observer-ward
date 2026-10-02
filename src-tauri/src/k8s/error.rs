@@ -86,26 +86,17 @@ pub(crate) enum K8sError {
 /// Carries the offending value and underlying numeric-parse cause as
 /// typed fields rather than a formatted string (axiom `rust_quality_63`).
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub(crate) enum QuantityParseError {
-    #[error("invalid cpu quantity {value}")]
-    Cpu {
+    #[error("invalid quantity {value}: unknown suffix")]
+    Suffix { value: String },
+    #[error("invalid quantity {value}")]
+    Number {
         value: String,
         #[source]
         source: std::num::ParseFloatError,
     },
-    #[error("invalid memory quantity {value}")]
-    MemoryInt {
-        value: String,
-        #[source]
-        source: std::num::ParseIntError,
-    },
-    #[error("invalid memory quantity {value}")]
-    MemoryFloat {
-        value: String,
-        #[source]
-        source: std::num::ParseFloatError,
-    },
-    #[error("memory quantity {value} overflows u64")]
-    MemoryOverflow { value: String },
+    #[error("quantity {value} is negative")]
+    Negative { value: String },
+    #[error("quantity {value} overflows u64")]
+    Overflow { value: String },
 }

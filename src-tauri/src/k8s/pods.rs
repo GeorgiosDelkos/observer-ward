@@ -167,11 +167,11 @@ pub(super) fn pod_restart_count(pod: Option<&Pod>) -> u32 {
         return 0;
     };
 
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "restart_count is always non-negative"
-    )]
-    statuses.iter().map(|cs| cs.restart_count as u32).sum()
+    // Saturating: a plain `sum` panics on overflow in debug builds, and a
+    // negative count from a misbehaving API server clamps to zero.
+    statuses.iter().fold(0_u32, |total, cs| {
+        total.saturating_add(u32::try_from(cs.restart_count).unwrap_or(0))
+    })
 }
 
 /// Extract the pod start time as an ISO 8601 string.
@@ -459,6 +459,15 @@ mod tests {
     fn restart_count_sums_containers() {
         let pod = make_pod_with_restarts("web", &[3, 1]);
         assert_eq!(pod_restart_count(Some(&pod)), 4);
+    }
+
+    #[test]
+    fn restart_count_saturates_and_ignores_negative_counts() {
+        let pod = make_pod_with_restarts("web", &[i32::MAX, i32::MAX, 5, -3]);
+        assert_eq!(pod_restart_count(Some(&pod)), u32::MAX);
+
+        let pod = make_pod_with_restarts("web", &[-3, 2]);
+        assert_eq!(pod_restart_count(Some(&pod)), 2);
     }
 
     #[test]

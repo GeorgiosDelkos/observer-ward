@@ -193,16 +193,11 @@ impl Drop for NativeDialogGuard {
 
 /// Keeps the process ineligible for automatic termination.
 ///
-/// `disableAutomaticTermination:` increments a process-wide counter.
-/// `NSProcessInfo.h` (macOS 27 SDK) says a count above zero makes the
-/// process ineligible, and that the count is recorded even before
-/// `automaticTerminationSupportEnabled` is set. This app does not set
-/// `NSSupportsAutomaticTermination`. `AppKit` still turns that support
-/// on for a window that stays ordered out: the log shows
-/// `_NSEnableAutomaticTerminationAndLog` and then
-/// `_kLSApplicationWouldBeTerminatedByTALKey`. Setting the support
-/// property to false is a documented no-op, so this unbalanced
-/// disable is the opt-out. The reason string is a debugging token.
+/// One unpaired `disableAutomaticTermination:` for the process
+/// lifetime. `AppKit` turns that support on for an ordered-out window,
+/// and setting `automaticTerminationSupportEnabled` to false is a
+/// no-op. The counter is recorded before support is enabled and
+/// applies once it is.
 ///
 /// <https://developer.apple.com/documentation/foundation/processinfo/disableautomatictermination(_:)>
 #[cfg(target_os = "macos")]

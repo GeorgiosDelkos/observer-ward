@@ -58,6 +58,16 @@ keyring = "4.2"
 # tray-icon under the macOS 27 tray-click workarounds. Upgrade them together.
 tauri-plugin-dialog = "2.7"
 
+# macOS only. Tauri 2.11.5 already links objc2-foundation 0.3.2; this
+# direct edge is so the process can call NSProcessInfo. Pin the exact
+# crate already in Cargo.lock: a newer 0.3 would replace the objc2
+# Tauri is built against.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "NSProcessInfo",
+    "NSString",
+] }
+
 [dev-dependencies]
 tempfile = "3.25"
 proptest = "1"

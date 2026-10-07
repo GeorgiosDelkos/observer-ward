@@ -42,6 +42,11 @@ use tray::setup_tray_and_window;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // Record the opt-out before AppKit enables automatic-termination
+    // support for the hidden popover. See `disable_automatic_termination`.
+    #[cfg(target_os = "macos")]
+    tray::disable_automatic_termination();
+
     let config_path = config::config_path()?;
     let initial_config = config::load_config_or_default(&config_path);
     let config = Arc::new(ConfigStore::new(config_path, initial_config));

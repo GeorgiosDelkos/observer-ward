@@ -1,9 +1,12 @@
-//! macOS tray icon, popover show/hide, and blur-grace handling.
+//! macOS tray icon, popover show/hide, blur-grace, and staying alive
+//! while that popover is hidden.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSProcessInfo, NSString};
 use tauri::image::Image;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager, WebviewWindow};
@@ -188,6 +191,26 @@ impl Drop for NativeDialogGuard {
     }
 }
 
+/// Keeps the process ineligible for automatic termination.
+///
+/// `disableAutomaticTermination:` increments a process-wide counter.
+/// `NSProcessInfo.h` (macOS 27 SDK) says a count above zero makes the
+/// process ineligible, and that the count is recorded even before
+/// `automaticTerminationSupportEnabled` is set. This app does not set
+/// `NSSupportsAutomaticTermination`. `AppKit` still turns that support
+/// on for a window that stays ordered out: the log shows
+/// `_NSEnableAutomaticTerminationAndLog` and then
+/// `_kLSApplicationWouldBeTerminatedByTALKey`. Setting the support
+/// property to false is a documented no-op, so this unbalanced
+/// disable is the opt-out. The reason string is a debugging token.
+///
+/// <https://developer.apple.com/documentation/foundation/processinfo/disableautomatictermination(_:)>
+#[cfg(target_os = "macos")]
+pub(crate) fn disable_automatic_termination() {
+    let reason = NSString::from_str("hidden tray popover");
+    NSProcessInfo::processInfo().disableAutomaticTermination(&reason);
+}
+
 pub(crate) fn setup_tray_and_window(
     app: &App,
     is_visible: &Arc<AtomicBool>,
@@ -319,10 +342,20 @@ fn handle_window_blur(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::disable_automatic_termination;
     use super::{
         NEVER, TRAY_CLICK_CLOSE_GRACE_MS, TRAY_SHOW_BLUR_GRACE_MS, TrayIcons, TrayLeftClickAction,
         should_skip_blur_hide, tray_left_click_action,
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disable_automatic_termination_returns() {
+        // The opt-out counter is a private ivar, so this only checks
+        // that the call returns.
+        disable_automatic_termination();
+    }
 
     #[test]
     fn bundled_tray_icons_decode() {

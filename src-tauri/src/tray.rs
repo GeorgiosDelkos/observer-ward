@@ -9,8 +9,7 @@ use std::time::Instant;
 use objc2_foundation::{NSProcessInfo, NSString};
 use tauri::image::Image;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, WebviewWindow};
-use tauri_plugin_positioner::{Position, WindowExt};
+use tauri::{App, AppHandle, Manager, PhysicalPosition, Position, Rect, Size, WebviewWindow};
 use tokio::sync::Notify;
 
 /// Skip hide-on-blur for this long after a tray click shows the window.
@@ -105,6 +104,84 @@ fn should_skip_blur_hide(now_ms: u64, last_tray_show_ms: u64, native_dialog_open
     // then would dismiss the form the user is filling in.
     native_dialog_open
         || since(now_ms, last_tray_show_ms).is_some_and(|elapsed| elapsed < TRAY_SHOW_BLUR_GRACE_MS)
+}
+
+/// Physical pixels of the status item that was clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayIconRect {
+    x: i32,
+    /// Top edge. On a macOS menu bar this is near zero.
+    y: i32,
+    width: i32,
+}
+
+/// Physical pixels of the popover's outer frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PopoverSize {
+    width: i32,
+    height: i32,
+}
+
+/// Read the status-item rectangle from a tray click.
+///
+/// tray-icon 0.24 reports a physical rectangle, and Tauri stores it as
+/// `Position::Physical` / `Size::Physical`. A logical rectangle is not
+/// produced on this path. Returning `None` skips placement instead of
+/// guessing a scale factor.
+fn tray_icon_rect(rect: &Rect) -> Option<TrayIconRect> {
+    let (x, y) = match rect.position {
+        Position::Physical(position) => (position.x, position.y),
+        Position::Logical(_) => return None,
+    };
+    let width = match rect.size {
+        Size::Physical(size) => i32::try_from(size.width).ok()?,
+        Size::Logical(_) => return None,
+    };
+    Some(TrayIconRect { x, y, width })
+}
+
+/// Top-left of a popover centered on a menu-bar icon.
+///
+/// The rect is already global physical pixels, so no monitor origin is added.
+/// When `icon.y - popover.height` would be negative or overflow, the top is
+/// pinned to the icon so the popover hangs downward.
+fn popover_origin(icon: TrayIconRect, popover: PopoverSize) -> (i32, i32) {
+    let x = icon
+        .x
+        .saturating_add(icon.width / 2)
+        .saturating_sub(popover.width / 2);
+    let y = match icon.y.checked_sub(popover.height) {
+        Some(y) if y >= 0 => y,
+        Some(_) | None => icon.y,
+    };
+    (x, y)
+}
+
+fn popover_size(outer_width: u32, outer_height: u32) -> Option<PopoverSize> {
+    Some(PopoverSize {
+        width: i32::try_from(outer_width).ok()?,
+        height: i32::try_from(outer_height).ok()?,
+    })
+}
+
+/// Place the popover centered on the icon. A failure leaves it where it is
+/// and still lets the caller show it: placement must not take the process down.
+fn place_popover(window: &WebviewWindow, icon: TrayIconRect) {
+    let outer = match window.outer_size() {
+        Ok(outer) => outer,
+        Err(e) => {
+            tracing::warn!("failed to read popover size: {e}");
+            return;
+        }
+    };
+    let Some(popover) = popover_size(outer.width, outer.height) else {
+        tracing::warn!("popover size does not fit in a screen coordinate");
+        return;
+    };
+    let (x, y) = popover_origin(icon, popover);
+    if let Err(e) = window.set_position(PhysicalPosition::new(x, y)) {
+        tracing::warn!("failed to position window: {e}");
+    }
 }
 
 /// Tray handle plus the click/blur bookkeeping, managed as Tauri state.
@@ -224,15 +301,19 @@ pub(crate) fn setup_tray_and_window(
         .icon_as_template(true)
         .tooltip(tooltip(TrayIconKind::Default))
         .on_tray_icon_event(move |tray, event| {
-            tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
-
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
+                rect,
                 ..
             } = event
             {
-                handle_tray_left_click(tray.app_handle(), &tray_visible, &tray_wake);
+                handle_tray_left_click(
+                    tray.app_handle(),
+                    &tray_visible,
+                    &tray_wake,
+                    tray_icon_rect(&rect),
+                );
             }
         })
         .build(app)?;
@@ -262,7 +343,12 @@ pub(crate) fn setup_tray_and_window(
     Ok(())
 }
 
-fn handle_tray_left_click(app: &AppHandle, visible: &AtomicBool, wake: &Notify) {
+fn handle_tray_left_click(
+    app: &AppHandle,
+    visible: &AtomicBool,
+    wake: &Notify,
+    icon: Option<TrayIconRect>,
+) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -275,7 +361,7 @@ fn handle_tray_left_click(app: &AppHandle, visible: &AtomicBool, wake: &Notify) 
     match tray_left_click_action(window_visible, state.now_ms(), last_blur) {
         TrayLeftClickAction::Hide => hide_tray_window(&window, visible, wake),
         TrayLeftClickAction::AlreadyClosed => {}
-        TrayLeftClickAction::Show => show_tray_window(&state, &window, visible, wake),
+        TrayLeftClickAction::Show => show_tray_window(&state, &window, visible, wake, icon),
     }
 }
 
@@ -294,6 +380,7 @@ fn show_tray_window(
     window: &WebviewWindow,
     visible: &AtomicBool,
     wake: &Notify,
+    icon: Option<TrayIconRect>,
 ) {
     state.show_kind(TrayIconKind::Default);
     state.icon_reset.store(true, Ordering::Release);
@@ -301,9 +388,13 @@ fn show_tray_window(
         .last_tray_show_ms
         .store(state.now_ms(), Ordering::Relaxed);
 
-    if let Err(e) = window.move_window(Position::TrayCenter) {
-        tracing::warn!("failed to position window: {e}");
+    match icon {
+        Some(icon) => place_popover(window, icon),
+        None => {
+            tracing::warn!("tray click had no physical icon rect; leaving the popover where it is");
+        }
     }
+
     if let Err(e) = window.show() {
         tracing::warn!("failed to show window: {e}");
     }
@@ -340,9 +431,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::disable_automatic_termination;
     use super::{
-        NEVER, TRAY_CLICK_CLOSE_GRACE_MS, TRAY_SHOW_BLUR_GRACE_MS, TrayIcons, TrayLeftClickAction,
-        should_skip_blur_hide, tray_left_click_action,
+        NEVER, PopoverSize, TRAY_CLICK_CLOSE_GRACE_MS, TRAY_SHOW_BLUR_GRACE_MS, TrayIconRect,
+        TrayIcons, TrayLeftClickAction, popover_origin, popover_size, should_skip_blur_hide,
+        tray_icon_rect, tray_left_click_action,
     };
+    use tauri::{PhysicalPosition, PhysicalSize, Position, Rect, Size};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -429,5 +522,117 @@ mod tests {
         let much_later = shown_at + 60_000;
         assert!(should_skip_blur_hide(much_later, shown_at, true));
         assert!(!should_skip_blur_hide(much_later, shown_at, false));
+    }
+
+    #[test]
+    fn popover_hangs_from_a_top_menu_bar() {
+        // Icon frame from the 2026-10-08 death, after the menu bar moved
+        // onto the built-in display. Subtracting the popover height would
+        // place it above the screen.
+        let (x, y) = popover_origin(
+            TrayIconRect {
+                x: 999,
+                y: 4,
+                width: 35,
+            },
+            PopoverSize {
+                width: 380,
+                height: 120,
+            },
+        );
+        assert_eq!(x, 999 + 35 / 2 - 380 / 2);
+        assert_eq!(y, 4);
+    }
+
+    #[test]
+    fn popover_sits_above_an_icon_when_there_is_room() {
+        let (x, y) = popover_origin(
+            TrayIconRect {
+                x: 1_000,
+                y: 800,
+                width: 36,
+            },
+            PopoverSize {
+                width: 380,
+                height: 120,
+            },
+        );
+        assert_eq!(x, 1_000 + 36 / 2 - 380 / 2);
+        assert_eq!(y, 800 - 120);
+    }
+
+    #[test]
+    fn popover_touches_the_top_when_it_fits_exactly() {
+        let (_, y) = popover_origin(
+            TrayIconRect {
+                x: 0,
+                y: 120,
+                width: 10,
+            },
+            PopoverSize {
+                width: 10,
+                height: 120,
+            },
+        );
+        assert_eq!(y, 0);
+    }
+
+    #[test]
+    fn popover_origin_does_not_panic_when_subtraction_overflows() {
+        let (_, y) = popover_origin(
+            TrayIconRect {
+                x: i32::MAX,
+                y: i32::MIN,
+                width: i32::MAX,
+            },
+            PopoverSize {
+                width: i32::MAX,
+                height: 1,
+            },
+        );
+        assert_eq!(y, i32::MIN);
+    }
+
+    #[test]
+    fn tray_icon_rect_reads_a_physical_click() {
+        let rect = Rect {
+            position: Position::Physical(PhysicalPosition::new(999, 4)),
+            size: Size::Physical(PhysicalSize::new(35, 29)),
+        };
+        assert_eq!(
+            tray_icon_rect(&rect),
+            Some(TrayIconRect {
+                x: 999,
+                y: 4,
+                width: 35,
+            })
+        );
+    }
+
+    #[test]
+    fn tray_icon_rect_rejects_a_logical_rect() {
+        let rect = Rect {
+            position: Position::Logical(tauri::LogicalPosition::new(10.0, 4.0)),
+            size: Size::Physical(PhysicalSize::new(35, 29)),
+        };
+        assert_eq!(tray_icon_rect(&rect), None);
+    }
+
+    #[test]
+    fn tray_icon_rect_rejects_a_width_that_does_not_fit_i32() {
+        let rect = Rect {
+            position: Position::Physical(PhysicalPosition::new(0, 0)),
+            size: Size::Physical(PhysicalSize::new(u32::MAX, 1)),
+        };
+        assert_eq!(tray_icon_rect(&rect), None);
+    }
+
+    #[test]
+    fn popover_size_rejects_a_dimension_that_does_not_fit_i32() {
+        assert_eq!(
+            popover_size(380, 120).map(|size| (size.width, size.height)),
+            Some((380, 120))
+        );
+        assert!(popover_size(u32::MAX, 120).is_none());
     }
 }

@@ -109,20 +109,16 @@ fn should_skip_blur_hide(now_ms: u64, last_tray_show_ms: u64, native_dialog_open
 /// Physical pixels of the status item that was clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrayIconRect {
-    /// Left edge.
     x: i32,
     /// Top edge. On a macOS menu bar this is near zero.
     y: i32,
-    /// Width. The popover is centered on this.
     width: i32,
 }
 
 /// Physical pixels of the popover's outer frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PopoverSize {
-    /// Outer width.
     width: i32,
-    /// Outer height.
     height: i32,
 }
 
@@ -146,17 +142,9 @@ fn tray_icon_rect(rect: &Rect) -> Option<TrayIconRect> {
 
 /// Top-left of a popover centered on a menu-bar icon.
 ///
-/// When `icon.y - popover.height` would be negative or overflow, the top of
-/// the popover is pinned to the icon so it hangs downward. That is the macOS
-/// menu-bar case. It is the same rule `tauri-plugin-positioner` 2.3.2 used
-/// for `Position::TrayCenter`.
-///
-/// The click rect is already in global physical pixels: tray-icon 0.24
-/// `get_tray_rect` flips the status item into main-display top-left space,
-/// then converts to physical pixels. `TrayCenter` did not add a monitor
-/// origin. It still called `current_monitor()?.unwrap()` before that match.
-/// For a hidden window that call is `Ok(None)` after its display goes away
-/// (`NSWindow.screen` is nil). The unwrap panicked and the process exited 101.
+/// The rect is already global physical pixels, so no monitor origin is added.
+/// When `icon.y - popover.height` would be negative or overflow, the top is
+/// pinned to the icon so the popover hangs downward.
 fn popover_origin(icon: TrayIconRect, popover: PopoverSize) -> (i32, i32) {
     let x = icon
         .x

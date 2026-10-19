@@ -29,75 +29,86 @@ pub(super) struct PodContext<'a> {
     pub(super) job_owners: &'a JobOwners,
 }
 
-/// One card per pod in the namespace. Pods present in metrics-server get
-/// usage; pods only in the spec list (Pending, crash-looping with no
-/// samples) still get a card so they are not invisible. Succeeded pods
-/// and pods of hidden workloads are skipped.
+/// One card per pod in the pod listing, with usage when metrics-server has
+/// a sample for it. Pending or crash-looping pods without a sample still get
+/// a card so they are not invisible. Succeeded pods and pods of hidden
+/// workloads get none.
+///
+/// A sample whose pod is not in the listing is ignored: both lists come
+/// from one poll, so that pod is already gone, and with no spec its owner
+/// is unknown, so a hidden workload's pod would come back unhideable.
 pub(super) fn assemble_pods(
     samples: &[PodMetricsSample],
     specs: &[Pod],
     ctx: &PodContext<'_>,
 ) -> Vec<PodMetrics> {
-    let spec_by_name: HashMap<&str, (&Pod, WorkloadRef)> = specs
+    let sample_by_name: HashMap<&str, &PodMetricsSample> = samples
         .iter()
-        .filter_map(|pod| {
-            let name = pod.metadata.name.as_deref()?;
-            Some((name, (pod, pod_workload(name, pod, ctx.job_owners))))
+        .filter_map(|s| s.metadata.name.as_deref().map(|n| (n, s)))
+        .collect();
+
+    let mut pods: Vec<PodMetrics> = specs
+        .iter()
+        .filter_map(|spec| {
+            let name = spec.metadata.name.as_deref()?;
+            if derive_pod_status(spec) == Some(PodStatus::Succeeded) {
+                return None;
+            }
+            let workload = pod_workload(name, spec, ctx.job_owners);
+            if is_hidden(&workload, ctx) {
+                return None;
+            }
+            let usage = sample_by_name.get(name).and_then(|sample| {
+                sample_usage(name, sample, spec, ctx)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            "ignoring metrics for pod {name}: {}",
+                            crate::error::error_chain(e)
+                        );
+                    })
+                    .ok()
+            });
+            Some(pod_card(name, spec, workload, usage, ctx))
         })
         .collect();
-    // A pod without a spec has no known workload, so it is never hidden.
-    let hidden = |name: &str| {
-        spec_by_name
-            .get(name)
-            .is_some_and(|(_, workload)| ctx.hidden.contains(workload))
-    };
-
-    let mut pods = Vec::with_capacity(samples.len().max(specs.len()));
-    let mut seen = HashSet::new();
-
-    for sample in samples {
-        let Some(name) = sample.metadata.name.as_deref() else {
-            continue;
-        };
-        if hidden(name) {
-            continue;
-        }
-        let spec = spec_by_name
-            .get(name)
-            .map(|(pod, workload)| (*pod, workload));
-        match sample_usage(name, sample, spec.map(|(pod, _)| pod), ctx) {
-            Ok(usage) => {
-                seen.insert(name);
-                pods.push(pod_card(name, spec, Some(usage), ctx));
-            }
-            Err(e) => {
-                tracing::warn!("skipping pod {name}: {}", crate::error::error_chain(&e));
-            }
-        }
-    }
-
-    for (&name, (spec, workload)) in &spec_by_name {
-        if seen.contains(name)
-            || hidden(name)
-            || derive_pod_status(spec) == Some(PodStatus::Succeeded)
-        {
-            continue;
-        }
-        pods.push(pod_card(name, Some((spec, workload)), None, ctx));
-    }
 
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     pods
 }
 
-/// `spec` is the pod's spec and workload, when it was in the listing.
+/// Whether `workload` is hidden. A Job not resolved to its cron job (the
+/// Job list failed or is not allowed) is also matched by its name, which
+/// the cron job controller makes `<cron job>-<digits>`, so a hidden cron
+/// job stays hidden while its Jobs cannot be read.
+fn is_hidden(workload: &WorkloadRef, ctx: &PodContext<'_>) -> bool {
+    if ctx.hidden.contains(workload) {
+        return true;
+    }
+    if workload.kind != JOB || ctx.job_owners.contains_key(&workload.name) {
+        return false;
+    }
+    cron_job_by_name(&workload.name).is_some_and(|cron_job| {
+        ctx.hidden.contains(&WorkloadRef {
+            kind: CRON_JOB.to_string(),
+            name: cron_job.to_string(),
+        })
+    })
+}
+
+/// The cron job a Job named `<cron job>-<digits>` would belong to.
+fn cron_job_by_name(job: &str) -> Option<&str> {
+    let (cron_job, run) = job.rsplit_once('-')?;
+    let is_run = !run.is_empty() && run.bytes().all(|b| b.is_ascii_digit());
+    (is_run && !cron_job.is_empty()).then_some(cron_job)
+}
+
 fn pod_card(
     name: &str,
-    spec: Option<(&Pod, &WorkloadRef)>,
+    spec: &Pod,
+    workload: WorkloadRef,
     usage: Option<PodUsage>,
     ctx: &PodContext<'_>,
 ) -> PodMetrics {
-    let (workload, spec) = (spec.map(|(_, w)| w.clone()), spec.map(|(pod, _)| pod));
     let net = match (ctx.net.get(name), ctx.prev_net.get(name)) {
         (Some(now), Some(prev)) => now.rate_since(prev),
         (Some(_) | None, None) | (None, Some(_)) => None,
@@ -105,9 +116,9 @@ fn pod_card(
     PodMetrics {
         name: name.to_string(),
         workload,
-        status: spec.and_then(derive_pod_status),
-        restart_count: spec.map_or(0, pod_restart_count),
-        start_time: spec.and_then(pod_start_time),
+        status: derive_pod_status(spec),
+        restart_count: pod_restart_count(spec),
+        start_time: pod_start_time(spec),
         last_event: ctx.events.get(name).cloned(),
         usage,
         net,
@@ -120,7 +131,7 @@ fn pod_card(
 fn sample_usage(
     name: &str,
     sample: &PodMetricsSample,
-    spec: Option<&Pod>,
+    spec: &Pod,
     ctx: &PodContext<'_>,
 ) -> Result<PodUsage, K8sError> {
     let mut cpu_used = 0.0_f64;
@@ -130,7 +141,7 @@ fn sample_usage(
         mem_used = mem_used.saturating_add(parse_memory_quantity(&container.usage.memory)?);
     }
 
-    let (cpu_cap, mem_cap) = spec.map_or((None, None), pod_allocations);
+    let (cpu_cap, mem_cap) = pod_allocations(spec);
     let cpu_base = cpu_cap.unwrap_or(ctx.cluster_cpu);
     let mem_base = mem_cap.unwrap_or(ctx.cluster_mem);
     let disk = ctx.pvc.get(name);
@@ -609,7 +620,7 @@ mod tests {
         let usage = sample_usage(
             "hcfs-server",
             &sample("hcfs-server", "90m", "64Mi"),
-            Some(&spec),
+            &spec,
             &maps.ctx(),
         )
         .expect("usage");
@@ -680,7 +691,11 @@ mod tests {
             },
         );
 
-        let pods = assemble_pods(&[sample("web", "1m", "1Mi")], &[], &maps.ctx());
+        let pods = assemble_pods(
+            &[sample("web", "1m", "1Mi")],
+            &[named_pod("web")],
+            &maps.ctx(),
+        );
 
         let net = pods[0].net.expect("rate from two samples");
         assert_eq!((net.rx_bytes_per_sec, net.tx_bytes_per_sec), (2_000, 1_000));
@@ -848,15 +863,43 @@ mod tests {
             &[
                 sample("api-a", "10m", "1Mi"),
                 sample("web", "10m", "1Mi"),
-                sample("racing", "1m", "1Mi"),
+                sample("gone", "1m", "1Mi"),
             ],
             &[api_sampled, api_pending, named_pod("web")],
             &maps.ctx(),
         );
 
         let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["racing", "web"], "a pod without a spec is kept");
-        assert!(pods[0].workload.is_none());
+        assert_eq!(names, ["web"], "a sample whose pod is gone gets no card");
+        assert!(pods[0].usage.is_some());
+    }
+
+    #[test]
+    fn unresolved_runs_of_a_hidden_cron_job_stay_hidden() {
+        let mut run = owned_pod(JOB, "backup-29000000", None);
+        run.metadata.name = Some("backup-29000000-x".to_string());
+        let mut manual = owned_pod(JOB, "migrate-2", None);
+        manual.metadata.name = Some("migrate-2-x".to_string());
+        let mut maps = Maps::empty();
+        maps.hidden.insert(workload(CRON_JOB, "backup"));
+        maps.hidden.insert(workload(CRON_JOB, "migrate"));
+        // Listed and known to have no cron job: never matched by name.
+        maps.job_owners.insert("migrate-2".to_string(), None);
+
+        let pods = assemble_pods(&[], &[run, manual], &maps.ctx());
+
+        let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["migrate-2-x"]);
+    }
+
+    #[test]
+    fn cron_job_by_name_needs_a_numeric_run_suffix() {
+        assert_eq!(cron_job_by_name("backup-29000000"), Some("backup"));
+        assert_eq!(cron_job_by_name("db-backup-1"), Some("db-backup"));
+        assert_eq!(cron_job_by_name("backup-x1"), None);
+        assert_eq!(cron_job_by_name("backup-"), None);
+        assert_eq!(cron_job_by_name("-1"), None);
+        assert_eq!(cron_job_by_name("backup"), None);
     }
 
     proptest::proptest! {

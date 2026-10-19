@@ -226,7 +226,8 @@ pub struct K8sTarget {
     pub context: String,
     pub namespace: String,
     /// Workloads whose pods are not shown, counted in the tray, or raised
-    /// as threshold notifications (Grafana alerts are not filtered). Omitted from the file when empty, so older files load as is.
+    /// as threshold notifications (Grafana alerts are not filtered).
+    /// Omitted from the file when empty, so older files load as is.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden: BTreeSet<WorkloadRef>,
 }

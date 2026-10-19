@@ -580,9 +580,6 @@ function hiddenWorkloads(cluster) {
 }
 
 function renderHideButton(pod) {
-  if (!pod.workload) {
-    return "";
-  }
   const label = escapeHtml(`Hide ${workloadLabel(pod.workload)}`);
   return `<button type="button" class="btn-trash btn-hide"
     data-cluster="${escapeHtml(pod.cluster)}"
@@ -1078,7 +1075,7 @@ async function hideWorkload(cluster, workload) {
     return;
   }
   pods = pods.filter((p) => {
-    const hidden = p.cluster === cluster && p.workload && sameWorkload(p.workload, workload);
+    const hidden = p.cluster === cluster && sameWorkload(p.workload, workload);
     if (hidden) {
       forgetCard(p.name);
     }
@@ -1506,7 +1503,7 @@ function handleMetricsUpdate(event) {
     // in flight when a workload was hidden.
     const hidden = hiddenWorkloads(name);
     for (const pod of m.pods) {
-      if (pod.workload && hidden.some((w) => sameWorkload(w, pod.workload))) {
+      if (hidden.some((w) => sameWorkload(w, pod.workload))) {
         continue;
       }
       const key = `${name}/${pod.name}`;

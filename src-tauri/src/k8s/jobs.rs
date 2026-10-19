@@ -2,140 +2,83 @@
 //! workload.
 //!
 //! A cron job makes a new Job, with a new name, for every run, and its pods
-//! only reference that Job. The Job's own owner reference names the
-//! cron job, so each Job is fetched once and the answer kept for as long
-//! as it has pods (an owner reference does not change). Only final
-//! answers are kept: a lookup that failed or ran out of time is retried
-//! on the next poll.
+//! only reference that Job. The Job's own owner reference names the cron
+//! job. One metadata-only list of the namespace's Jobs answers that for
+//! every Job at once, and the answer is kept until a Job with pods turns up
+//! that the last list did not have: once per cron job run, not per poll.
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::Job;
 use kube::Client;
-use kube::api::Api;
-use tokio::task::JoinSet;
-use tokio::time::Instant;
+use kube::api::{Api, ListParams, ObjectMeta};
 
 /// The `Job` kind, as it appears in a pod's controller reference.
 pub(super) const JOB: &str = "Job";
 pub(super) const CRON_JOB: &str = "CronJob";
 
-/// Time allowed for one poll's Job lookups. They only refine how pods are
-/// grouped, so a slow lookup must not push the whole cluster poll past its
-/// timeout.
-const JOB_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
+/// Time allowed for the Job list. It only refines how pods are grouped, so
+/// a slow list must not push the whole cluster poll past its timeout.
+const JOB_LIST_BUDGET: Duration = Duration::from_secs(5);
 
-/// The name of the cron job owning each Job, `None` for a Job without
-/// one. Keyed by Job name, within the target's namespace.
+/// The name of the cron job owning each Job, `None` for a Job without one.
+/// Keyed by Job name, within the target's namespace.
 pub(super) type JobOwners = HashMap<String, Option<String>>;
 
-/// What one poll's lookups found.
-#[derive(Debug, Default, PartialEq)]
-pub(super) struct Lookups {
-    /// Final answers, to be kept.
-    pub(super) owners: JobOwners,
-    /// The API refused to let us read Jobs; asking again will not help.
-    pub(super) forbidden: bool,
-}
-
-/// The outcome of looking up one Job.
+/// The outcome of listing the namespace's Jobs.
 #[derive(Debug, PartialEq)]
-enum Lookup {
-    /// The Job's cron job (`None`: it has none, or the Job is gone).
-    Owner(Option<String>),
+pub(super) enum JobList {
+    /// Every Job in `wanted`, with its cron job. A wanted Job the list did
+    /// not have (deleted meanwhile) maps to `None`, so it is not listed
+    /// again for as long as its pods linger.
+    Owners(JobOwners),
+    /// Reading Jobs is not allowed; asking again will not help.
     Forbidden,
-    /// A transient failure, already logged.
-    Retry,
+    /// A transient failure or timeout, already logged; retry next poll.
+    Failed,
 }
 
-/// Forget Jobs that no longer have pods and return those in `wanted`
-/// that are not known yet.
-pub(super) fn jobs_to_fetch(owners: &mut JobOwners, wanted: &HashSet<&str>) -> Vec<String> {
-    owners.retain(|name, _| wanted.contains(name.as_str()));
-    wanted
-        .iter()
-        .filter(|name| !owners.contains_key(**name))
-        .map(|name| (*name).to_string())
-        .collect()
-}
-
-/// Look up the cron job of each Job in `names`, concurrently, within
-/// [`JOB_LOOKUP_BUDGET`].
-pub(super) async fn fetch_job_owners(
+/// List the Jobs in `namespace` within [`JOB_LIST_BUDGET`] and map each to
+/// its cron job.
+pub(super) async fn list_job_owners(
     client: &Client,
     namespace: &str,
-    names: Vec<String>,
-) -> Lookups {
+    wanted: &HashSet<&str>,
+) -> JobList {
     let api: Api<Job> = Api::namespaced(client.clone(), namespace);
-    let lookup = |name: String| {
-        let api = api.clone();
-        let namespace = namespace.to_string();
-        async move { classify(api.get(&name).await, &namespace, &name) }
+    let params = ListParams::default();
+    let list = api.list_metadata(&params);
+    let Ok(listed) = tokio::time::timeout(JOB_LIST_BUDGET, list).await else {
+        tracing::warn!("listing jobs in {namespace} ran out of time; retrying next poll");
+        return JobList::Failed;
     };
-    lookup_all(names, lookup, Instant::now() + JOB_LOOKUP_BUDGET, namespace).await
-}
-
-/// Run `lookup` for every name until `deadline`. Lookups still running
-/// then are dropped (which aborts them) and left out, to retry next poll.
-async fn lookup_all<F, Fut>(
-    names: Vec<String>,
-    lookup: F,
-    deadline: Instant,
-    namespace: &str,
-) -> Lookups
-where
-    F: Fn(String) -> Fut,
-    Fut: Future<Output = Lookup> + Send + 'static,
-{
-    let mut tasks = JoinSet::new();
-    for name in names {
-        let found = lookup(name.clone());
-        tasks.spawn(async move { (name, found.await) });
-    }
-
-    let mut lookups = Lookups::default();
-    loop {
-        let joined = match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(joined)) => joined,
-            Ok(None) => break,
-            Err(_) => {
-                tracing::warn!("job lookups in {namespace} ran out of time; retrying next poll");
-                break;
-            }
-        };
-        match joined {
-            Ok((name, Lookup::Owner(owner))) => {
-                lookups.owners.insert(name, owner);
-            }
-            Ok((_, Lookup::Forbidden)) => lookups.forbidden = true,
-            Ok((_, Lookup::Retry)) => {}
-            Err(e) => tracing::warn!("job lookup task in {namespace} failed: {e}"),
-        }
-    }
-    lookups
-}
-
-fn classify(job: Result<Job, kube::Error>, namespace: &str, name: &str) -> Lookup {
-    match job {
-        Ok(job) => Lookup::Owner(cron_job_of(&job)),
-        Err(kube::Error::Api(status)) if status.is_not_found() => Lookup::Owner(None),
-        Err(kube::Error::Api(status)) if status.is_forbidden() => Lookup::Forbidden,
+    match listed {
+        Ok(list) => JobList::Owners(owners_of(list.items.iter().map(|j| &j.metadata), wanted)),
+        Err(kube::Error::Api(status)) if status.is_forbidden() => JobList::Forbidden,
         Err(e) => {
             tracing::warn!(
-                "cannot read job {namespace}/{name}, retrying next poll: {}",
+                "cannot list jobs in {namespace}, retrying next poll: {}",
                 crate::error::error_chain(&e)
             );
-            Lookup::Retry
+            JobList::Failed
         }
     }
 }
 
-/// The name of the cron job that controls `job`, if any.
-fn cron_job_of(job: &Job) -> Option<String> {
-    let owner = job
-        .metadata
+fn owners_of<'a>(jobs: impl Iterator<Item = &'a ObjectMeta>, wanted: &HashSet<&str>) -> JobOwners {
+    let mut owners: JobOwners = jobs
+        .filter_map(|job| Some((job.name.clone()?, cron_job_of(job))))
+        .collect();
+    for name in wanted {
+        owners.entry((*name).to_string()).or_insert(None);
+    }
+    owners
+}
+
+/// The name of the cron job that controls the Job with `meta`, if any.
+fn cron_job_of(meta: &ObjectMeta) -> Option<String> {
+    let owner = meta
         .owner_references
         .as_deref()?
         .iter()
@@ -146,112 +89,49 @@ fn cron_job_of(job: &Job) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-    use kube::api::ObjectMeta;
-    use kube::core::Status;
 
     use super::*;
 
-    fn job_owned_by(kind: &str, controller: bool) -> Job {
-        Job {
-            metadata: ObjectMeta {
-                name: Some("backup-29000000".to_string()),
-                owner_references: Some(vec![OwnerReference {
-                    kind: kind.to_string(),
-                    name: "backup".to_string(),
-                    controller: Some(controller),
-                    ..OwnerReference::default()
-                }]),
-                ..ObjectMeta::default()
-            },
-            ..Job::default()
+    fn job(name: &str, owner_kind: &str, controller: bool) -> ObjectMeta {
+        ObjectMeta {
+            name: Some(name.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                kind: owner_kind.to_string(),
+                name: "backup".to_string(),
+                controller: Some(controller),
+                ..OwnerReference::default()
+            }]),
+            ..ObjectMeta::default()
         }
-    }
-
-    fn api_error(code: u16, reason: &str) -> kube::Error {
-        kube::Error::Api(Box::new(Status {
-            code,
-            reason: reason.to_string(),
-            ..Status::default()
-        }))
     }
 
     #[test]
     fn cron_job_is_the_controlling_owner() {
         assert_eq!(
-            cron_job_of(&job_owned_by(CRON_JOB, true)).as_deref(),
+            cron_job_of(&job("j", CRON_JOB, true)).as_deref(),
             Some("backup")
         );
-        assert_eq!(cron_job_of(&job_owned_by(CRON_JOB, false)), None);
-        assert_eq!(cron_job_of(&job_owned_by("Workflow", true)), None);
-        assert_eq!(cron_job_of(&Job::default()), None);
+        assert_eq!(cron_job_of(&job("j", CRON_JOB, false)), None);
+        assert_eq!(cron_job_of(&job("j", "Workflow", true)), None);
+        assert_eq!(cron_job_of(&ObjectMeta::default()), None);
     }
 
     #[test]
-    fn only_final_answers_are_owners() {
-        let found = classify(Ok(job_owned_by(CRON_JOB, true)), "ns", "j");
-        assert_eq!(found, Lookup::Owner(Some("backup".to_string())));
-        assert_eq!(
-            classify(Err(api_error(404, "NotFound")), "ns", "j"),
-            Lookup::Owner(None)
-        );
-        assert_eq!(
-            classify(Err(api_error(403, "Forbidden")), "ns", "j"),
-            Lookup::Forbidden
-        );
-        assert_eq!(
-            classify(Err(api_error(503, "ServiceUnavailable")), "ns", "j"),
-            Lookup::Retry
-        );
-    }
+    fn listed_jobs_map_to_their_cron_job_and_missing_wanted_ones_to_none() {
+        let listed = [
+            job("backup-1", CRON_JOB, true),
+            job("manual", "Workflow", true),
+        ];
 
-    #[test]
-    fn known_jobs_are_not_refetched_and_gone_ones_are_forgotten() {
-        let mut owners = JobOwners::from([
-            ("kept".to_string(), Some("backup".to_string())),
-            ("gone".to_string(), None),
-        ]);
-
-        let fetch = jobs_to_fetch(&mut owners, &HashSet::from(["kept", "new"]));
-
-        assert_eq!(fetch, ["new"]);
-        assert_eq!(owners.keys().collect::<Vec<_>>(), ["kept"]);
-    }
-
-    #[tokio::test]
-    async fn lookups_keep_answers_and_flag_forbidden() {
-        let lookup = |name: String| async move {
-            match name.as_str() {
-                "a" => Lookup::Owner(Some("cron".to_string())),
-                "b" => Lookup::Forbidden,
-                _ => Lookup::Retry,
-            }
-        };
-        let names = ["a", "b", "c"].map(str::to_string).to_vec();
-
-        let found = lookup_all(names, lookup, Instant::now() + JOB_LOOKUP_BUDGET, "ns").await;
+        let owners = owners_of(listed.iter(), &HashSet::from(["backup-1", "deleted"]));
 
         assert_eq!(
-            found,
-            Lookups {
-                owners: JobOwners::from([("a".to_string(), Some("cron".to_string()))]),
-                forbidden: true,
-            }
+            owners,
+            JobOwners::from([
+                ("backup-1".to_string(), Some("backup".to_string())),
+                ("manual".to_string(), None),
+                ("deleted".to_string(), None),
+            ])
         );
-    }
-
-    #[tokio::test]
-    async fn lookups_past_the_deadline_are_left_to_retry() {
-        let lookup = |name: String| async move {
-            if name == "slow" {
-                std::future::pending::<()>().await;
-            }
-            Lookup::Owner(None)
-        };
-        let names = ["fast", "slow"].map(str::to_string).to_vec();
-        let deadline = Instant::now() + Duration::from_millis(50);
-
-        let found = lookup_all(names, lookup, deadline, "ns").await;
-
-        assert_eq!(found.owners, JobOwners::from([("fast".to_string(), None)]));
     }
 }

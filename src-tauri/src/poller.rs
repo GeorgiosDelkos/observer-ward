@@ -604,6 +604,7 @@ mod tests {
     use crate::config::{K8sTarget, SshTarget, WorkloadRef};
     use crate::metrics::tests::{cluster, host, make_alert, offline, pod, usage};
     use crate::metrics::{AlertSeverity, AlertState};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     #[test]
@@ -769,7 +770,19 @@ mod tests {
         let hiding = k8s_server("prod", [pod_workload("api-1")]);
 
         assert!(pool.backoff_error(&hiding).is_some());
-        assert!(Backend::new(&server).adopt(&hiding));
+
+        let hidden_of = |backend: &Backend| match backend {
+            Backend::K8s(k8s) => k8s.target().hidden.clone(),
+            Backend::Ssh(_) => BTreeSet::from([pod_workload("not a k8s backend")]),
+        };
+        let mut backend = Backend::new(&server);
+        assert!(backend.adopt(&hiding));
+        assert_eq!(hidden_of(&backend), BTreeSet::from([pod_workload("api-1")]));
+        assert!(
+            backend.adopt(&server),
+            "showing it again keeps the backend too"
+        );
+        assert_eq!(hidden_of(&backend), BTreeSet::new());
     }
 
     #[test]

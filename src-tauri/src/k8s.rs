@@ -23,7 +23,7 @@ pub(crate) use error::K8sError;
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
-use jobs::{JobOwners, fetch_job_owners, jobs_to_fetch};
+use jobs::{JobList, JobOwners, list_job_owners};
 use metrics_api::{NodeMetrics, PodMetrics as PodMetricsSample};
 use pods::{PodContext, assemble_pods, jobs_of};
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
@@ -55,7 +55,7 @@ pub(crate) struct K8sBackend {
     client: Option<Client>,
     prev_net: Option<NetSample>,
     prev_pod_net: HashMap<String, NetSample>,
-    /// Kept across polls: each Job is looked up once.
+    /// From the last Job list, kept until a Job with pods is missing from it.
     job_owners: JobOwners,
     /// Reading Jobs was refused; not retried until the client is rebuilt
     /// (new credentials may allow it).
@@ -196,23 +196,27 @@ impl K8sBackend {
         }
     }
 
-    /// Learn the cron job behind every Job with pods that is not known
-    /// yet, and forget Jobs whose pods are gone.
+    /// Re-list the namespace's Jobs when a Job with pods is not in the last
+    /// list: a new cron job run. Otherwise the last list still answers.
     async fn resolve_jobs(&mut self, client: &Client, specs: &[Pod]) {
-        let missing = jobs_to_fetch(&mut self.job_owners, &jobs_of(specs));
-        if missing.is_empty() || self.jobs_forbidden {
+        let wanted = jobs_of(specs);
+        let known = wanted.iter().all(|job| self.job_owners.contains_key(*job));
+        if known || self.jobs_forbidden {
             return;
         }
         let namespace = &self.target.namespace;
-        let found = fetch_job_owners(client, namespace, missing).await;
-        if found.forbidden {
-            tracing::warn!(
-                "no permission to read jobs in {}/{namespace}: cron job pods hide one run at a time",
-                self.target.name
-            );
-            self.jobs_forbidden = true;
+        match list_job_owners(client, namespace, &wanted).await {
+            JobList::Owners(owners) => self.job_owners = owners,
+            JobList::Forbidden => {
+                tracing::warn!(
+                    "no permission to list jobs in {}/{namespace}: \
+                     hidden cron jobs are matched by run name only",
+                    self.target.name
+                );
+                self.jobs_forbidden = true;
+            }
+            JobList::Failed => {}
         }
-        self.job_owners.extend(found.owners);
     }
 
     fn pod_cards(

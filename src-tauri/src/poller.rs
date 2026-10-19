@@ -107,30 +107,21 @@ impl Backend {
         }
     }
 
-    /// Whether this backend connects where `server` does. Any edit to the
-    /// connection means a fresh one; hiding a workload does not.
-    fn serves(&self, server: &ServerConfig) -> bool {
+    /// Take `server` if this backend connects where it does, adopting its
+    /// hidden workloads. Any other edit means a fresh connection.
+    fn adopt(&mut self, server: &ServerConfig) -> bool {
         match (self, server) {
             (Backend::Ssh(backend), ServerConfig::Ssh(target)) => backend.target() == target,
             (Backend::K8s(backend), ServerConfig::K8s(target)) => {
-                backend.target().same_connection(target)
+                let same = backend.target().same_connection(target);
+                if same {
+                    backend.set_hidden(target.hidden.clone());
+                }
+                same
             }
             (Backend::Ssh(_), ServerConfig::K8s(_)) | (Backend::K8s(_), ServerConfig::Ssh(_)) => {
                 false
             }
-        }
-    }
-
-    /// Adopt `server`, which [`Self::serves`] accepted: a K8s backend
-    /// takes its current hidden workloads.
-    fn retarget(&mut self, server: &ServerConfig) {
-        match (self, server) {
-            (Backend::K8s(backend), ServerConfig::K8s(target)) => {
-                backend.retarget(target.clone());
-            }
-            // An SSH backend only serves an identical target.
-            (Backend::Ssh(_), ServerConfig::Ssh(_) | ServerConfig::K8s(_))
-            | (Backend::K8s(_), ServerConfig::Ssh(_)) => {}
         }
     }
 
@@ -284,11 +275,14 @@ impl ServerPool {
 
     fn take_backend(&mut self, server: &ServerConfig) -> Backend {
         match self.backends.remove(server.name()) {
-            Some(mut backend) if backend.serves(server) => {
-                backend.retarget(server);
-                backend
+            Some(mut backend) => {
+                if backend.adopt(server) {
+                    backend
+                } else {
+                    Backend::new(server)
+                }
             }
-            Some(_) | None => Backend::new(server),
+            None => Backend::new(server),
         }
     }
 
@@ -512,7 +506,9 @@ impl Poller {
             self.alerts.poll(config.grafana.as_ref()),
         );
         // Against the config as it is now, not as the poll started: a
-        // workload hidden mid-poll must not notify or reach the tray.
+        // workload hidden mid-poll must not notify or reach the tray. This
+        // only removes pods; one shown mid-poll returns with the next poll,
+        // which `show_workload` wakes at once.
         hide_workloads(&mut reports, &self.config.snapshot().await);
 
         let metric_notices = self.notifier.metric_notices(&reports);
@@ -773,7 +769,7 @@ mod tests {
         let hiding = k8s_server("prod", [pod_workload("api-1")]);
 
         assert!(pool.backoff_error(&hiding).is_some());
-        assert!(Backend::new(&server).serves(&hiding));
+        assert!(Backend::new(&server).adopt(&hiding));
     }
 
     #[test]

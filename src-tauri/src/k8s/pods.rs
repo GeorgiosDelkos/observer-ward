@@ -10,7 +10,7 @@ use crate::config::WorkloadRef;
 use crate::metrics::{Capacity, NetSample, PodMetrics, PodStatus, PodUsage, Usage, percent};
 
 use super::error::K8sError;
-use super::jobs::{JOB, JobOwners};
+use super::jobs::{CRON_JOB, JOB, JobOwners};
 use super::metrics_api::PodMetrics as PodMetricsSample;
 use super::quantity::{parse_cpu_quantity, parse_memory_quantity};
 
@@ -38,16 +38,19 @@ pub(super) fn assemble_pods(
     specs: &[Pod],
     ctx: &PodContext<'_>,
 ) -> Vec<PodMetrics> {
-    let spec_by_name: HashMap<&str, &Pod> = specs
+    let spec_by_name: HashMap<&str, (&Pod, WorkloadRef)> = specs
         .iter()
-        .filter_map(|p| p.metadata.name.as_deref().map(|n| (n, p)))
-        .collect();
-    let workloads: HashMap<&str, WorkloadRef> = spec_by_name
-        .iter()
-        .map(|(&name, &spec)| (name, pod_workload(name, spec, ctx.job_owners)))
+        .filter_map(|pod| {
+            let name = pod.metadata.name.as_deref()?;
+            Some((name, (pod, pod_workload(name, pod, ctx.job_owners))))
+        })
         .collect();
     // A pod without a spec has no known workload, so it is never hidden.
-    let hidden = |name: &str| workloads.get(name).is_some_and(|w| ctx.hidden.contains(w));
+    let hidden = |name: &str| {
+        spec_by_name
+            .get(name)
+            .is_some_and(|(_, workload)| ctx.hidden.contains(workload))
+    };
 
     let mut pods = Vec::with_capacity(samples.len().max(specs.len()));
     let mut seen = HashSet::new();
@@ -59,11 +62,13 @@ pub(super) fn assemble_pods(
         if hidden(name) {
             continue;
         }
-        let spec = spec_by_name.get(name).copied();
-        match sample_usage(name, sample, spec, ctx) {
+        let spec = spec_by_name
+            .get(name)
+            .map(|(pod, workload)| (*pod, workload));
+        match sample_usage(name, sample, spec.map(|(pod, _)| pod), ctx) {
             Ok(usage) => {
                 seen.insert(name);
-                pods.push(pod_card(name, spec, workloads.get(name), Some(usage), ctx));
+                pods.push(pod_card(name, spec, Some(usage), ctx));
             }
             Err(e) => {
                 tracing::warn!("skipping pod {name}: {}", crate::error::error_chain(&e));
@@ -71,34 +76,35 @@ pub(super) fn assemble_pods(
         }
     }
 
-    for (&name, &spec) in &spec_by_name {
+    for (&name, (spec, workload)) in &spec_by_name {
         if seen.contains(name)
             || hidden(name)
             || derive_pod_status(spec) == Some(PodStatus::Succeeded)
         {
             continue;
         }
-        pods.push(pod_card(name, Some(spec), workloads.get(name), None, ctx));
+        pods.push(pod_card(name, Some((spec, workload)), None, ctx));
     }
 
     pods.sort_by(|a, b| a.name.cmp(&b.name));
     pods
 }
 
+/// `spec` is the pod's spec and workload, when it was in the listing.
 fn pod_card(
     name: &str,
-    spec: Option<&Pod>,
-    workload: Option<&WorkloadRef>,
+    spec: Option<(&Pod, &WorkloadRef)>,
     usage: Option<PodUsage>,
     ctx: &PodContext<'_>,
 ) -> PodMetrics {
+    let (workload, spec) = (spec.map(|(_, w)| w.clone()), spec.map(|(pod, _)| pod));
     let net = match (ctx.net.get(name), ctx.prev_net.get(name)) {
         (Some(now), Some(prev)) => now.rate_since(prev),
         (Some(_) | None, None) | (None, Some(_)) => None,
     };
     PodMetrics {
         name: name.to_string(),
-        workload: workload.cloned(),
+        workload,
         status: spec.and_then(derive_pod_status),
         restart_count: spec.map_or(0, pod_restart_count),
         start_time: spec.and_then(pod_start_time),
@@ -172,7 +178,10 @@ pub(super) fn pod_workload(name: &str, pod: &Pod, job_owners: &JobOwners) -> Wor
     if owner.kind == JOB
         && let Some(cron_job) = job_owners.get(&owner.name).and_then(Option::as_ref)
     {
-        return cron_job.clone();
+        return WorkloadRef {
+            kind: CRON_JOB.to_string(),
+            name: cron_job.clone(),
+        };
     }
 
     let labels = pod.metadata.labels.as_ref();
@@ -193,12 +202,11 @@ pub(super) fn pod_workload(name: &str, pod: &Pod, job_owners: &JobOwners) -> Wor
     })
 }
 
-/// The Jobs whose cron job is worth knowing: those controlling a pod that
-/// gets a card (a succeeded pod gets none).
-pub(super) fn jobs_with_cards(specs: &[Pod]) -> HashSet<&str> {
+/// The Jobs controlling a pod in `specs`. Succeeded pods count too: one
+/// still sampled by metrics-server gets a card.
+pub(super) fn jobs_of(specs: &[Pod]) -> HashSet<&str> {
     specs
         .iter()
-        .filter(|pod| derive_pod_status(pod) != Some(PodStatus::Succeeded))
         .filter_map(controller)
         .filter(|owner| owner.kind == JOB)
         .map(|owner| owner.name.as_str())
@@ -766,9 +774,9 @@ mod tests {
     #[test]
     fn jobs_resolve_to_their_cron_job_when_known() {
         let run = owned_pod(JOB, "backup-29000000", None);
-        let cron_job = workload("CronJob", "backup");
+        let cron_job = workload(CRON_JOB, "backup");
         let owners = JobOwners::from([
-            ("backup-29000000".to_string(), Some(cron_job.clone())),
+            ("backup-29000000".to_string(), Some("backup".to_string())),
             ("manual".to_string(), None),
         ]);
 
@@ -780,22 +788,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_jobs_of_pods_with_cards_are_looked_up() {
-        let running = owned_pod(JOB, "nightly-1", None);
-        let done = with_status(
-            owned_pod(JOB, "nightly-0", None),
+    fn succeeded(pod: Pod) -> Pod {
+        with_status(
+            pod,
             K8sPodStatus {
                 phase: Some("Succeeded".to_string()),
                 ..K8sPodStatus::default()
             },
+        )
+    }
+
+    #[test]
+    fn jobs_of_every_job_owned_pod_are_looked_up() {
+        let specs = [
+            owned_pod(JOB, "nightly-1", None),
+            succeeded(owned_pod(JOB, "nightly-0", None)),
+            owned_pod(REPLICA_SET, "api-1", None),
+        ];
+
+        assert_eq!(jobs_of(&specs), HashSet::from(["nightly-1", "nightly-0"]));
+    }
+
+    #[test]
+    fn hidden_cron_jobs_get_no_card_even_when_succeeded_and_sampled() {
+        let mut running = owned_pod(JOB, "backup-2", None);
+        running.metadata.name = Some("backup-2-x".to_string());
+        let mut done = succeeded(owned_pod(JOB, "backup-1", None));
+        done.metadata.name = Some("backup-1-x".to_string());
+        let mut maps = Maps::empty();
+        maps.hidden.insert(workload(CRON_JOB, "backup"));
+        for job in ["backup-1", "backup-2"] {
+            maps.job_owners
+                .insert(job.to_string(), Some("backup".to_string()));
+        }
+
+        let pods = assemble_pods(
+            &[sample("backup-1-x", "1m", "1Mi")],
+            &[running, done],
+            &maps.ctx(),
         );
-        let deployment = owned_pod(REPLICA_SET, "api-1", None);
 
-        let specs = [running, done, deployment];
-        let jobs = jobs_with_cards(&specs);
-
-        assert_eq!(jobs, HashSet::from(["nightly-1"]));
+        assert!(pods.is_empty(), "{pods:?}");
     }
 
     #[test]

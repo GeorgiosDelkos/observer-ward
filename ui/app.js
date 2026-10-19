@@ -79,6 +79,20 @@ const sshFields = document.querySelectorAll(".field-ssh");
 
 // ── Window Sizing ────────────────────────────
 
+// Padding around an open modal; matches `.modal-overlay` in styles.css.
+const MODAL_INSET = 20;
+
+// An open modal can be taller than the list it covers, and the window
+// clips it: stretch the container to fit it while it is open.
+function fitOpenModal() {
+  const container = document.querySelector(".container");
+  const modal = document.querySelector(".modal-overlay.open .modal");
+  container.style.minHeight = modal
+    ? `${modal.offsetHeight + 2 * MODAL_INSET}px`
+    : "";
+  return container.offsetHeight;
+}
+
 function resizeToContent() {
   const header = document.querySelector(".header");
   const footer = document.querySelector(".footer");
@@ -93,7 +107,7 @@ function resizeToContent() {
     footer.offsetHeight +
     WIN_PADDING;
 
-  const height = Math.max(WIN_MIN_HEIGHT, contentHeight);
+  const height = Math.max(WIN_MIN_HEIGHT, contentHeight, fitOpenModal() + WIN_PADDING);
   invoke("resize_window", { width: WIN_WIDTH, height }).catch(() => {});
 }
 
@@ -990,6 +1004,7 @@ function openRemoveModal(name) {
   removeModalBody.textContent =
     `Remove "${label}"? This cannot be undone.`;
   removeModal.classList.add("open");
+  resizeToContent();
   btnRemoveCancel.focus();
 }
 
@@ -999,6 +1014,7 @@ function closeRemoveModal() {
   }
   pendingRemoveName = null;
   removeModal.classList.remove("open");
+  resizeToContent();
 }
 
 async function confirmRemove() {
@@ -1101,12 +1117,19 @@ function openHiddenModal(cluster, error = "") {
   hiddenModalError.hidden = !error;
   renderHiddenModalList();
   hiddenModal.classList.add("open");
+  resizeToContent();
   btnHiddenClose.focus();
 }
 
 function closeHiddenModal() {
+  const cluster = hiddenModalCluster;
   hiddenModalCluster = null;
   hiddenModal.classList.remove("open");
+  resizeToContent();
+  // Back to the chip that opened it, when it is still there.
+  serverListEl
+    .querySelector(`.cluster-hidden[data-cluster="${CSS.escape(cluster ?? "")}"]`)
+    ?.focus();
 }
 
 // The pods come back with the poll that `show_workload` wakes.

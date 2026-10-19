@@ -65,6 +65,9 @@ impl K8sBackend {
         }
     }
 
+    /// The target this backend connects with. Its `hidden` may be stale,
+    /// since hiding a workload keeps the backend: read that from the
+    /// current config.
     pub(crate) fn target(&self) -> &K8sTarget {
         &self.target
     }

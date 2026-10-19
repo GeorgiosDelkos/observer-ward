@@ -168,7 +168,7 @@ impl ClusterMetrics {
     /// Drop the pods of every workload in `hidden`.
     pub fn hide(&mut self, hidden: &BTreeSet<WorkloadRef>) {
         if let Some(pods) = &mut self.pods {
-            pods.retain(|pod| !hidden.contains(&pod.workload));
+            pods.retain(|pod| pod.workload.as_ref().is_none_or(|w| !hidden.contains(w)));
         }
     }
 }
@@ -176,8 +176,10 @@ impl ClusterMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PodMetrics {
     pub name: String,
-    /// What hiding this pod hides.
-    pub workload: WorkloadRef,
+    /// What hiding this pod hides. `None` when the pod spec was not in
+    /// the listing: the owner is unknown, and hiding the pod by name
+    /// would store an entry that never matches again.
+    pub workload: Option<WorkloadRef>,
     /// `None` when the pod spec was not in the listing (a pod created or
     /// deleted between the two list calls).
     pub status: Option<PodStatus>,
@@ -470,10 +472,10 @@ pub(crate) mod tests {
     pub(crate) fn pod(name: &str, restarts: u32, usage: Option<Usage>) -> PodMetrics {
         PodMetrics {
             name: name.to_string(),
-            workload: WorkloadRef {
+            workload: Some(WorkloadRef {
                 kind: "Pod".to_string(),
                 name: name.to_string(),
-            },
+            }),
             status: Some(PodStatus::Running),
             restart_count: restarts,
             start_time: None,
@@ -510,7 +512,14 @@ pub(crate) mod tests {
         let mut report = cluster(
             "prod",
             usage(0.0, 0.0, 0.0),
-            Some(vec![pod("api-1", 0, None), pod("db-0", 0, None)]),
+            Some(vec![
+                pod("api-1", 0, None),
+                pod("db-0", 0, None),
+                PodMetrics {
+                    workload: None,
+                    ..pod("racing", 0, None)
+                },
+            ]),
         );
         let ServerReport::K8s {
             health: Health::Online { metrics },
@@ -519,7 +528,8 @@ pub(crate) mod tests {
         else {
             panic!("cluster fixture is online");
         };
-        let hidden = BTreeSet::from([metrics.pods.as_ref().expect("pods")[0].workload.clone()]);
+        let api = metrics.pods.as_ref().expect("pods")[0].workload.clone();
+        let hidden = BTreeSet::from([api.expect("fixture pods have a workload")]);
 
         metrics.hide(&hidden);
 
@@ -529,7 +539,7 @@ pub(crate) mod tests {
             .flatten()
             .map(|p| p.name.as_str())
             .collect();
-        assert_eq!(names, ["db-0"]);
+        assert_eq!(names, ["db-0", "racing"], "a pod without a spec is kept");
 
         metrics.pods = None;
         metrics.hide(&hidden);

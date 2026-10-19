@@ -80,7 +80,7 @@ fn pod_card(
     };
     PodMetrics {
         name: name.to_string(),
-        workload: pod_workload(name, spec),
+        workload: spec.map(|spec| pod_workload(name, spec)),
         status: spec.and_then(derive_pod_status),
         restart_count: spec.map_or(0, pod_restart_count),
         start_time: spec.and_then(pod_start_time),
@@ -128,45 +128,56 @@ fn sample_usage(
     })
 }
 
-/// The workload that owns the pod: its controller, with a Deployment's
-/// replica set resolved to the Deployment (a new replica set is made on
-/// every rollout). A pod without a controller, or without a spec in the
-/// listing, is its own workload.
-pub(super) fn pod_workload(name: &str, pod: Option<&Pod>) -> WorkloadRef {
-    let metadata = pod.map(|p| &p.metadata);
-    let owner = metadata
-        .and_then(|m| m.owner_references.as_deref())
+/// Kind of a pod without a controller, which is its own workload.
+const POD: &str = "Pod";
+const REPLICA_SET: &str = "ReplicaSet";
+
+/// Controllers that make a new replica set on every rollout, named
+/// `<owner>-<hash>`, with the hash in a pod label: the label, then the
+/// owner's kind. Argo Rollouts uses its own label.
+const REPLICA_SET_OWNERS: [(&str, &str); 2] = [
+    ("pod-template-hash", "Deployment"),
+    ("rollouts-pod-template-hash", "Rollout"),
+];
+
+/// The workload that owns `pod`: its controller, with a replica set
+/// resolved to the Deployment (or Argo Rollout) that made it. A pod
+/// without a controller is its own workload.
+pub(super) fn pod_workload(name: &str, pod: &Pod) -> WorkloadRef {
+    let owner = pod
+        .metadata
+        .owner_references
+        .as_deref()
         .and_then(|owners| owners.iter().find(|o| o.controller == Some(true)));
     let Some(owner) = owner else {
         return WorkloadRef {
-            kind: "Pod".to_string(),
+            kind: POD.to_string(),
             name: name.to_string(),
         };
     };
 
-    let template_hash = metadata
-        .and_then(|m| m.labels.as_ref())
-        .and_then(|labels| labels.get("pod-template-hash"));
-    let deployment = template_hash
-        .filter(|_| owner.kind == "ReplicaSet")
-        .and_then(|hash| deployment_name(&owner.name, hash));
-    match deployment {
-        Some(deployment) => WorkloadRef {
-            kind: "Deployment".to_string(),
-            name: deployment.to_string(),
-        },
-        None => WorkloadRef {
-            kind: owner.kind.clone(),
-            name: owner.name.clone(),
-        },
-    }
+    let labels = pod.metadata.labels.as_ref();
+    let rollout_owner = REPLICA_SET_OWNERS
+        .iter()
+        .filter(|_| owner.kind == REPLICA_SET)
+        .find_map(|&(label, kind)| {
+            let hash = labels?.get(label)?;
+            let name = replica_set_owner(&owner.name, hash)?;
+            Some(WorkloadRef {
+                kind: kind.to_string(),
+                name: name.to_string(),
+            })
+        });
+    rollout_owner.unwrap_or_else(|| WorkloadRef {
+        kind: owner.kind.clone(),
+        name: owner.name.clone(),
+    })
 }
 
-/// The Deployment that made `replica_set`: the Deployment controller names
-/// each replica set `<deployment>-<pod-template-hash>`. `None` for a
-/// replica set not named that way (one created by hand or by another
-/// controller), which is then shown as itself.
-fn deployment_name<'a>(replica_set: &'a str, template_hash: &str) -> Option<&'a str> {
+/// The owner that made `replica_set`, named `<owner>-<template_hash>`.
+/// `None` for a replica set not named that way (one created by hand or
+/// by another controller), which is then shown as itself.
+fn replica_set_owner<'a>(replica_set: &'a str, template_hash: &str) -> Option<&'a str> {
     if template_hash.is_empty() {
         return None;
     }
@@ -622,7 +633,7 @@ mod tests {
         assert_eq!((net.rx_bytes_per_sec, net.tx_bytes_per_sec), (2_000, 1_000));
     }
 
-    fn owned_pod(kind: &str, owner: &str, template_hash: Option<&str>) -> Pod {
+    fn owned_pod(kind: &str, owner: &str, hash_label: Option<(&str, &str)>) -> Pod {
         let mut pod = named_pod("p");
         pod.metadata.owner_references = Some(vec![
             OwnerReference {
@@ -637,8 +648,8 @@ mod tests {
                 ..OwnerReference::default()
             },
         ]);
-        pod.metadata.labels = template_hash
-            .map(|hash| BTreeMap::from([("pod-template-hash".to_string(), hash.to_string())]));
+        pod.metadata.labels =
+            hash_label.map(|(label, hash)| BTreeMap::from([(label.to_string(), hash.to_string())]));
         pod
     }
 
@@ -650,61 +661,79 @@ mod tests {
     }
 
     #[test]
-    fn workload_resolves_replica_sets_to_their_deployment() {
-        let pod = owned_pod("ReplicaSet", "api-7d9f8c6b5", Some("7d9f8c6b5"));
+    fn workload_resolves_replica_sets_to_their_rollout_owner() {
+        let pod = owned_pod(
+            REPLICA_SET,
+            "api-7d9f8c6b5",
+            Some(("pod-template-hash", "7d9f8c6b5")),
+        );
         assert_eq!(
-            pod_workload("api-7d9f8c6b5-x2k4p", Some(&pod)),
+            pod_workload("api-7d9f8c6b5-x2k4p", &pod),
             workload("Deployment", "api")
         );
 
-        let unrelated = owned_pod("ReplicaSet", "manual-rs", Some("7d9f8c6b5"));
+        let argo = owned_pod(
+            REPLICA_SET,
+            "web-6c8d7f",
+            Some(("rollouts-pod-template-hash", "6c8d7f")),
+        );
         assert_eq!(
-            pod_workload("manual-rs-abcde", Some(&unrelated)),
-            workload("ReplicaSet", "manual-rs")
+            pod_workload("web-6c8d7f-abcde", &argo),
+            workload("Rollout", "web")
+        );
+
+        let unrelated = owned_pod(
+            REPLICA_SET,
+            "manual-rs",
+            Some(("pod-template-hash", "7d9f8c6b5")),
+        );
+        assert_eq!(
+            pod_workload("manual-rs-abcde", &unrelated),
+            workload(REPLICA_SET, "manual-rs")
         );
     }
 
     #[test]
     fn workload_is_the_controller_or_the_pod_itself() {
         let pod = owned_pod("StatefulSet", "db", None);
-        assert_eq!(
-            pod_workload("db-0", Some(&pod)),
-            workload("StatefulSet", "db")
-        );
+        assert_eq!(pod_workload("db-0", &pod), workload("StatefulSet", "db"));
 
-        // A matching hash label only resolves ReplicaSets.
-        let job = owned_pod("Job", "backup-29000000", Some("29000000"));
+        // A matching hash label only resolves replica sets.
+        let job = owned_pod(
+            "Job",
+            "backup-29000000",
+            Some(("pod-template-hash", "29000000")),
+        );
         assert_eq!(
-            pod_workload("backup-29000000-abcde", Some(&job)),
+            pod_workload("backup-29000000-abcde", &job),
             workload("Job", "backup-29000000")
         );
 
         assert_eq!(
-            pod_workload("debug", Some(&named_pod("debug"))),
-            workload("Pod", "debug")
+            pod_workload("debug", &named_pod("debug")),
+            workload(POD, "debug")
         );
-        assert_eq!(pod_workload("gone", None), workload("Pod", "gone"));
     }
 
     proptest::proptest! {
         #[test]
-        fn deployment_name_inverts_the_controller_naming(
+        fn replica_set_owner_inverts_the_controller_naming(
             deployment in "[a-z0-9]([-a-z0-9]{0,20}[a-z0-9])?",
             hash in "[a-z0-9]{1,10}",
         ) {
             let replica_set = format!("{deployment}-{hash}");
             proptest::prop_assert_eq!(
-                deployment_name(&replica_set, &hash),
+                replica_set_owner(&replica_set, &hash),
                 Some(deployment.as_str())
             );
         }
 
         #[test]
-        fn deployment_name_never_returns_an_empty_name(
+        fn replica_set_owner_never_returns_an_empty_name(
             replica_set in "[-a-z0-9]{0,12}",
             hash in "[a-z0-9]{0,6}",
         ) {
-            if let Some(name) = deployment_name(&replica_set, &hash) {
+            if let Some(name) = replica_set_owner(&replica_set, &hash) {
                 proptest::prop_assert!(!name.is_empty());
                 proptest::prop_assert_eq!(format!("{name}-{hash}"), replica_set);
             }

@@ -160,8 +160,8 @@ pub(crate) async fn remove_server(
     Ok(next)
 }
 
-/// Stop showing, notifying on, and counting the pods of `workload` in
-/// cluster `server`. Hiding an already hidden workload is a no-op.
+/// Stop showing, counting, and raising threshold notifications for the
+/// pods of `workload` in cluster `server`. Hiding an already hidden workload is a no-op.
 #[tauri::command]
 pub(crate) async fn hide_workload(
     store: State<'_, Arc<ConfigStore>>,
@@ -171,7 +171,7 @@ pub(crate) async fn hide_workload(
 ) -> CommandResult<AppConfig> {
     let next = store
         .update(|config| {
-            hidden_workloads(config, server)?.insert(workload);
+            k8s_hidden_mut(config, server)?.insert(workload);
             Ok::<_, CommandError>(())
         })
         .await?;
@@ -190,7 +190,7 @@ pub(crate) async fn show_workload(
 ) -> CommandResult<AppConfig> {
     let next = store
         .update(|config| {
-            hidden_workloads(config, server)?.remove(&workload);
+            k8s_hidden_mut(config, server)?.remove(&workload);
             Ok::<_, CommandError>(())
         })
         .await?;
@@ -198,7 +198,7 @@ pub(crate) async fn show_workload(
     Ok(next)
 }
 
-fn hidden_workloads(
+fn k8s_hidden_mut(
     config: &mut AppConfig,
     server: String,
 ) -> CommandResult<&mut BTreeSet<WorkloadRef>> {
@@ -448,9 +448,10 @@ pub(crate) fn open_url(url: String) -> CommandResult<()> {
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::{CommandError, hidden_workloads, open_url, validate_new_server};
+    use super::{CommandError, k8s_hidden_mut, open_url, validate_new_server};
     use crate::config::{AppConfig, K8sTarget, ServerConfig, SshTarget, WorkloadRef};
 
     #[test]
@@ -462,7 +463,7 @@ mod tests {
                     kubeconfig: None,
                     context: "prod".to_string(),
                     namespace: "default".to_string(),
-                    hidden: std::collections::BTreeSet::new(),
+                    hidden: BTreeSet::new(),
                 }),
                 ServerConfig::Ssh(SshTarget {
                     name: "bastion".into(),
@@ -479,7 +480,7 @@ mod tests {
             name: "api".to_string(),
         };
 
-        hidden_workloads(&mut config, "prod".to_string())
+        k8s_hidden_mut(&mut config, "prod".to_string())
             .expect("k8s server")
             .insert(api.clone());
 
@@ -488,11 +489,11 @@ mod tests {
         };
         assert!(prod.hidden.contains(&api));
         assert!(matches!(
-            hidden_workloads(&mut config, "bastion".to_string()),
+            k8s_hidden_mut(&mut config, "bastion".to_string()),
             Err(CommandError::WrongServerKind { .. })
         ));
         assert!(matches!(
-            hidden_workloads(&mut config, "nope".to_string()),
+            k8s_hidden_mut(&mut config, "nope".to_string()),
             Err(CommandError::UnknownServer(_))
         ));
     }
@@ -506,7 +507,7 @@ mod tests {
             kubeconfig: Some(missing.clone()),
             context: "hippius".to_string(),
             namespace: "default".to_string(),
-            hidden: std::collections::BTreeSet::new(),
+            hidden: BTreeSet::new(),
         });
 
         let err = validate_new_server(&server)

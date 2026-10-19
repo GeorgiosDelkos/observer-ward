@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
 use tokio::task::{Id, JoinSet};
 
-use crate::config::{ConfigStore, ServerConfig, ServerName};
+use crate::config::{AppConfig, ConfigStore, ServerConfig, ServerName};
 use crate::error::error_chain;
 use crate::grafana::{AlertSource, TokenEpoch};
 use crate::k8s::K8sBackend;
@@ -305,27 +305,27 @@ fn order_by_config(reports: &mut [ServerReport], servers: &[ServerConfig]) {
 
 async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput {
     let name = server.name().clone();
-    let Ok(mut report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
+    let Ok(report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
         let error = format!("timed out collecting metrics for {}", server.name());
         return (None, offline_report(&server, error));
     };
-    hide_workloads(&mut report, &server);
     (Some(backend), report)
 }
 
-/// Drop the pods `server` hides. Done here, from the current config and
-/// before the report reaches the tray, notifier, or UI, so a hidden pod
-/// affects none of them, and the backend is kept when only `hidden` changes.
-fn hide_workloads(report: &mut ServerReport, server: &ServerConfig) {
-    if let (
-        ServerReport::K8s {
+/// Drop the pods each cluster in `config` hides, before the reports reach
+/// the tray, notifier, or UI, so a hidden pod affects none of them.
+fn hide_workloads(reports: &mut [ServerReport], config: &AppConfig) {
+    for report in reports {
+        let ServerReport::K8s {
+            name,
             health: Health::Online { metrics },
-            ..
-        },
-        ServerConfig::K8s(target),
-    ) = (report, server)
-    {
-        metrics.hide(&target.hidden);
+        } = report
+        else {
+            continue;
+        };
+        if let Some(ServerConfig::K8s(target)) = config.server(name.as_str()) {
+            metrics.hide(&target.hidden);
+        }
     }
 }
 
@@ -491,10 +491,13 @@ impl Poller {
         self.servers.retain(&config.servers);
         self.emit("poll-start", ());
 
-        let (reports, alerts) = tokio::join!(
+        let (mut reports, alerts) = tokio::join!(
             self.servers.poll(&config.servers),
             self.alerts.poll(config.grafana.as_ref()),
         );
+        // Against the config as it is now, not as the poll started: a
+        // workload hidden mid-poll must not notify or reach the tray.
+        hide_workloads(&mut reports, &self.config.snapshot().await);
 
         let metric_notices = self.notifier.metric_notices(&reports);
         let update = MetricsUpdate { servers: reports };
@@ -586,9 +589,9 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{K8sTarget, SshTarget};
+    use crate::config::{K8sTarget, SshTarget, WorkloadRef};
     use crate::metrics::tests::{cluster, host, make_alert, offline, pod, usage};
-    use crate::metrics::{AlertSeverity, AlertState, PodMetrics};
+    use crate::metrics::{AlertSeverity, AlertState};
     use std::path::PathBuf;
 
     #[test]
@@ -725,48 +728,59 @@ mod tests {
         assert!(pool.backoff_error(&broken).is_none(), "state was reset");
     }
 
-    fn k8s_server(name: &str, hidden: &[&PodMetrics]) -> ServerConfig {
+    fn k8s_server(name: &str, hidden: impl IntoIterator<Item = WorkloadRef>) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),
             namespace: "default".to_string(),
-            hidden: hidden.iter().map(|p| p.workload.clone()).collect(),
+            hidden: hidden.into_iter().collect(),
         })
     }
 
+    /// The workload of the `pod` fixture named `name`.
+    fn pod_workload(name: &str) -> WorkloadRef {
+        WorkloadRef {
+            kind: "Pod".to_string(),
+            name: name.to_string(),
+        }
+    }
+
     #[test]
-    fn hiding_a_workload_keeps_the_backoff() {
+    fn hiding_a_workload_keeps_the_backoff_and_the_backend() {
         let mut pool = ServerPool::default();
-        let server = k8s_server("prod", &[]);
+        let server = k8s_server("prod", []);
         for _ in 0..BACKOFF_THRESHOLD {
             pool.record(&server, &offline("prod"));
         }
 
-        let hiding = k8s_server("prod", &[&pod("api-1", 0, None)]);
+        let hiding = k8s_server("prod", [pod_workload("api-1")]);
 
         assert!(pool.backoff_error(&hiding).is_some());
+        assert!(Backend::new(&server).serves(&hiding));
     }
 
     #[test]
-    fn hidden_pods_never_leave_the_collect_task() {
-        let api = pod("api-1", 7, Some(usage(99.0, 99.0, 0.0)));
-        let mut report = cluster(
+    fn hidden_pods_reach_neither_tray_nor_notifier() {
+        let mut reports = [cluster(
             "prod",
             usage(1.0, 1.0, 1.0),
             Some(vec![
-                api.clone(),
+                pod("api-1", 7, Some(usage(99.0, 99.0, 0.0))),
                 pod("db-0", 0, Some(usage(1.0, 1.0, 0.0))),
             ]),
-        );
-        let reports = std::slice::from_mut(&mut report);
-        assert!(has_restarts(reports));
+        )];
+        assert!(has_restarts(&reports));
+        let config = AppConfig {
+            servers: vec![k8s_server("prod", [pod_workload("api-1")])],
+            ..AppConfig::default()
+        };
 
-        hide_workloads(&mut reports[0], &k8s_server("prod", &[&api]));
+        hide_workloads(&mut reports, &config);
 
-        assert!(!has_restarts(reports));
-        assert_eq!(worst_level(reports), MetricLevel::Ok);
-        let labels: Vec<String> = online_usage(reports).map(|(label, _)| label).collect();
+        assert!(!has_restarts(&reports));
+        assert_eq!(worst_level(&reports), MetricLevel::Ok);
+        let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
         assert_eq!(labels, ["prod", "prod/db-0"]);
     }
 

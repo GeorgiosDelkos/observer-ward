@@ -225,8 +225,8 @@ pub struct K8sTarget {
     pub kubeconfig: Option<PathBuf>,
     pub context: String,
     pub namespace: String,
-    /// Workloads whose pods are not shown, notified on, or counted in the
-    /// tray. Omitted from the file when empty, so older files load as is.
+    /// Workloads whose pods are not shown, counted in the tray, or raised
+    /// as threshold notifications (Grafana alerts are not filtered). Omitted from the file when empty, so older files load as is.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden: BTreeSet<WorkloadRef>,
 }
@@ -252,15 +252,16 @@ impl K8sTarget {
     }
 }
 
-/// The workload a pod belongs to: the stable identity pods are hidden by,
-/// since pod names change on every restart and rollout and their owner's
-/// do not.
-///
-/// `kind` is the Kubernetes kind (`Deployment`, `StatefulSet`, `Job`, a
-/// custom resource), or `Pod` for a pod without a controller.
+/// The workload a pod belongs to, which pods are hidden by: pod names
+/// change on every restart and rollout. The name is stable for
+/// deployments, stateful sets and daemon sets, but not for a cron job,
+/// whose Jobs are named per run, so hiding one hides only that run.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkloadRef {
+    /// The Kubernetes kind (`Deployment`, `StatefulSet`, `Job`, a custom
+    /// resource), or `Pod` for a pod without a controller.
     pub kind: String,
+    /// Name of the owning object, or of the pod itself when `kind` is `Pod`.
     pub name: String,
 }
 

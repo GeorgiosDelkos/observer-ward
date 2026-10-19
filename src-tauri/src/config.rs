@@ -1,6 +1,7 @@
 //! Persisted app configuration: model, validation, and JSON storage.
 
 use std::borrow::Borrow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -88,7 +89,10 @@ impl AppConfig {
         }
 
         for server in &self.servers {
-            if !previous.servers.contains(server) {
+            // Only the name is checked, so a server already there under the
+            // same name (say, with a workload newly hidden) needs no check,
+            // and a legacy name must not block that edit.
+            if count_named(previous, server.name()) == 0 {
                 server.name().validate()?;
             }
             // A name shared by more servers than before is a new duplicate,
@@ -221,6 +225,43 @@ pub struct K8sTarget {
     pub kubeconfig: Option<PathBuf>,
     pub context: String,
     pub namespace: String,
+    /// Workloads whose pods are not shown, notified on, or counted in the
+    /// tray. Omitted from the file when empty, so older files load as is.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub hidden: BTreeSet<WorkloadRef>,
+}
+
+impl K8sTarget {
+    /// Whether `other` reaches the same cluster and namespace. `hidden`
+    /// only filters what is shown, so changing it must not drop the
+    /// connection or reset a backoff.
+    #[must_use]
+    pub fn same_connection(&self, other: &K8sTarget) -> bool {
+        // Destructured so a new field must be classified here.
+        let K8sTarget {
+            name,
+            kubeconfig,
+            context,
+            namespace,
+            hidden: _,
+        } = self;
+        *name == other.name
+            && *kubeconfig == other.kubeconfig
+            && *context == other.context
+            && *namespace == other.namespace
+    }
+}
+
+/// The workload a pod belongs to: the stable identity pods are hidden by,
+/// since pod names change on every restart and rollout and their owner's
+/// do not.
+///
+/// `kind` is the Kubernetes kind (`Deployment`, `StatefulSet`, `Job`, a
+/// custom resource), or `Pod` for a pod without a controller.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkloadRef {
+    pub kind: String,
+    pub name: String,
 }
 
 /// An SSH host reached with key authentication.
@@ -245,6 +286,18 @@ impl ServerConfig {
         match self {
             ServerConfig::K8s(target) => &target.name,
             ServerConfig::Ssh(target) => &target.name,
+        }
+    }
+
+    /// Whether `other` connects to the same place; see
+    /// [`K8sTarget::same_connection`].
+    #[must_use]
+    pub fn same_connection(&self, other: &ServerConfig) -> bool {
+        match (self, other) {
+            (ServerConfig::K8s(a), ServerConfig::K8s(b)) => a.same_connection(b),
+            (ServerConfig::Ssh(a), ServerConfig::Ssh(b)) => a == b,
+            (ServerConfig::K8s(_), ServerConfig::Ssh(_))
+            | (ServerConfig::Ssh(_), ServerConfig::K8s(_)) => false,
         }
     }
 }
@@ -531,7 +584,63 @@ mod tests {
             kubeconfig: None,
             context: "ctx".to_string(),
             namespace: "default".to_string(),
+            hidden: BTreeSet::new(),
         })
+    }
+
+    fn deployment(name: &str) -> WorkloadRef {
+        WorkloadRef {
+            kind: "Deployment".to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn hidden_workloads_round_trip_and_are_omitted_when_empty() {
+        let json = serde_json::to_value(k8s("prod")).expect("serialize");
+        assert!(json.get("hidden").is_none(), "{json}");
+
+        let mut server = k8s("prod");
+        if let ServerConfig::K8s(target) = &mut server {
+            target.hidden.insert(deployment("api"));
+        }
+        let json = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(
+            json["hidden"],
+            serde_json::json!([{ "kind": "Deployment", "name": "api" }])
+        );
+        let back: ServerConfig = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, server);
+    }
+
+    #[test]
+    fn hiding_a_workload_keeps_the_connection() {
+        let ServerConfig::K8s(before) = k8s("prod") else {
+            panic!("k8s fixture");
+        };
+        let mut hidden = before.clone();
+        hidden.hidden.insert(deployment("api"));
+        let mut moved = before.clone();
+        moved.namespace = "other".to_string();
+
+        assert!(before.same_connection(&hidden));
+        assert!(!before.same_connection(&moved));
+        assert!(!k8s("prod").same_connection(&ssh("prod")));
+    }
+
+    #[test]
+    fn editing_a_legacy_server_in_place_is_not_revalidated() {
+        let previous = AppConfig {
+            servers: vec![k8s("prod/eu")],
+            ..AppConfig::default()
+        };
+        let mut next = previous.clone();
+        if let Some(ServerConfig::K8s(target)) = next.servers.first_mut() {
+            target.hidden.insert(deployment("api"));
+        }
+
+        next.validate_change_from(&previous)
+            .expect("hiding a workload on a legacy entry is allowed");
     }
 
     #[test]

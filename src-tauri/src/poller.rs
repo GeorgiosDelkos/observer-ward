@@ -107,12 +107,14 @@ impl Backend {
         }
     }
 
-    /// Whether this backend was built from exactly `server`. Any edit
-    /// means a fresh connection.
+    /// Whether this backend connects where `server` does. Any edit to the
+    /// connection means a fresh one; hiding a workload does not.
     fn serves(&self, server: &ServerConfig) -> bool {
         match (self, server) {
             (Backend::Ssh(backend), ServerConfig::Ssh(target)) => backend.target() == target,
-            (Backend::K8s(backend), ServerConfig::K8s(target)) => backend.target() == target,
+            (Backend::K8s(backend), ServerConfig::K8s(target)) => {
+                backend.target().same_connection(target)
+            }
             (Backend::Ssh(_), ServerConfig::K8s(_)) | (Backend::K8s(_), ServerConfig::Ssh(_)) => {
                 false
             }
@@ -249,11 +251,11 @@ impl ServerPool {
 
     /// The last error if `server` is in backoff. An expired backoff resets
     /// the counter for a fresh set of attempts, and so does any change to
-    /// the server's config: a corrected entry (removed and re-added under
-    /// the same name) must be contacted right away.
+    /// the server's connection: a corrected entry (removed and re-added
+    /// under the same name) must be contacted right away.
     fn backoff_error(&mut self, server: &ServerConfig) -> Option<String> {
         let state = self.failures.get_mut(server.name())?;
-        if state.server != *server {
+        if !state.server.same_connection(server) {
             self.failures.remove(server.name());
             return None;
         }
@@ -303,11 +305,28 @@ fn order_by_config(reports: &mut [ServerReport], servers: &[ServerConfig]) {
 
 async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput {
     let name = server.name().clone();
-    let Ok(report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
+    let Ok(mut report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
         let error = format!("timed out collecting metrics for {}", server.name());
         return (None, offline_report(&server, error));
     };
+    hide_workloads(&mut report, &server);
     (Some(backend), report)
+}
+
+/// Drop the pods `server` hides. Done here, from the current config and
+/// before the report reaches the tray, notifier, or UI, so a hidden pod
+/// affects none of them, and the backend is kept when only `hidden` changes.
+fn hide_workloads(report: &mut ServerReport, server: &ServerConfig) {
+    if let (
+        ServerReport::K8s {
+            health: Health::Online { metrics },
+            ..
+        },
+        ServerConfig::K8s(target),
+    ) = (report, server)
+    {
+        metrics.hide(&target.hidden);
+    }
 }
 
 /// Replace the cached value. The slot holds a value replaced wholesale, so
@@ -567,9 +586,9 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SshTarget;
+    use crate::config::{K8sTarget, SshTarget};
     use crate::metrics::tests::{cluster, host, make_alert, offline, pod, usage};
-    use crate::metrics::{AlertSeverity, AlertState};
+    use crate::metrics::{AlertSeverity, AlertState, PodMetrics};
     use std::path::PathBuf;
 
     #[test]
@@ -704,6 +723,51 @@ mod tests {
 
         assert!(pool.backoff_error(&fixed).is_none());
         assert!(pool.backoff_error(&broken).is_none(), "state was reset");
+    }
+
+    fn k8s_server(name: &str, hidden: &[&PodMetrics]) -> ServerConfig {
+        ServerConfig::K8s(K8sTarget {
+            name: name.into(),
+            kubeconfig: None,
+            context: "ctx".to_string(),
+            namespace: "default".to_string(),
+            hidden: hidden.iter().map(|p| p.workload.clone()).collect(),
+        })
+    }
+
+    #[test]
+    fn hiding_a_workload_keeps_the_backoff() {
+        let mut pool = ServerPool::default();
+        let server = k8s_server("prod", &[]);
+        for _ in 0..BACKOFF_THRESHOLD {
+            pool.record(&server, &offline("prod"));
+        }
+
+        let hiding = k8s_server("prod", &[&pod("api-1", 0, None)]);
+
+        assert!(pool.backoff_error(&hiding).is_some());
+    }
+
+    #[test]
+    fn hidden_pods_never_leave_the_collect_task() {
+        let api = pod("api-1", 7, Some(usage(99.0, 99.0, 0.0)));
+        let mut report = cluster(
+            "prod",
+            usage(1.0, 1.0, 1.0),
+            Some(vec![
+                api.clone(),
+                pod("db-0", 0, Some(usage(1.0, 1.0, 0.0))),
+            ]),
+        );
+        let reports = std::slice::from_mut(&mut report);
+        assert!(has_restarts(reports));
+
+        hide_workloads(&mut reports[0], &k8s_server("prod", &[&api]));
+
+        assert!(!has_restarts(reports));
+        assert_eq!(worst_level(reports), MetricLevel::Ok);
+        let labels: Vec<String> = online_usage(reports).map(|(label, _)| label).collect();
+        assert_eq!(labels, ["prod", "prod/db-0"]);
     }
 
     #[test]

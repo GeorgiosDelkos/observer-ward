@@ -222,6 +222,7 @@ mod tests {
             kubeconfig: kubeconfig.map(PathBuf::from),
             context: "prod-ctx".to_string(),
             namespace: "default".to_string(),
+            hidden: std::collections::BTreeSet::new(),
         }
     }
 

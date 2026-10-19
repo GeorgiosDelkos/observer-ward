@@ -5,6 +5,7 @@
 //! command runs on the main thread, where a Keychain prompt or slow disk
 //! would freeze the UI.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -13,7 +14,9 @@ use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Notify;
 
-use crate::config::{self, AppConfig, ConfigError, ConfigStore, ServerConfig, Settings};
+use crate::config::{
+    self, AppConfig, ConfigError, ConfigStore, ServerConfig, Settings, WorkloadRef,
+};
 use crate::error::error_chain;
 use crate::grafana::{self, GrafanaError, TokenEpoch};
 use crate::k8s::{self, K8sError};
@@ -155,6 +158,59 @@ pub(crate) async fn remove_server(
         .await?;
     wake.0.notify_one();
     Ok(next)
+}
+
+/// Stop showing, notifying on, and counting the pods of `workload` in
+/// cluster `server`. Hiding an already hidden workload is a no-op.
+#[tauri::command]
+pub(crate) async fn hide_workload(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    server: String,
+    workload: WorkloadRef,
+) -> CommandResult<AppConfig> {
+    let next = store
+        .update(|config| {
+            hidden_workloads(config, server)?.insert(workload);
+            Ok::<_, CommandError>(())
+        })
+        .await?;
+    wake.0.notify_one();
+    Ok(next)
+}
+
+/// Undo [`hide_workload`]. Showing a workload that is not hidden is a
+/// no-op.
+#[tauri::command]
+pub(crate) async fn show_workload(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    server: String,
+    workload: WorkloadRef,
+) -> CommandResult<AppConfig> {
+    let next = store
+        .update(|config| {
+            hidden_workloads(config, server)?.remove(&workload);
+            Ok::<_, CommandError>(())
+        })
+        .await?;
+    wake.0.notify_one();
+    Ok(next)
+}
+
+fn hidden_workloads(
+    config: &mut AppConfig,
+    server: String,
+) -> CommandResult<&mut BTreeSet<WorkloadRef>> {
+    match config
+        .servers
+        .iter_mut()
+        .find(|s| s.name().as_str() == server)
+    {
+        Some(ServerConfig::K8s(target)) => Ok(&mut target.hidden),
+        Some(ServerConfig::Ssh(_)) => Err(wrong_kind(server, "a Kubernetes")),
+        None => Err(CommandError::UnknownServer(server)),
+    }
 }
 
 /// Show a native file picker for a kubeconfig and return the chosen path,
@@ -394,8 +450,52 @@ pub(crate) fn open_url(url: String) -> CommandResult<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CommandError, open_url, validate_new_server};
-    use crate::config::{K8sTarget, ServerConfig, SshTarget};
+    use super::{CommandError, hidden_workloads, open_url, validate_new_server};
+    use crate::config::{AppConfig, K8sTarget, ServerConfig, SshTarget, WorkloadRef};
+
+    #[test]
+    fn hidden_workloads_are_edited_on_the_named_cluster_only() {
+        let mut config = AppConfig {
+            servers: vec![
+                ServerConfig::K8s(K8sTarget {
+                    name: "prod".into(),
+                    kubeconfig: None,
+                    context: "prod".to_string(),
+                    namespace: "default".to_string(),
+                    hidden: std::collections::BTreeSet::new(),
+                }),
+                ServerConfig::Ssh(SshTarget {
+                    name: "bastion".into(),
+                    host: "10.0.1.50".to_string(),
+                    port: 22,
+                    user: "admin".to_string(),
+                    key_path: PathBuf::from("/k"),
+                }),
+            ],
+            ..AppConfig::default()
+        };
+        let api = WorkloadRef {
+            kind: "Deployment".to_string(),
+            name: "api".to_string(),
+        };
+
+        hidden_workloads(&mut config, "prod".to_string())
+            .expect("k8s server")
+            .insert(api.clone());
+
+        let Some(ServerConfig::K8s(prod)) = config.servers.first() else {
+            unreachable!("fixture order");
+        };
+        assert!(prod.hidden.contains(&api));
+        assert!(matches!(
+            hidden_workloads(&mut config, "bastion".to_string()),
+            Err(CommandError::WrongServerKind { .. })
+        ));
+        assert!(matches!(
+            hidden_workloads(&mut config, "nope".to_string()),
+            Err(CommandError::UnknownServer(_))
+        ));
+    }
 
     #[tokio::test]
     async fn new_k8s_server_with_missing_kubeconfig_is_rejected() {
@@ -406,6 +506,7 @@ mod tests {
             kubeconfig: Some(missing.clone()),
             context: "hippius".to_string(),
             namespace: "default".to_string(),
+            hidden: std::collections::BTreeSet::new(),
         });
 
         let err = validate_new_server(&server)

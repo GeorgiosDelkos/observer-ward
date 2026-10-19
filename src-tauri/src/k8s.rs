@@ -1,17 +1,18 @@
 //! Kubernetes Metrics API + kubelet stats collection.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams};
 
-use crate::config::K8sTarget;
+use crate::config::{K8sTarget, WorkloadRef};
 use crate::metrics::{ClusterMetrics, NetSample, PodMetrics, Usage, percent};
 
 mod error;
 mod events;
+mod jobs;
 mod kubeconfig;
 mod metrics_api;
 mod pods;
@@ -22,8 +23,9 @@ pub(crate) use error::K8sError;
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
+use jobs::{JobList, JobOwners, list_job_owners};
 use metrics_api::{NodeMetrics, PodMetrics as PodMetricsSample};
-use pods::{PodContext, assemble_pods};
+use pods::{PodContext, assemble_pods, jobs_of};
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
 use stats::{
     StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc, fetch_all_node_stats,
@@ -53,6 +55,11 @@ pub(crate) struct K8sBackend {
     client: Option<Client>,
     prev_net: Option<NetSample>,
     prev_pod_net: HashMap<String, NetSample>,
+    /// From the last Job list, kept until a Job with pods is missing from it.
+    job_owners: JobOwners,
+    /// Reading Jobs was refused; not retried until the client is rebuilt
+    /// (new credentials may allow it).
+    jobs_forbidden: bool,
 }
 
 impl K8sBackend {
@@ -62,7 +69,15 @@ impl K8sBackend {
             client: None,
             prev_net: None,
             prev_pod_net: HashMap::new(),
+            job_owners: JobOwners::new(),
+            jobs_forbidden: false,
         }
+    }
+
+    /// Take the current hidden workloads. Only `hidden` may change without
+    /// a new backend: anything else is a different connection.
+    pub(crate) fn set_hidden(&mut self, hidden: BTreeSet<WorkloadRef>) {
+        self.target.hidden = hidden;
     }
 
     pub(crate) fn target(&self) -> &K8sTarget {
@@ -79,9 +94,12 @@ impl K8sBackend {
     /// (nodes, node metrics) fails. Pod and event listing failures only
     /// degrade the result.
     pub(crate) async fn collect(&mut self) -> Result<ClusterMetrics, K8sError> {
-        let client = match &self.client {
-            Some(client) => client.clone(),
-            None => self.connect().await?,
+        let client = if let Some(client) = &self.client {
+            client.clone()
+        } else {
+            // New credentials may be allowed to read Jobs.
+            self.jobs_forbidden = false;
+            self.connect().await?
         };
         let result = self.collect_with(&client).await;
         self.client = result.is_ok().then_some(client);
@@ -125,6 +143,7 @@ impl K8sBackend {
 
         let pods = match pod_lists {
             Ok((samples, specs)) => {
+                self.resolve_jobs(client, &specs).await;
                 Some(self.pod_cards(&samples, &specs, &stats, &events, allocatable))
             }
             Err(e) => {
@@ -177,6 +196,29 @@ impl K8sBackend {
         }
     }
 
+    /// Re-list the namespace's Jobs when a Job with pods is not in the last
+    /// list: a new cron job run. Otherwise the last list still answers.
+    async fn resolve_jobs(&mut self, client: &Client, specs: &[Pod]) {
+        let wanted = jobs_of(specs);
+        let known = wanted.iter().all(|job| self.job_owners.contains_key(*job));
+        if known || self.jobs_forbidden {
+            return;
+        }
+        let namespace = &self.target.namespace;
+        match list_job_owners(client, namespace, &wanted).await {
+            JobList::Owners(owners) => self.job_owners = owners,
+            JobList::Forbidden => {
+                tracing::warn!(
+                    "no permission to list jobs in {}/{namespace}: \
+                     hidden cron jobs are matched by run name only",
+                    self.target.name
+                );
+                self.jobs_forbidden = true;
+            }
+            JobList::Failed => {}
+        }
+    }
+
     fn pod_cards(
         &mut self,
         samples: &[PodMetricsSample],
@@ -199,6 +241,8 @@ impl K8sBackend {
                 net: &net,
                 prev_net: &self.prev_pod_net,
                 events,
+                hidden: &self.target.hidden,
+                job_owners: &self.job_owners,
             },
         );
         self.prev_pod_net = net;

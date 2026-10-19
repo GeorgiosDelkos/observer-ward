@@ -202,6 +202,7 @@ fn run_in_terminal_app(cmd: &str) -> Result<(), TerminalError> {
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
@@ -222,6 +223,7 @@ mod tests {
             kubeconfig: kubeconfig.map(PathBuf::from),
             context: "prod-ctx".to_string(),
             namespace: "default".to_string(),
+            hidden: BTreeSet::new(),
         }
     }
 

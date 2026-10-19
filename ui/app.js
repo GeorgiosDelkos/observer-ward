@@ -9,6 +9,10 @@ const WIN_PADDING = 20;
 const VISIBLE_POD_CARDS = 3;
 
 const UNITS = ["B/s", "KB/s", "MB/s", "GB/s"];
+
+const TRASH_ICON = `<svg class="trash-icon" viewBox="0 0 16 16" aria-hidden="true">
+  <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.7 9.5h6.6L12 4M6.75 6.5v4.5M9.25 6.5v4.5"/>
+</svg>`;
 const KILO = 1024;
 
 // ── State ─────────────────────────────────────
@@ -75,6 +79,20 @@ const sshFields = document.querySelectorAll(".field-ssh");
 
 // ── Window Sizing ────────────────────────────
 
+// Padding around an open modal; matches `.modal-overlay` in styles.css.
+const MODAL_INSET = 20;
+
+// An open modal can be taller than the list it covers, and the window
+// clips it: stretch the container to fit it while it is open.
+function fitOpenModal() {
+  const container = document.querySelector(".container");
+  const modal = document.querySelector(".modal-overlay.open .modal");
+  container.style.minHeight = modal
+    ? `${modal.offsetHeight + 2 * MODAL_INSET}px`
+    : "";
+  return container.offsetHeight;
+}
+
 function resizeToContent() {
   const header = document.querySelector(".header");
   const footer = document.querySelector(".footer");
@@ -89,7 +107,7 @@ function resizeToContent() {
     footer.offsetHeight +
     WIN_PADDING;
 
-  const height = Math.max(WIN_MIN_HEIGHT, contentHeight);
+  const height = Math.max(WIN_MIN_HEIGHT, contentHeight, fitOpenModal() + WIN_PADDING);
   invoke("resize_window", { width: WIN_WIDTH, height }).catch(() => {});
 }
 
@@ -540,10 +558,44 @@ function renderPodCard(pod) {
         <span class="server-name">${escapeHtml(getDisplayName(name, pod.displayName))}</span>
         ${badgesHtml}
         <button class="btn-logs" data-pod-full="${escapeHtml(name)}">logs</button>
+        ${renderHideButton(pod)}
         ${offlineHtml}
       </div>
       ${metricsHtml}
     </div>`;
+}
+
+// Pods are hidden by the workload that owns them (see `WorkloadRef` in
+// config.rs), since pod names change on every restart and rollout.
+function workloadLabel(workload) {
+  return `${workload.kind.toLowerCase()} ${workload.name}`;
+}
+
+function sameWorkload(a, b) {
+  return a.kind === b.kind && a.name === b.name;
+}
+
+function hiddenWorkloads(cluster) {
+  return findServerConfig(cluster)?.hidden ?? [];
+}
+
+function renderHideButton(pod) {
+  const label = escapeHtml(`Hide ${workloadLabel(pod.workload)}`);
+  return `<button type="button" class="btn-trash btn-hide"
+    data-cluster="${escapeHtml(pod.cluster)}"
+    data-kind="${escapeHtml(pod.workload.kind)}"
+    data-workload="${escapeHtml(pod.workload.name)}"
+    title="${label}" aria-label="${label}">${TRASH_ICON}</button>`;
+}
+
+function renderHiddenChip(clusterName) {
+  const count = hiddenWorkloads(clusterName).length;
+  if (count === 0) {
+    return "";
+  }
+  return `<button type="button" class="cluster-hidden"
+    data-cluster="${escapeHtml(clusterName)}"
+    title="Show hidden workloads">${count} hidden</button>`;
 }
 
 function renderClusterSummary(clusterName, clusterPods) {
@@ -577,6 +629,7 @@ function renderClusterSummary(clusterName, clusterPods) {
       <span class="cluster-stat">${clusterPods.length} pods</span>
       <span class="cluster-stat">${formatMillicores(totalCpu)} CPU</span>
       <span class="cluster-stat">${formatMemory(totalMem)} MEM</span>
+      ${renderHiddenChip(clusterName)}
       ${renderRemoveButton(clusterName)}
     </div>`;
 }
@@ -608,6 +661,13 @@ function renderAll() {
       clusterGroups[cluster] = [];
     }
     clusterGroups[cluster].push(pod);
+  }
+  // A cluster whose every pod is hidden still needs its summary row:
+  // the "hidden" chip on it is the only way to show them again.
+  for (const server of servers) {
+    if (hiddenWorkloads(server.name).length > 0 && !clusterGroups[server.name]) {
+      clusterGroups[server.name] = [];
+    }
   }
 
   let podHtml = "";
@@ -862,9 +922,9 @@ const ctxRemove = document.getElementById("ctx-remove");
 const ctxSeparator = contextMenu.querySelector(".context-menu-separator");
 
 function renderRemoveButton(name) {
-  return `<button type="button" class="btn-remove"
+  return `<button type="button" class="btn-trash btn-remove"
     data-server-name="${escapeHtml(name)}"
-    title="Remove">remove</button>`;
+    title="Remove" aria-label="Remove">${TRASH_ICON}</button>`;
 }
 
 function showContextMenu(e, target) {
@@ -941,6 +1001,7 @@ function openRemoveModal(name) {
   removeModalBody.textContent =
     `Remove "${label}"? This cannot be undone.`;
   removeModal.classList.add("open");
+  resizeToContent();
   btnRemoveCancel.focus();
 }
 
@@ -950,6 +1011,7 @@ function closeRemoveModal() {
   }
   pendingRemoveName = null;
   removeModal.classList.remove("open");
+  resizeToContent();
 }
 
 async function confirmRemove() {
@@ -993,6 +1055,98 @@ async function removeServerByName(name) {
     }
   }
   pods = pods.filter((p) => p.cluster !== name);
+  renderAll();
+}
+
+function forgetCard(key) {
+  delete metricsCache[key];
+  delete metricsHistory[key];
+  delete anomalyState[key];
+}
+
+// Hiding is undone from the "hidden" chip, so it needs no confirmation.
+// The cards go at once; the backend drops them from every later poll.
+async function hideWorkload(cluster, workload) {
+  try {
+    const config = await invoke("hide_workload", { server: cluster, workload });
+    servers = config.servers;
+  } catch (err) {
+    openHiddenModal(cluster, `Could not hide ${workloadLabel(workload)}: ${err}`);
+    return;
+  }
+  pods = pods.filter((p) => {
+    const hidden = p.cluster === cluster && sameWorkload(p.workload, workload);
+    if (hidden) {
+      forgetCard(p.name);
+    }
+    return !hidden;
+  });
+  renderAll();
+}
+
+const hiddenModal = document.getElementById("hidden-modal");
+const hiddenModalTitle = document.getElementById("hidden-modal-title");
+const hiddenModalList = document.getElementById("hidden-modal-list");
+const hiddenModalError = document.getElementById("hidden-modal-error");
+const btnHiddenClose = document.getElementById("btn-hidden-close");
+let hiddenModalCluster = null;
+
+function renderHiddenModalList() {
+  const workloads = hiddenWorkloads(hiddenModalCluster);
+  hiddenModalList.innerHTML = workloads.length === 0
+    ? '<li class="hidden-empty">Nothing hidden</li>'
+    : workloads.map((w) => `
+      <li class="hidden-row">
+        <span class="hidden-kind">${escapeHtml(w.kind.toLowerCase())}</span>
+        <span class="hidden-name">${escapeHtml(w.name)}</span>
+        <button type="button" class="btn-show"
+          data-kind="${escapeHtml(w.kind)}"
+          data-workload="${escapeHtml(w.name)}">show</button>
+      </li>`).join("");
+}
+
+function openHiddenModal(cluster, error = "") {
+  hideContextMenu();
+  hiddenModalCluster = cluster;
+  hiddenModalTitle.textContent =
+    `Hidden in ${getDisplayName(cluster, cluster)}`;
+  hiddenModalError.textContent = error;
+  hiddenModalError.hidden = !error;
+  renderHiddenModalList();
+  hiddenModal.classList.add("open");
+  resizeToContent();
+  btnHiddenClose.focus();
+}
+
+function closeHiddenModal() {
+  const cluster = hiddenModalCluster;
+  hiddenModalCluster = null;
+  hiddenModal.classList.remove("open");
+  resizeToContent();
+  // Back to the chip that opened it, when it is still there.
+  serverListEl
+    .querySelector(`.cluster-hidden[data-cluster="${CSS.escape(cluster ?? "")}"]`)
+    ?.focus();
+}
+
+// The pods come back with the poll that `show_workload` wakes.
+async function showWorkload(workload) {
+  const cluster = hiddenModalCluster;
+  try {
+    const config = await invoke("show_workload", { server: cluster, workload });
+    servers = config.servers;
+  } catch (err) {
+    hiddenModalError.textContent = `Could not show ${workloadLabel(workload)}: ${err}`;
+    hiddenModalError.hidden = false;
+    return;
+  }
+  hiddenModalError.hidden = true;
+  if (hiddenWorkloads(cluster).length === 0) {
+    closeHiddenModal();
+  } else {
+    renderHiddenModalList();
+    btnHiddenClose.focus();
+  }
   renderAll();
 }
 
@@ -1345,7 +1499,13 @@ function handleMetricsUpdate(event) {
       continue;
     }
     polledClusters.add(name);
+    // The backend filters hidden pods too; this covers a poll already
+    // in flight when a workload was hidden.
+    const hidden = hiddenWorkloads(name);
     for (const pod of m.pods) {
+      if (hidden.some((w) => sameWorkload(w, pod.workload))) {
+        continue;
+      }
       const key = `${name}/${pod.name}`;
       metricsCache[key] = cardMetrics({
         usage: pod.usage,
@@ -1365,6 +1525,7 @@ function handleMetricsUpdate(event) {
         name: key,
         displayName: pod.name,
         cluster: name,
+        workload: pod.workload,
         type: "pod",
       });
     }
@@ -1583,6 +1744,29 @@ document.getElementById("btn-close-settings")
 document.getElementById("btn-save-settings")
   .addEventListener("click", saveSettings);
 
+btnHiddenClose.addEventListener("click", closeHiddenModal);
+hiddenModal.addEventListener("click", (e) => {
+  if (e.target === hiddenModal) {
+    closeHiddenModal();
+    return;
+  }
+  const btn = e.target.closest(".btn-show");
+  if (btn) {
+    showWorkload({ kind: btn.dataset.kind, name: btn.dataset.workload });
+  }
+});
+hiddenModal.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab" || !hiddenModal.classList.contains("open")) {
+    return;
+  }
+  const order = [...hiddenModal.querySelectorAll("button")];
+  const idx = order.indexOf(document.activeElement);
+  e.preventDefault();
+  const step = e.shiftKey ? -1 : 1;
+  const next = idx < 0 ? 0 : (idx + step + order.length) % order.length;
+  order[next].focus();
+});
+
 btnRemoveCancel.addEventListener("click", closeRemoveModal);
 btnRemoveConfirm.addEventListener("click", confirmRemove);
 removeModal.addEventListener("click", (e) => {
@@ -1613,6 +1797,23 @@ serverListEl.addEventListener("click", (e) => {
     const name = removeBtn.dataset.serverName;
     if (name) {
       openRemoveModal(name);
+    }
+    return;
+  }
+  const hideBtn = e.target.closest(".btn-hide");
+  if (hideBtn) {
+    e.stopPropagation();
+    const { cluster, kind, workload } = hideBtn.dataset;
+    if (cluster && kind && workload) {
+      hideWorkload(cluster, { kind, name: workload });
+    }
+    return;
+  }
+  const hiddenChip = e.target.closest(".cluster-hidden");
+  if (hiddenChip) {
+    e.stopPropagation();
+    if (hiddenChip.dataset.cluster) {
+      openHiddenModal(hiddenChip.dataset.cluster);
     }
     return;
   }
@@ -1770,6 +1971,10 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (removeModal.classList.contains("open")) {
       closeRemoveModal();
+      return;
+    }
+    if (hiddenModal.classList.contains("open")) {
+      closeHiddenModal();
       return;
     }
     hideContextMenu();

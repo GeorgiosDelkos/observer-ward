@@ -20,8 +20,9 @@ use tokio::sync::Notify;
 use commands::{
     LatestAlerts, LatestMetrics, TokenEpochState, WakeState, add_server, copy_to_clipboard,
     delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics, has_grafana_token,
-    inspect_kubeconfig, open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig, pick_ssh_key,
-    quit_app, remove_server, resize_window, save_settings, set_grafana_token,
+    hide_workload, inspect_kubeconfig, open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig,
+    pick_ssh_key, quit_app, remove_server, resize_window, save_settings, set_grafana_token,
+    show_workload,
 };
 use config::ConfigStore;
 use grafana::TokenEpoch;
@@ -77,6 +78,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             pick_ssh_key,
             inspect_kubeconfig,
             remove_server,
+            hide_workload,
+            show_workload,
             resize_window,
             open_ssh_terminal,
             open_pod_logs,

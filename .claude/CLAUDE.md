@@ -42,7 +42,7 @@ cargo tauri build                                   # production build
 
 **Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update`, `poll-start`, and `alerts-update` events from the backend.
 
-Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`.
+Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`. Pods are hidden by owning workload (`K8sTarget.hidden`), filtered in the poller so hidden pods never reach the tray, notifier, or UI.
 
 **Data flow:** Poll loop -> collect metrics per server -> emit Tauri event -> frontend re-renders.
 

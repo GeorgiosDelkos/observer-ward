@@ -5,13 +5,13 @@
 //! something for pods cannot appear, zeroed, on an SSH host; and an
 //! offline server carries its error instead of a row of zeros.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::BuildHasher;
 use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::config::ServerName;
+use crate::config::{ServerName, WorkloadRef};
 
 /// Event payload sent to the frontend as `metrics-update`.
 #[derive(Debug, Clone, Serialize)]
@@ -164,11 +164,21 @@ pub struct ClusterMetrics {
     pub pods: Option<Vec<PodMetrics>>,
 }
 
+impl ClusterMetrics {
+    /// Drop the pods of every workload in `hidden`.
+    pub fn hide(&mut self, hidden: &BTreeSet<WorkloadRef>) {
+        if let Some(pods) = &mut self.pods {
+            pods.retain(|pod| !hidden.contains(&pod.workload));
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PodMetrics {
     pub name: String,
-    /// `None` when the pod spec was not in the listing (a pod created or
-    /// deleted between the two list calls).
+    /// What hiding this pod hides.
+    pub workload: WorkloadRef,
+    /// `None` when the pod reports no status yet.
     pub status: Option<PodStatus>,
     pub restart_count: u32,
     /// RFC 3339, second precision.
@@ -422,6 +432,7 @@ pub fn newly_firing<'a, S: BuildHasher>(
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "panicking on failure is standard in tests"
 )]
 pub(crate) mod tests {
@@ -458,6 +469,10 @@ pub(crate) mod tests {
     pub(crate) fn pod(name: &str, restarts: u32, usage: Option<Usage>) -> PodMetrics {
         PodMetrics {
             name: name.to_string(),
+            workload: WorkloadRef {
+                kind: "Pod".to_string(),
+                name: name.to_string(),
+            },
             status: Some(PodStatus::Running),
             restart_count: restarts,
             start_time: None,
@@ -487,6 +502,37 @@ pub(crate) mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn hide_drops_only_pods_of_hidden_workloads() {
+        let mut report = cluster(
+            "prod",
+            usage(0.0, 0.0, 0.0),
+            Some(vec![pod("api-1", 0, None), pod("db-0", 0, None)]),
+        );
+        let ServerReport::K8s {
+            health: Health::Online { metrics },
+            ..
+        } = &mut report
+        else {
+            panic!("cluster fixture is online");
+        };
+        let hidden = BTreeSet::from([metrics.pods.as_ref().expect("pods")[0].workload.clone()]);
+
+        metrics.hide(&hidden);
+
+        let names: Vec<_> = metrics
+            .pods
+            .iter()
+            .flatten()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["db-0"]);
+
+        metrics.pods = None;
+        metrics.hide(&hidden);
+        assert!(metrics.pods.is_none(), "a failed listing stays failed");
     }
 
     #[test]

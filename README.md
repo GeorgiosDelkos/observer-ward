@@ -63,15 +63,17 @@ Click the tray icon to open the popover. Click outside it to dismiss.
 
 Adding checks the kubeconfig can be read and the context resolves to a cluster, so a mistyped path or context is reported in the form rather than saved. If a server goes offline later, its card shows why; right-click → **Copy Error** copies the full message.
 
-The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API.
+The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API (plus `get` on Jobs, to hide CronJobs).
 
 Expanded pod lists show three pods at a time (scroll for the rest) and are sorted A–Z.
 
 ### Hide pods
 
-Click the trash icon on a pod card to stop tracking it. This hides the workload that owns the pod (its Deployment, StatefulSet, DaemonSet, or Job; a pod with no controller is hidden by name), so it stays hidden across restarts and rollouts. Hidden pods are left out of the list, the tray icon, and notifications. Nothing is deleted from the cluster.
+Click the trash icon on a pod card to stop tracking it. This hides the workload that owns the pod (its Deployment, StatefulSet, DaemonSet, CronJob, or Argo Rollout; a pod with no controller is hidden by name), so it stays hidden across restarts and rollouts. Hidden pods are left out of the list, the tray icon, and notifications. Nothing is deleted from the cluster.
 
-The cluster row then shows **N hidden**; click it and choose **show** to track a workload again. Each CronJob run is its own Job, so hiding one hides only that run.
+The cluster row then shows **N hidden**; click it and choose **show** to track a workload again. Hidden pods are skipped as soon as they are listed, so no per-pod work is done for them.
+
+CronJob pods are matched to their CronJob by reading the Job of each run, once. Without permission to `get` Jobs, a CronJob pod hides only its own run.
 
 ### Add an SSH server
 

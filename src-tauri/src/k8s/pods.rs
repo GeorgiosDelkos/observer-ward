@@ -1,14 +1,16 @@
 //! Per-pod metric assembly from Metrics API samples and pod specs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use k8s_openapi::api::core::v1::{Container, Pod, PodStatus as K8sPodStatus};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::config::WorkloadRef;
 use crate::metrics::{Capacity, NetSample, PodMetrics, PodStatus, PodUsage, Usage, percent};
 
 use super::error::K8sError;
+use super::jobs::{JOB, JobOwners};
 use super::metrics_api::PodMetrics as PodMetricsSample;
 use super::quantity::{parse_cpu_quantity, parse_memory_quantity};
 
@@ -22,12 +24,15 @@ pub(super) struct PodContext<'a> {
     pub(super) net: &'a HashMap<String, NetSample>,
     pub(super) prev_net: &'a HashMap<String, NetSample>,
     pub(super) events: &'a HashMap<String, String>,
+    /// Workloads whose pods get no card, and so no further work.
+    pub(super) hidden: &'a BTreeSet<WorkloadRef>,
+    pub(super) job_owners: &'a JobOwners,
 }
 
 /// One card per pod in the namespace. Pods present in metrics-server get
 /// usage; pods only in the spec list (Pending, crash-looping with no
 /// samples) still get a card so they are not invisible. Succeeded pods
-/// are skipped.
+/// and pods of hidden workloads are skipped.
 pub(super) fn assemble_pods(
     samples: &[PodMetricsSample],
     specs: &[Pod],
@@ -37,6 +42,12 @@ pub(super) fn assemble_pods(
         .iter()
         .filter_map(|p| p.metadata.name.as_deref().map(|n| (n, p)))
         .collect();
+    let workloads: HashMap<&str, WorkloadRef> = spec_by_name
+        .iter()
+        .map(|(&name, &spec)| (name, pod_workload(name, spec, ctx.job_owners)))
+        .collect();
+    // A pod without a spec has no known workload, so it is never hidden.
+    let hidden = |name: &str| workloads.get(name).is_some_and(|w| ctx.hidden.contains(w));
 
     let mut pods = Vec::with_capacity(samples.len().max(specs.len()));
     let mut seen = HashSet::new();
@@ -45,11 +56,14 @@ pub(super) fn assemble_pods(
         let Some(name) = sample.metadata.name.as_deref() else {
             continue;
         };
+        if hidden(name) {
+            continue;
+        }
         let spec = spec_by_name.get(name).copied();
         match sample_usage(name, sample, spec, ctx) {
             Ok(usage) => {
                 seen.insert(name);
-                pods.push(pod_card(name, spec, Some(usage), ctx));
+                pods.push(pod_card(name, spec, workloads.get(name), Some(usage), ctx));
             }
             Err(e) => {
                 tracing::warn!("skipping pod {name}: {}", crate::error::error_chain(&e));
@@ -58,10 +72,13 @@ pub(super) fn assemble_pods(
     }
 
     for (&name, &spec) in &spec_by_name {
-        if seen.contains(name) || derive_pod_status(spec) == Some(PodStatus::Succeeded) {
+        if seen.contains(name)
+            || hidden(name)
+            || derive_pod_status(spec) == Some(PodStatus::Succeeded)
+        {
             continue;
         }
-        pods.push(pod_card(name, Some(spec), None, ctx));
+        pods.push(pod_card(name, Some(spec), workloads.get(name), None, ctx));
     }
 
     pods.sort_by(|a, b| a.name.cmp(&b.name));
@@ -71,6 +88,7 @@ pub(super) fn assemble_pods(
 fn pod_card(
     name: &str,
     spec: Option<&Pod>,
+    workload: Option<&WorkloadRef>,
     usage: Option<PodUsage>,
     ctx: &PodContext<'_>,
 ) -> PodMetrics {
@@ -80,7 +98,7 @@ fn pod_card(
     };
     PodMetrics {
         name: name.to_string(),
-        workload: spec.map(|spec| pod_workload(name, spec)),
+        workload: workload.cloned(),
         status: spec.and_then(derive_pod_status),
         restart_count: spec.map_or(0, pod_restart_count),
         start_time: spec.and_then(pod_start_time),
@@ -141,20 +159,21 @@ const REPLICA_SET_OWNERS: [(&str, &str); 2] = [
 ];
 
 /// The workload that owns `pod`: its controller, with a replica set
-/// resolved to the Deployment (or Argo Rollout) that made it. A pod
-/// without a controller is its own workload.
-pub(super) fn pod_workload(name: &str, pod: &Pod) -> WorkloadRef {
-    let owner = pod
-        .metadata
-        .owner_references
-        .as_deref()
-        .and_then(|owners| owners.iter().find(|o| o.controller == Some(true)));
-    let Some(owner) = owner else {
+/// resolved to the Deployment (or Argo Rollout) that made it, and a Job
+/// to its cron job when `job_owners` knows one. A pod without a controller
+/// is its own workload.
+pub(super) fn pod_workload(name: &str, pod: &Pod, job_owners: &JobOwners) -> WorkloadRef {
+    let Some(owner) = controller(pod) else {
         return WorkloadRef {
             kind: POD.to_string(),
             name: name.to_string(),
         };
     };
+    if owner.kind == JOB
+        && let Some(cron_job) = job_owners.get(&owner.name).and_then(Option::as_ref)
+    {
+        return cron_job.clone();
+    }
 
     let labels = pod.metadata.labels.as_ref();
     let rollout_owner = REPLICA_SET_OWNERS
@@ -172,6 +191,26 @@ pub(super) fn pod_workload(name: &str, pod: &Pod) -> WorkloadRef {
         kind: owner.kind.clone(),
         name: owner.name.clone(),
     })
+}
+
+/// The Jobs whose cron job is worth knowing: those controlling a pod that
+/// gets a card (a succeeded pod gets none).
+pub(super) fn jobs_with_cards(specs: &[Pod]) -> HashSet<&str> {
+    specs
+        .iter()
+        .filter(|pod| derive_pod_status(pod) != Some(PodStatus::Succeeded))
+        .filter_map(controller)
+        .filter(|owner| owner.kind == JOB)
+        .map(|owner| owner.name.as_str())
+        .collect()
+}
+
+fn controller(pod: &Pod) -> Option<&OwnerReference> {
+    pod.metadata
+        .owner_references
+        .as_deref()?
+        .iter()
+        .find(|o| o.controller == Some(true))
 }
 
 /// The owner that made `replica_set`, named `<owner>-<template_hash>`.
@@ -436,6 +475,8 @@ mod tests {
         net: HashMap<String, NetSample>,
         prev_net: HashMap<String, NetSample>,
         events: HashMap<String, String>,
+        hidden: BTreeSet<WorkloadRef>,
+        job_owners: JobOwners,
     }
 
     impl Maps {
@@ -445,6 +486,8 @@ mod tests {
                 net: HashMap::new(),
                 prev_net: HashMap::new(),
                 events: HashMap::new(),
+                hidden: BTreeSet::new(),
+                job_owners: JobOwners::new(),
             }
         }
 
@@ -456,6 +499,8 @@ mod tests {
                 net: &self.net,
                 prev_net: &self.prev_net,
                 events: &self.events,
+                hidden: &self.hidden,
+                job_owners: &self.job_owners,
             }
         }
     }
@@ -668,7 +713,7 @@ mod tests {
             Some(("pod-template-hash", "7d9f8c6b5")),
         );
         assert_eq!(
-            pod_workload("api-7d9f8c6b5-x2k4p", &pod),
+            pod_workload("api-7d9f8c6b5-x2k4p", &pod, &JobOwners::new()),
             workload("Deployment", "api")
         );
 
@@ -678,7 +723,7 @@ mod tests {
             Some(("rollouts-pod-template-hash", "6c8d7f")),
         );
         assert_eq!(
-            pod_workload("web-6c8d7f-abcde", &argo),
+            pod_workload("web-6c8d7f-abcde", &argo, &JobOwners::new()),
             workload("Rollout", "web")
         );
 
@@ -688,7 +733,7 @@ mod tests {
             Some(("pod-template-hash", "7d9f8c6b5")),
         );
         assert_eq!(
-            pod_workload("manual-rs-abcde", &unrelated),
+            pod_workload("manual-rs-abcde", &unrelated, &JobOwners::new()),
             workload(REPLICA_SET, "manual-rs")
         );
     }
@@ -696,7 +741,10 @@ mod tests {
     #[test]
     fn workload_is_the_controller_or_the_pod_itself() {
         let pod = owned_pod("StatefulSet", "db", None);
-        assert_eq!(pod_workload("db-0", &pod), workload("StatefulSet", "db"));
+        assert_eq!(
+            pod_workload("db-0", &pod, &JobOwners::new()),
+            workload("StatefulSet", "db")
+        );
 
         // A matching hash label only resolves replica sets.
         let job = owned_pod(
@@ -705,14 +753,77 @@ mod tests {
             Some(("pod-template-hash", "29000000")),
         );
         assert_eq!(
-            pod_workload("backup-29000000-abcde", &job),
+            pod_workload("backup-29000000-abcde", &job, &JobOwners::new()),
             workload("Job", "backup-29000000")
         );
 
         assert_eq!(
-            pod_workload("debug", &named_pod("debug")),
+            pod_workload("debug", &named_pod("debug"), &JobOwners::new()),
             workload(POD, "debug")
         );
+    }
+
+    #[test]
+    fn jobs_resolve_to_their_cron_job_when_known() {
+        let run = owned_pod(JOB, "backup-29000000", None);
+        let cron_job = workload("CronJob", "backup");
+        let owners = JobOwners::from([
+            ("backup-29000000".to_string(), Some(cron_job.clone())),
+            ("manual".to_string(), None),
+        ]);
+
+        assert_eq!(pod_workload("backup-29000000-x", &run, &owners), cron_job);
+        let manual = owned_pod(JOB, "manual", None);
+        assert_eq!(
+            pod_workload("manual-x", &manual, &owners),
+            workload(JOB, "manual")
+        );
+    }
+
+    #[test]
+    fn only_jobs_of_pods_with_cards_are_looked_up() {
+        let running = owned_pod(JOB, "nightly-1", None);
+        let done = with_status(
+            owned_pod(JOB, "nightly-0", None),
+            K8sPodStatus {
+                phase: Some("Succeeded".to_string()),
+                ..K8sPodStatus::default()
+            },
+        );
+        let deployment = owned_pod(REPLICA_SET, "api-1", None);
+
+        let specs = [running, done, deployment];
+        let jobs = jobs_with_cards(&specs);
+
+        assert_eq!(jobs, HashSet::from(["nightly-1"]));
+    }
+
+    #[test]
+    fn hidden_workloads_get_no_card_with_or_without_a_sample() {
+        let mut api_sampled = owned_pod(
+            REPLICA_SET,
+            "api-7d9f8c6b5",
+            Some(("pod-template-hash", "7d9f8c6b5")),
+        );
+        api_sampled.metadata.name = Some("api-a".to_string());
+        let mut api_pending = api_sampled.clone();
+        api_pending.metadata.name = Some("api-b".to_string());
+        let mut maps = Maps::empty();
+        maps.hidden.insert(workload("Deployment", "api"));
+
+        let pods = assemble_pods(
+            &[
+                sample("api-a", "10m", "1Mi"),
+                sample("web", "10m", "1Mi"),
+                sample("racing", "1m", "1Mi"),
+            ],
+            &[api_sampled, api_pending, named_pod("web")],
+            &maps.ctx(),
+        );
+
+        let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["racing", "web"], "a pod without a spec is kept");
+        assert!(pods[0].workload.is_none());
     }
 
     proptest::proptest! {

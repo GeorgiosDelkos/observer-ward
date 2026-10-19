@@ -12,6 +12,7 @@ use crate::metrics::{ClusterMetrics, NetSample, PodMetrics, Usage, percent};
 
 mod error;
 mod events;
+mod jobs;
 mod kubeconfig;
 mod metrics_api;
 mod pods;
@@ -22,8 +23,9 @@ pub(crate) use error::K8sError;
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
+use jobs::{JobOwners, fetch_job_owners};
 use metrics_api::{NodeMetrics, PodMetrics as PodMetricsSample};
-use pods::{PodContext, assemble_pods};
+use pods::{PodContext, assemble_pods, jobs_with_cards};
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
 use stats::{
     StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc, fetch_all_node_stats,
@@ -53,6 +55,8 @@ pub(crate) struct K8sBackend {
     client: Option<Client>,
     prev_net: Option<NetSample>,
     prev_pod_net: HashMap<String, NetSample>,
+    /// Kept across polls: each Job is looked up once.
+    job_owners: JobOwners,
 }
 
 impl K8sBackend {
@@ -62,12 +66,17 @@ impl K8sBackend {
             client: None,
             prev_net: None,
             prev_pod_net: HashMap::new(),
+            job_owners: JobOwners::new(),
         }
     }
 
-    /// The target this backend connects with. Its `hidden` may be stale,
-    /// since hiding a workload keeps the backend: read that from the
-    /// current config.
+    /// Take a new `target` that connects the same way (only `hidden`
+    /// differs), keeping the client and the network samples.
+    pub(crate) fn retarget(&mut self, target: K8sTarget) {
+        debug_assert!(self.target.same_connection(&target));
+        self.target = target;
+    }
+
     pub(crate) fn target(&self) -> &K8sTarget {
         &self.target
     }
@@ -128,6 +137,7 @@ impl K8sBackend {
 
         let pods = match pod_lists {
             Ok((samples, specs)) => {
+                self.resolve_jobs(client, &specs).await;
                 Some(self.pod_cards(&samples, &specs, &stats, &events, allocatable))
             }
             Err(e) => {
@@ -180,6 +190,24 @@ impl K8sBackend {
         }
     }
 
+    /// Learn the cron job behind every Job with a pod card that is not
+    /// known yet, and forget Jobs whose pods are gone.
+    async fn resolve_jobs(&mut self, client: &Client, specs: &[Pod]) {
+        let wanted = jobs_with_cards(specs);
+        self.job_owners
+            .retain(|name, _| wanted.contains(name.as_str()));
+        let missing: Vec<String> = wanted
+            .into_iter()
+            .filter(|name| !self.job_owners.contains_key(*name))
+            .map(str::to_string)
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let found = fetch_job_owners(client, &self.target.namespace, missing).await;
+        self.job_owners.extend(found);
+    }
+
     fn pod_cards(
         &mut self,
         samples: &[PodMetricsSample],
@@ -202,6 +230,8 @@ impl K8sBackend {
                 net: &net,
                 prev_net: &self.prev_pod_net,
                 events,
+                hidden: &self.target.hidden,
+                job_owners: &self.job_owners,
             },
         );
         self.prev_pod_net = net;

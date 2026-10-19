@@ -121,6 +121,19 @@ impl Backend {
         }
     }
 
+    /// Adopt `server`, which [`Self::serves`] accepted: a K8s backend
+    /// takes its current hidden workloads.
+    fn retarget(&mut self, server: &ServerConfig) {
+        match (self, server) {
+            (Backend::K8s(backend), ServerConfig::K8s(target)) => {
+                backend.retarget(target.clone());
+            }
+            // An SSH backend only serves an identical target.
+            (Backend::Ssh(_), ServerConfig::Ssh(_) | ServerConfig::K8s(_))
+            | (Backend::K8s(_), ServerConfig::Ssh(_)) => {}
+        }
+    }
+
     /// Collect one report. Errors are rendered with their cause chain here,
     /// the last point where they are typed.
     async fn collect(&mut self, name: ServerName) -> ServerReport {
@@ -271,7 +284,10 @@ impl ServerPool {
 
     fn take_backend(&mut self, server: &ServerConfig) -> Backend {
         match self.backends.remove(server.name()) {
-            Some(backend) if backend.serves(server) => backend,
+            Some(mut backend) if backend.serves(server) => {
+                backend.retarget(server);
+                backend
+            }
             Some(_) | None => Backend::new(server),
         }
     }

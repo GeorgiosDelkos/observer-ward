@@ -253,9 +253,9 @@ impl K8sTarget {
 }
 
 /// The workload a pod belongs to, which pods are hidden by: pod names
-/// change on every restart and rollout. The name is stable for
-/// deployments, stateful sets and daemon sets, but not for a cron job,
-/// whose Jobs are named per run, so hiding one hides only that run.
+/// change on every restart and rollout, the workload's do not. A cron
+/// job makes a new Job per run, so its pods resolve to the cron job when
+/// the Job can be read, and to that one run's Job when it cannot.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkloadRef {
     /// The Kubernetes kind (`Deployment`, `StatefulSet`, `Job`, a custom

@@ -67,6 +67,12 @@ The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-se
 
 Expanded pod lists show three pods at a time (scroll for the rest) and are sorted A–Z.
 
+### Hide pods
+
+Click the trash icon on a pod card to stop tracking it. This hides the workload that owns the pod (its Deployment, StatefulSet, DaemonSet, or Job; a pod with no controller is hidden by name), so it stays hidden across restarts and rollouts. Hidden pods are left out of the list, the tray icon, and notifications. Nothing is deleted from the cluster.
+
+The cluster row then shows **N hidden**; click it and choose **show** to track a workload again. Each CronJob run is its own Job, so hiding one hides only that run.
+
 ### Add an SSH server
 
 1. Click **+** and choose **SSH**
@@ -97,7 +103,7 @@ Footer **Settings**:
 
 ### Remove a cluster or server
 
-Click **remove** on the card (or right-click → Remove). Confirm in the in-app dialog. This cannot be undone; add the target again if you still need it.
+Click the trash icon on the card or cluster row (or right-click → Remove). Confirm in the in-app dialog. This cannot be undone; add the target again if you still need it.
 
 ## Configuration
 

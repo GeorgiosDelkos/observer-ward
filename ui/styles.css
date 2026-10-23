@@ -1,11 +1,12 @@
 /* Observer Ward — Night Glass.
  *
- * Proportions: every size is on a 4px grid except the text edge, 22px
- * from the window edge (8px page inset + 14px card padding), which all
- * text shares. Corners are concentric: window 24, card 16 (24 − 8),
- * inner list 10 (16 − 6), controls 8. Borders are inset box-shadows so
- * no 1px shifts the text edge. Colour only means state (mint, amber,
- * coral); iris marks what can be pressed.
+ * Proportions: the structure is on a 4px grid (row heights 28/40/44/48/52,
+ * window inset 8, gauges 64, controls 28/32/36); inner spacing uses an
+ * even 2px scale (2/6/10/14). All text shares one edge, 22px from the
+ * window (8px page inset + 14px card padding). Corners are concentric:
+ * window 24, card 16 (24 − 8), inner list 10 (16 − 6), controls 8.
+ * Borders are inset box-shadows so no 1px shifts the text edge. Colour
+ * only means state (mint, amber, coral); iris marks what can be pressed.
  */
 
 @font-face {
@@ -234,7 +235,7 @@ input:focus-visible {
 .mark::after {
   content: "";
   position: absolute;
-  inset: 7px;
+  inset: 6px;
   border-radius: 50%;
   border: 2px solid rgba(10, 12, 20, 0.85);
 }
@@ -646,7 +647,7 @@ button.a-row:hover {
 .cell {
   width: 16px;
   height: 16px;
-  border-radius: 5px;
+  border-radius: 4px;
   background: rgba(69, 224, 160, 0.2);
   box-shadow: inset 0 0 0 1px rgba(69, 224, 160, 0.35);
   transition: transform 0.12s ease;
@@ -934,8 +935,8 @@ button.a-row:hover {
 .chip.ok::before,
 .chip.bad::before {
   content: "";
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
   margin-right: 6px;
   border-radius: 50%;
   background: var(--ok);

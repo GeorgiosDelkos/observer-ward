@@ -198,7 +198,7 @@ cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo deny check
-cd .. && node --test "tests/ui/*.test.mjs"   # UI model and formatting
+cd .. && node --test tests/ui/*.test.mjs   # UI model and formatting
 ```
 
 Clippy denies `unwrap`, `panic`, `todo`, and `dbg!` in production code. Logging uses `tracing`.

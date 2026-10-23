@@ -38,6 +38,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test
+      - name: UI tests
+        # The popover's pure modules (formatting, model) under Node's own
+        # test runner; macOS runners ship Node, so nothing is installed.
+        # The shell expands the glob, so any Node with node:test works.
+        working-directory: .
+        run: node --test tests/ui/*.test.mjs
 
   audit:
     name: supply-chain (advisories, licenses, bans, sources)

@@ -15,13 +15,19 @@
       {
         "label": "main",
         "title": "Observer Ward",
-        "width": 380,
-        "height": 120,
+        "width": 400,
+        "height": 160,
         "resizable": false,
         "decorations": false,
         "visible": false,
         "skipTaskbar": true,
-        "transparent": true
+        "transparent": true,
+        "shadow": true,
+        "windowEffects": {
+          "effects": ["hudWindow"],
+          "state": "active",
+          "radius": 24
+        }
       }
     ],
     "security": {

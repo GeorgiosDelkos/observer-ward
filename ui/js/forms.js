@@ -19,7 +19,11 @@ const GRAFANA_CONN_NAME = "default";
 export function mountAdd(root, { cluster = null, onAdded, onResize }) {
   const fixed = cluster ? clusters().find((c) => c.name === cluster) : null;
   root.innerHTML = addHtml(fixed);
-  const $ = (id) => root.querySelector(`#${id}`);
+  // Listeners and lookups use the form this mount created, never `root`:
+  // the page container is reused, so anything bound to it would outlive
+  // the form, and a late async load would write into another page.
+  const formEl = root.querySelector("form");
+  const $ = (id) => formEl.querySelector(`#${id}`);
 
   const form = {
     kind: "k8s",
@@ -129,7 +133,7 @@ export function mountAdd(root, { cluster = null, onAdded, onResize }) {
 
   async function browse(command, input) {
     showError("");
-    const buttons = root.querySelectorAll("[data-browse]");
+    const buttons = formEl.querySelectorAll("[data-browse]");
     // One picker at a time: the backend's blur guard is per dialog.
     for (const b of buttons) {
       b.disabled = true;
@@ -152,7 +156,7 @@ export function mountAdd(root, { cluster = null, onAdded, onResize }) {
 
   function setKind(kind) {
     form.kind = kind;
-    for (const b of root.querySelectorAll("[data-kind]")) {
+    for (const b of formEl.querySelectorAll("[data-kind]")) {
       b.setAttribute("aria-pressed", String(b.dataset.kind === kind));
     }
     $("f-k8s").hidden = kind !== "k8s";
@@ -174,7 +178,7 @@ export function mountAdd(root, { cluster = null, onAdded, onResize }) {
     renderChips();
   }
 
-  root.addEventListener("click", async (e) => {
+  formEl.addEventListener("click", async (e) => {
     const kindButton = e.target.closest("[data-kind]");
     if (kindButton) {
       setKind(kindButton.dataset.kind);
@@ -215,7 +219,7 @@ export function mountAdd(root, { cluster = null, onAdded, onResize }) {
     }
   });
 
-  root.querySelector("form").addEventListener("submit", async (e) => {
+  formEl.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (filter.value.trim()) {
       addTyped();
@@ -347,34 +351,16 @@ function addHtml(fixed) {
 // ── Settings ────────────────────────────────────
 
 /** Render the settings page into `root`; `onSaved()` runs after a save. */
-export async function mountSettings(root, { onSaved, onResize }) {
+export function mountSettings(root, { onSaved, onResize }) {
   root.innerHTML = settingsHtml();
-  const $ = (id) => root.querySelector(`#${id}`);
+  // Everything is looked up in this form, which outlives a page change
+  // only as a detached node: late loads then write nowhere.
+  const formEl = root.querySelector("form");
+  const $ = (id) => formEl.querySelector(`#${id}`);
   const error = $("s-error");
 
-  try {
-    const config = await invoke("get_config");
-    $("s-fg").value = config.foreground_poll_secs ?? 10;
-    $("s-bg").value = config.background_poll_secs ?? 300;
-    $("s-notify").checked = config.notifications_enabled ?? false;
-    const grafana = config.grafana ?? null;
-    $("s-grafana").checked = Boolean(grafana?.enabled);
-    $("s-url").value = grafana?.url ?? "";
-    $("s-tls").checked = grafana ? grafana.verify_tls !== false : true;
-    const hasToken = await invoke("has_grafana_token", { name: GRAFANA_CONN_NAME });
-    $("s-token").placeholder = hasToken ? "Stored · leave blank to keep" : "Service account token";
-  } catch (err) {
-    error.textContent = `Could not load settings: ${err}`;
-    error.hidden = false;
-  }
-  try {
-    $("s-login").checked = await invoke("plugin:autostart|is_enabled");
-  } catch (err) {
-    console.warn("autostart status unavailable:", err);
-  }
-  onResize();
-
-  root.querySelector("form").addEventListener("submit", async (e) => {
+  // Bound before the slow loads below, so Enter never submits natively.
+  formEl.addEventListener("submit", async (e) => {
     e.preventDefault();
     error.hidden = true;
     const fg = Number.parseInt($("s-fg").value, 10);
@@ -412,6 +398,36 @@ export async function mountSettings(root, { onSaved, onResize }) {
       onResize();
     }
   });
+
+  loadSettings($, error).then(() => {
+    if (formEl.isConnected) {
+      onResize();
+    }
+  });
+}
+
+/** Fill the settings form from the config, the Keychain and autostart. */
+async function loadSettings($, error) {
+  try {
+    const config = await invoke("get_config");
+    $("s-fg").value = config.foreground_poll_secs ?? 10;
+    $("s-bg").value = config.background_poll_secs ?? 300;
+    $("s-notify").checked = config.notifications_enabled ?? false;
+    const grafana = config.grafana ?? null;
+    $("s-grafana").checked = Boolean(grafana?.enabled);
+    $("s-url").value = grafana?.url ?? "";
+    $("s-tls").checked = grafana ? grafana.verify_tls !== false : true;
+    const hasToken = await invoke("has_grafana_token", { name: GRAFANA_CONN_NAME });
+    $("s-token").placeholder = hasToken ? "Stored · leave blank to keep" : "Service account token";
+  } catch (err) {
+    error.textContent = `Could not load settings: ${err}`;
+    error.hidden = false;
+  }
+  try {
+    $("s-login").checked = await invoke("plugin:autostart|is_enabled");
+  } catch (err) {
+    console.warn("autostart status unavailable:", err);
+  }
 }
 
 function settingsHtml() {

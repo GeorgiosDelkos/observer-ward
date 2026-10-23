@@ -6,9 +6,10 @@
 //! connection.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams};
 use tokio::task::{JoinError, JoinSet};
@@ -144,25 +145,11 @@ impl K8sBackend {
             for state in self.namespaces.values_mut() {
                 state.jobs_forbidden = false;
             }
-            self.connect().await?
+            connect(self.target.kubeconfig.clone(), &self.target.context).await?
         };
         let result = self.collect_with(&client).await;
         self.client = result.is_ok().then_some(client);
         result
-    }
-
-    /// Build a `kube::Client` from the configured kubeconfig and context.
-    async fn connect(&self) -> Result<Client, K8sError> {
-        let path = self.target.kubeconfig.clone();
-        let kubeconfig = tokio::task::spawn_blocking(move || kubeconfig::load(path.as_deref()))
-            .await
-            .map_err(K8sError::KubeconfigTask)??;
-
-        let mut config = kubeconfig::build_config(kubeconfig, &self.target.context).await?;
-        config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
-        config.read_timeout = Some(KUBE_READ_TIMEOUT);
-
-        Client::try_from(config).map_err(|source| K8sError::CreateClient(Box::new(source)))
     }
 
     async fn collect_with(&mut self, client: &Client) -> Result<ClusterMetrics, K8sError> {
@@ -370,6 +357,46 @@ impl K8sBackend {
         state.prev_pod_net = net;
         pods
     }
+}
+
+/// Build a `kube::Client` for `context` of the kubeconfig at `path` (the
+/// default one when `None`).
+async fn connect(path: Option<PathBuf>, context: &str) -> Result<Client, K8sError> {
+    let kubeconfig = tokio::task::spawn_blocking(move || kubeconfig::load(path.as_deref()))
+        .await
+        .map_err(K8sError::KubeconfigTask)??;
+
+    let mut config = kubeconfig::build_config(kubeconfig, context).await?;
+    config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
+    config.read_timeout = Some(KUBE_READ_TIMEOUT);
+
+    Client::try_from(config).map_err(|source| K8sError::CreateClient(Box::new(source)))
+}
+
+/// Names of the namespaces `context` can list, sorted, so the add form
+/// can offer them instead of free-typed names.
+///
+/// # Errors
+///
+/// [`K8sError`] if the client cannot be built or listing namespaces fails
+/// (an account limited to some namespaces may not list them at all).
+pub(crate) async fn list_namespaces(
+    kubeconfig: Option<PathBuf>,
+    context: &str,
+) -> Result<Vec<String>, K8sError> {
+    let client = connect(kubeconfig, context).await?;
+    let api: Api<Namespace> = Api::all(client);
+    let list = api
+        .list_metadata(&ListParams::default())
+        .await
+        .map_err(|source| K8sError::ListNamespaces(Box::new(source)))?;
+    let mut names: Vec<String> = list
+        .items
+        .into_iter()
+        .filter_map(|ns| ns.metadata.name)
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Pod lists and events of every namespace in `names`, concurrently, one

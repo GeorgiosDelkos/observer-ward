@@ -41,6 +41,8 @@ pub(crate) enum K8sError {
     KubeconfigTask(#[source] tokio::task::JoinError),
     #[error("timed out fetching stats for node {node}")]
     NodeStatsTimeout { node: String },
+    #[error("failed to list namespaces")]
+    ListNamespaces(#[source] Box<kube::Error>),
     #[error("failed to list nodes")]
     ListNodes(#[source] Box<kube::Error>),
     #[error("failed to list events in namespace {namespace}")]

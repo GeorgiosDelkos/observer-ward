@@ -334,6 +334,16 @@ pub(crate) async fn inspect_kubeconfig(
     Ok(k8s::inspect(path).await?)
 }
 
+/// List the namespaces a kubeconfig context can see (the default
+/// kubeconfig when `kubeconfig` is `None`), for the add form's picker.
+#[tauri::command]
+pub(crate) async fn list_namespaces(
+    kubeconfig: Option<PathBuf>,
+    context: String,
+) -> CommandResult<Vec<String>> {
+    Ok(k8s::list_namespaces(kubeconfig, &context).await?)
+}
+
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,

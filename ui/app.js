@@ -575,30 +575,52 @@ function sameWorkload(a, b) {
   return a.kind === b.kind && a.name === b.name;
 }
 
-function hiddenWorkloads(cluster) {
-  return findServerConfig(cluster)?.hidden ?? [];
+function hiddenWorkloads(cluster, namespace) {
+  const watched = findServerConfig(cluster)?.namespaces ?? [];
+  return watched.find((ns) => ns.name === namespace)?.hidden ?? [];
+}
+
+// Pods are grouped per watched namespace: "cluster/namespace".
+function groupKey(cluster, namespace) {
+  return `${cluster}/${namespace}`;
 }
 
 function renderHideButton(pod) {
   const label = escapeHtml(`Hide ${workloadLabel(pod.workload)}`);
   return `<button type="button" class="btn-trash btn-hide"
     data-cluster="${escapeHtml(pod.cluster)}"
+    data-namespace="${escapeHtml(pod.namespace)}"
     data-kind="${escapeHtml(pod.workload.kind)}"
     data-workload="${escapeHtml(pod.workload.name)}"
     title="${label}" aria-label="${label}">${TRASH_ICON}</button>`;
 }
 
-function renderHiddenChip(clusterName) {
-  const count = hiddenWorkloads(clusterName).length;
+function renderHiddenChip(group) {
+  const count = hiddenWorkloads(group.cluster, group.namespace).length;
   if (count === 0) {
     return "";
   }
   return `<button type="button" class="cluster-hidden"
-    data-cluster="${escapeHtml(clusterName)}"
+    data-cluster="${escapeHtml(group.cluster)}"
+    data-namespace="${escapeHtml(group.namespace)}"
     title="Show hidden workloads">${count} hidden</button>`;
 }
 
-function renderClusterSummary(clusterName, clusterPods) {
+// Only a cluster with another namespace can stop watching this one; the
+// cluster card removes the last.
+function renderUnwatchButton(group) {
+  const watched = findServerConfig(group.cluster)?.namespaces ?? [];
+  if (watched.length < 2) {
+    return "";
+  }
+  const label = escapeHtml(`Stop watching ${group.namespace}`);
+  return `<button type="button" class="btn-trash btn-unwatch"
+    data-cluster="${escapeHtml(group.cluster)}"
+    data-namespace="${escapeHtml(group.namespace)}"
+    title="${label}" aria-label="${label}">${TRASH_ICON}</button>`;
+}
+
+function renderClusterSummary(group, clusterPods) {
   let totalCpu = 0;
   let totalMem = 0;
 
@@ -610,27 +632,20 @@ function renderClusterSummary(clusterName, clusterPods) {
     }
   }
 
-  const clusterMetrics = metricsCache[clusterName];
-  const nodeCount = clusterMetrics && !clusterMetrics.error
-    ? clusterMetrics.node_count || 0
-    : 0;
-  const nodesStat = nodeCount > 0
-    ? `<span class="cluster-stat">${nodeCount}n</span>`
-    : "";
-
-  const collapsed = collapsedClusters.has(clusterName);
+  const collapsed = collapsedClusters.has(group.key);
   const chevronClass = collapsed ? "chevron collapsed" : "chevron";
 
   return `
-    <div class="cluster-summary" data-cluster="${escapeHtml(clusterName)}">
+    <div class="cluster-summary"
+         data-cluster="${escapeHtml(group.cluster)}"
+         data-group="${escapeHtml(group.key)}">
       <span class="${chevronClass}">&#x25B8;</span>
-      <span class="cluster-name">${escapeHtml(getDisplayName(clusterName, clusterName))}</span>
-      ${nodesStat}
+      <span class="cluster-name">${escapeHtml(getDisplayName(group.key, group.key))}</span>
       <span class="cluster-stat">${clusterPods.length} pods</span>
       <span class="cluster-stat">${formatMillicores(totalCpu)} CPU</span>
       <span class="cluster-stat">${formatMemory(totalMem)} MEM</span>
-      ${renderHiddenChip(clusterName)}
-      ${renderRemoveButton(clusterName)}
+      ${renderHiddenChip(group)}
+      ${renderUnwatchButton(group)}
     </div>`;
 }
 
@@ -654,24 +669,27 @@ function renderAll() {
     .map(renderServerCard)
     .join("");
 
-  const clusterGroups = {};
-  for (const pod of pods) {
-    const cluster = pod.cluster || "default";
-    if (!clusterGroups[cluster]) {
-      clusterGroups[cluster] = [];
-    }
-    clusterGroups[cluster].push(pod);
-  }
-  // A cluster whose every pod is hidden still needs its summary row:
-  // the "hidden" chip on it is the only way to show them again.
+  // Every watched namespace gets a summary row, even with no pods: its
+  // "hidden" chip and unwatch button live there. Config order first.
+  const groups = new Map();
   for (const server of servers) {
-    if (hiddenWorkloads(server.name).length > 0 && !clusterGroups[server.name]) {
-      clusterGroups[server.name] = [];
+    for (const ns of server.type === "k8s" ? server.namespaces : []) {
+      const key = groupKey(server.name, ns.name);
+      groups.set(key, { key, cluster: server.name, namespace: ns.name, pods: [] });
     }
+  }
+  for (const pod of pods) {
+    const key = groupKey(pod.cluster, pod.namespace);
+    if (!groups.has(key)) {
+      groups.set(key, { key, cluster: pod.cluster, namespace: pod.namespace, pods: [] });
+    }
+    groups.get(key).pods.push(pod);
   }
 
   let podHtml = "";
-  for (const [cluster, clusterPods] of Object.entries(clusterGroups)) {
+  for (const group of groups.values()) {
+    const cluster = group.key;
+    const clusterPods = group.pods;
     if (!collapsedClusters.has(cluster) && !expandedOnce.has(cluster)) {
       collapsedClusters.add(cluster);
     }
@@ -685,7 +703,7 @@ function renderAll() {
     });
     const collapsed = collapsedClusters.has(cluster);
     const displayStyle = collapsed ? "display: none;" : "";
-    podHtml += renderClusterSummary(cluster, clusterPods);
+    podHtml += renderClusterSummary(group, clusterPods);
     podHtml += `<div class="cluster-pods" data-cluster-pods="${escapeHtml(cluster)}" style="${displayStyle}">`;
     podHtml += clusterPods.map(renderPodCard).join("");
     podHtml += "</div>";
@@ -830,7 +848,7 @@ function buildServerConfig() {
   if (!name) {
     return { error: "Name is required" };
   }
-  // Pod cards are keyed "cluster/pod"; the backend rejects "/" too.
+  // Pod cards are keyed "cluster/namespace/pod"; the backend rejects "/" too.
   if (name.includes("/")) {
     return { error: "Name must not contain '/'" };
   }
@@ -848,8 +866,11 @@ function buildServerConfig() {
     if (!namespace) {
       return { error: "Namespace is required for Kubernetes" };
     }
+    // A context that is already configured gains this namespace instead.
     return {
-      config: { type: "k8s", name, context, namespace, kubeconfig },
+      config: {
+        type: "k8s", name, context, kubeconfig, namespaces: [{ name: namespace }],
+      },
     };
   }
 
@@ -978,7 +999,9 @@ const removeModalTitle = document.getElementById("remove-modal-title");
 const removeModalBody = document.getElementById("remove-modal-body");
 const btnRemoveCancel = document.getElementById("btn-remove-cancel");
 const btnRemoveConfirm = document.getElementById("btn-remove-confirm");
-let pendingRemoveName = null;
+// { name } removes a server; { cluster, namespace } stops watching one
+// namespace of a cluster.
+let pendingRemove = null;
 let removeInFlight = false;
 
 function serverKindLabel(name) {
@@ -993,13 +1016,28 @@ function serverKindLabel(name) {
 }
 
 function openRemoveModal(name) {
-  hideContextMenu();
-  pendingRemoveName = name;
-  const kind = serverKindLabel(name);
   const label = getDisplayName(name, name);
-  removeModalTitle.textContent = `Remove ${kind}?`;
-  removeModalBody.textContent =
-    `Remove "${label}"? This cannot be undone.`;
+  showRemoveModal(
+    { name },
+    `Remove ${serverKindLabel(name)}?`,
+    `Remove "${label}"? This cannot be undone.`,
+  );
+}
+
+function openUnwatchModal(cluster, namespace) {
+  showRemoveModal(
+    { cluster, namespace },
+    "Stop watching namespace?",
+    `Stop watching "${namespace}" in "${getDisplayName(cluster, cluster)}"? `
+      + "Its hidden workloads are forgotten too.",
+  );
+}
+
+function showRemoveModal(target, title, body) {
+  hideContextMenu();
+  pendingRemove = target;
+  removeModalTitle.textContent = title;
+  removeModalBody.textContent = body;
   removeModal.classList.add("open");
   resizeToContent();
   btnRemoveCancel.focus();
@@ -1009,7 +1047,7 @@ function closeRemoveModal() {
   if (removeInFlight) {
     return;
   }
-  pendingRemoveName = null;
+  pendingRemove = null;
   removeModal.classList.remove("open");
   resizeToContent();
 }
@@ -1018,8 +1056,8 @@ async function confirmRemove() {
   if (removeInFlight) {
     return;
   }
-  const name = pendingRemoveName;
-  if (!name) {
+  const target = pendingRemove;
+  if (!target) {
     closeRemoveModal();
     return;
   }
@@ -1027,7 +1065,11 @@ async function confirmRemove() {
   btnRemoveConfirm.disabled = true;
   btnRemoveCancel.disabled = true;
   try {
-    await removeServerByName(name);
+    if (target.namespace) {
+      await unwatchNamespace(target.cluster, target.namespace);
+    } else {
+      await removeServerByName(target.name);
+    }
     removeInFlight = false;
     closeRemoveModal();
   } catch (err) {
@@ -1058,6 +1100,19 @@ async function removeServerByName(name) {
   renderAll();
 }
 
+async function unwatchNamespace(cluster, namespace) {
+  const config = await invoke("unwatch_namespace", { server: cluster, namespace });
+  servers = config.servers;
+  pods = pods.filter((p) => {
+    const gone = p.cluster === cluster && p.namespace === namespace;
+    if (gone) {
+      forgetCard(p.name);
+    }
+    return !gone;
+  });
+  renderAll();
+}
+
 function forgetCard(key) {
   delete metricsCache[key];
   delete metricsHistory[key];
@@ -1066,16 +1121,18 @@ function forgetCard(key) {
 
 // Hiding is undone from the "hidden" chip, so it needs no confirmation.
 // The cards go at once; the backend drops them from every later poll.
-async function hideWorkload(cluster, workload) {
+async function hideWorkload(cluster, namespace, workload) {
   try {
-    const config = await invoke("hide_workload", { server: cluster, workload });
+    const config = await invoke("hide_workload", { server: cluster, namespace, workload });
     servers = config.servers;
   } catch (err) {
-    openHiddenModal(cluster, `Could not hide ${workloadLabel(workload)}: ${err}`);
+    openHiddenModal(cluster, namespace, `Could not hide ${workloadLabel(workload)}: ${err}`);
     return;
   }
   pods = pods.filter((p) => {
-    const hidden = p.cluster === cluster && sameWorkload(p.workload, workload);
+    const hidden = p.cluster === cluster
+      && p.namespace === namespace
+      && sameWorkload(p.workload, workload);
     if (hidden) {
       forgetCard(p.name);
     }
@@ -1089,10 +1146,12 @@ const hiddenModalTitle = document.getElementById("hidden-modal-title");
 const hiddenModalList = document.getElementById("hidden-modal-list");
 const hiddenModalError = document.getElementById("hidden-modal-error");
 const btnHiddenClose = document.getElementById("btn-hidden-close");
-let hiddenModalCluster = null;
+// { cluster, namespace } whose hidden workloads the modal lists.
+let hiddenModalTarget = null;
 
 function renderHiddenModalList() {
-  const workloads = hiddenWorkloads(hiddenModalCluster);
+  const { cluster, namespace } = hiddenModalTarget;
+  const workloads = hiddenWorkloads(cluster, namespace);
   hiddenModalList.innerHTML = workloads.length === 0
     ? '<li class="hidden-empty">Nothing hidden</li>'
     : workloads.map((w) => `
@@ -1105,11 +1164,11 @@ function renderHiddenModalList() {
       </li>`).join("");
 }
 
-function openHiddenModal(cluster, error = "") {
+function openHiddenModal(cluster, namespace, error = "") {
   hideContextMenu();
-  hiddenModalCluster = cluster;
+  hiddenModalTarget = { cluster, namespace };
   hiddenModalTitle.textContent =
-    `Hidden in ${getDisplayName(cluster, cluster)}`;
+    `Hidden in ${getDisplayName(cluster, cluster)} / ${namespace}`;
   hiddenModalError.textContent = error;
   hiddenModalError.hidden = !error;
   renderHiddenModalList();
@@ -1119,21 +1178,26 @@ function openHiddenModal(cluster, error = "") {
 }
 
 function closeHiddenModal() {
-  const cluster = hiddenModalCluster;
-  hiddenModalCluster = null;
+  const target = hiddenModalTarget;
+  hiddenModalTarget = null;
   hiddenModal.classList.remove("open");
   resizeToContent();
+  if (!target) {
+    return;
+  }
   // Back to the chip that opened it, when it is still there.
+  const cluster = CSS.escape(target.cluster);
+  const namespace = CSS.escape(target.namespace);
   serverListEl
-    .querySelector(`.cluster-hidden[data-cluster="${CSS.escape(cluster ?? "")}"]`)
+    .querySelector(`.cluster-hidden[data-cluster="${cluster}"][data-namespace="${namespace}"]`)
     ?.focus();
 }
 
 // The pods come back with the poll that `show_workload` wakes.
 async function showWorkload(workload) {
-  const cluster = hiddenModalCluster;
+  const { cluster, namespace } = hiddenModalTarget;
   try {
-    const config = await invoke("show_workload", { server: cluster, workload });
+    const config = await invoke("show_workload", { server: cluster, namespace, workload });
     servers = config.servers;
   } catch (err) {
     hiddenModalError.textContent = `Could not show ${workloadLabel(workload)}: ${err}`;
@@ -1141,7 +1205,7 @@ async function showWorkload(workload) {
     return;
   }
   hiddenModalError.hidden = true;
-  if (hiddenWorkloads(cluster).length === 0) {
+  if (hiddenWorkloads(cluster, namespace).length === 0) {
     closeHiddenModal();
   } else {
     renderHiddenModalList();
@@ -1183,7 +1247,8 @@ async function handleCopyKubectl() {
     return;
   }
   const q = (s) => `'${s.replace(/'/g, "'\\''")}'`;
-  let cmd = `kubectl --context ${q(cfg.context)} -n ${q(cfg.namespace)}`;
+  // A cluster watches several namespaces, so the command names none.
+  let cmd = `kubectl --context ${q(cfg.context)}`;
   if (cfg.kubeconfig) {
     cmd += ` --kubeconfig ${q(cfg.kubeconfig)}`;
   }
@@ -1249,17 +1314,17 @@ async function handleCopyMetrics() {
 // ── Pod Logs ──────────────────────────────────
 
 async function openPodLogs(fullName) {
-  // Pod names never contain "/", so the last one splits the key, even for
-  // a cluster name from before "/" was rejected.
-  const slashIdx = fullName.lastIndexOf("/");
-  if (slashIdx < 0) {
+  const pod = pods.find((p) => p.name === fullName);
+  if (!pod) {
     return;
   }
-  const clusterName = fullName.substring(0, slashIdx);
-  const podName = fullName.substring(slashIdx + 1);
   try {
-    // The backend resolves context, namespace and kubeconfig from config.
-    await invoke("open_pod_logs", { server: clusterName, pod: podName });
+    // The backend resolves context and kubeconfig from config.
+    await invoke("open_pod_logs", {
+      server: pod.cluster,
+      namespace: pod.namespace,
+      pod: pod.displayName,
+    });
   } catch (err) {
     console.error("Failed to open pod logs:", err);
   }
@@ -1468,7 +1533,7 @@ function handleMetricsUpdate(event) {
 
   const currentPods = [];
   const receivedPodNames = new Set();
-  const polledClusters = new Set();
+  const polledGroups = new Set();
 
   for (const report of payload.servers) {
     const name = report.name;
@@ -1489,79 +1554,88 @@ function handleMetricsUpdate(event) {
       memory_bytes: m.memory_bytes,
       disk_used_bytes: m.disk?.used_bytes,
       disk_capacity_bytes: m.disk?.capacity_bytes,
-      node_count: m.node_count,
+      node_count: m.nodes?.length,
     });
     recordHistory(name, metricsCache[name]);
 
-    // `pods` is null when the backend failed to list them: only a
-    // successful listing is authoritative enough to prune old cards.
-    if (report.kind !== "k8s" || !Array.isArray(m.pods)) {
+    if (report.kind !== "k8s") {
       continue;
     }
-    polledClusters.add(name);
-    // The backend filters hidden pods too; this covers a poll already
-    // in flight when a workload was hidden.
-    const hidden = hiddenWorkloads(name);
-    for (const pod of m.pods) {
-      if (hidden.some((w) => sameWorkload(w, pod.workload))) {
+    for (const ns of m.namespaces ?? []) {
+      // `pods` is null when the backend failed to list them: only a
+      // successful listing is authoritative enough to prune old cards.
+      if (!Array.isArray(ns.pods)) {
         continue;
       }
-      const key = `${name}/${pod.name}`;
-      metricsCache[key] = cardMetrics({
-        usage: pod.usage,
-        net: pod.net,
-        cpu_millicores: pod.usage?.cpu_millicores,
-        memory_bytes: pod.usage?.memory_bytes,
-        restart_count: pod.restart_count,
-        start_time: pod.start_time,
-        pod_status: pod.status,
-        pvc_used_bytes: pod.pvc?.used_bytes,
-        pvc_capacity_bytes: pod.pvc?.capacity_bytes,
-        last_event: pod.last_event,
-      });
-      recordHistory(key, metricsCache[key]);
-      receivedPodNames.add(key);
-      currentPods.push({
-        name: key,
-        displayName: pod.name,
-        cluster: name,
-        workload: pod.workload,
-        type: "pod",
-      });
+      polledGroups.add(groupKey(name, ns.name));
+      // The backend filters hidden pods too; this covers a poll already
+      // in flight when a workload was hidden.
+      const hidden = hiddenWorkloads(name, ns.name);
+      for (const pod of ns.pods) {
+        if (hidden.some((w) => sameWorkload(w, pod.workload))) {
+          continue;
+        }
+        const key = `${groupKey(name, ns.name)}/${pod.name}`;
+        metricsCache[key] = cardMetrics({
+          usage: pod.usage,
+          net: pod.net,
+          cpu_millicores: pod.usage?.cpu_millicores,
+          memory_bytes: pod.usage?.memory_bytes,
+          restart_count: pod.restart_count,
+          start_time: pod.start_time,
+          pod_status: pod.status,
+          pvc_used_bytes: pod.pvc?.used_bytes,
+          pvc_capacity_bytes: pod.pvc?.capacity_bytes,
+          last_event: pod.last_event,
+        });
+        recordHistory(key, metricsCache[key]);
+        receivedPodNames.add(key);
+        currentPods.push({
+          name: key,
+          displayName: pod.name,
+          cluster: name,
+          namespace: ns.name,
+          workload: pod.workload,
+          type: "pod",
+        });
+      }
     }
   }
 
-  // Keys are server names or "cluster/pod". A legacy server name may
-  // contain "/" too, so server keys are recognised by name, not by shape.
+  // Keys are server names or "cluster/namespace/pod". A legacy server name
+  // may contain "/" too, so server keys are recognised by name, not shape.
   const activeServerNames = new Set(servers.map((s) => s.name));
+  const watchedGroups = new Set(servers.flatMap((s) =>
+    s.type === "k8s" ? s.namespaces.map((ns) => groupKey(s.name, ns.name)) : []));
   const isPodKey = (key) => !activeServerNames.has(key) && key.includes("/");
+  // Pod and namespace names never contain "/", so the last one splits off
+  // the pod, even under a legacy cluster name.
+  const groupOf = (key) => key.substring(0, key.lastIndexOf("/"));
 
-  // Clean up stale pod entries only from clusters that were
-  // actually polled — preserve pods from offline/backoff clusters
-  for (const key of Object.keys(metricsCache)) {
+  // Clean up stale pod entries only from namespaces that were actually
+  // polled (keeping those of offline or backed-off clusters), and every
+  // pod of a namespace or cluster no longer watched.
+  for (const key of Object.keys(metricsHistory).concat(Object.keys(metricsCache))) {
     if (!isPodKey(key)) {
+      if (!activeServerNames.has(key)) {
+        delete metricsHistory[key];
+        delete anomalyState[key];
+      }
       continue;
     }
-    const cluster = key.substring(0, key.lastIndexOf("/"));
-    if (polledClusters.has(cluster) && !receivedPodNames.has(key)) {
+    const group = groupOf(key);
+    const stale = polledGroups.has(group) && !receivedPodNames.has(key);
+    if (stale || !watchedGroups.has(group)) {
       delete metricsCache[key];
       delete metricsHistory[key];
       delete anomalyState[key];
     }
   }
 
-  // Prune history/anomaly for servers no longer configured; a removed
-  // cluster's pods go too, since their cluster is no longer polled.
-  for (const key of Object.keys(metricsHistory)) {
-    const owner = isPodKey(key) ? key.substring(0, key.lastIndexOf("/")) : key;
-    if (!activeServerNames.has(owner)) {
-      delete metricsHistory[key];
-      delete anomalyState[key];
-    }
-  }
-
   for (const pod of pods) {
-    if (!receivedPodNames.has(pod.name) && !polledClusters.has(pod.cluster)) {
+    const group = groupKey(pod.cluster, pod.namespace);
+    const kept = watchedGroups.has(group) && !polledGroups.has(group);
+    if (kept && !receivedPodNames.has(pod.name)) {
       currentPods.push(pod);
     }
   }
@@ -1800,20 +1874,30 @@ serverListEl.addEventListener("click", (e) => {
     }
     return;
   }
+  const unwatchBtn = e.target.closest(".btn-unwatch");
+  if (unwatchBtn) {
+    e.stopPropagation();
+    const { cluster, namespace } = unwatchBtn.dataset;
+    if (cluster && namespace) {
+      openUnwatchModal(cluster, namespace);
+    }
+    return;
+  }
   const hideBtn = e.target.closest(".btn-hide");
   if (hideBtn) {
     e.stopPropagation();
-    const { cluster, kind, workload } = hideBtn.dataset;
-    if (cluster && kind && workload) {
-      hideWorkload(cluster, { kind, name: workload });
+    const { cluster, namespace, kind, workload } = hideBtn.dataset;
+    if (cluster && namespace && kind && workload) {
+      hideWorkload(cluster, namespace, { kind, name: workload });
     }
     return;
   }
   const hiddenChip = e.target.closest(".cluster-hidden");
   if (hiddenChip) {
     e.stopPropagation();
-    if (hiddenChip.dataset.cluster) {
-      openHiddenModal(hiddenChip.dataset.cluster);
+    const { cluster, namespace } = hiddenChip.dataset;
+    if (cluster && namespace) {
+      openHiddenModal(cluster, namespace);
     }
     return;
   }
@@ -1830,15 +1914,15 @@ serverListEl.addEventListener("click", (e) => {
   if (!summary) {
     return;
   }
-  const cluster = summary.dataset.cluster;
-  if (!cluster) {
+  const group = summary.dataset.group;
+  if (!group) {
     return;
   }
-  if (collapsedClusters.has(cluster)) {
-    collapsedClusters.delete(cluster);
-    expandedOnce.add(cluster);
+  if (collapsedClusters.has(group)) {
+    collapsedClusters.delete(group);
+    expandedOnce.add(group);
   } else {
-    collapsedClusters.add(cluster);
+    collapsedClusters.add(group);
   }
   renderAll();
 });
@@ -1911,7 +1995,7 @@ serverListEl.addEventListener("dblclick", (e) => {
   if (card) {
     fullName = card.dataset.serverName;
   } else if (summary) {
-    fullName = summary.dataset.cluster;
+    fullName = summary.dataset.group;
   }
   if (!fullName) {
     return;

@@ -876,7 +876,7 @@ body {
   background: var(--accent-bg);
 }
 
-/* Trash icon: remove a server, or hide a pod's workload */
+/* Trash icon: remove a server, stop watching a namespace, or hide a workload */
 .btn-trash {
   display: inline-flex;
   align-items: center;
@@ -906,7 +906,8 @@ body {
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.btn-remove {
+.btn-remove,
+.btn-unwatch {
   margin-left: auto;
 }
 

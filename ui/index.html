@@ -7,248 +7,31 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="container">
-
-    <!-- Header -->
-    <div class="header">
-      <div class="header-side">
-        <div class="ward-eye">
-          <span class="ward-dot"></span>
-        </div>
-      </div>
-      <div class="header-center">
-        <span class="title">OBSERVER WARD</span>
-        <span id="sync-label" class="sync-label">syncing</span>
-      </div>
-      <div class="header-side">
-        <button id="btn-open-add" class="btn-icon"
-                title="Add server">&#x2295;</button>
-      </div>
+  <div class="win" id="win">
+    <!-- Blurred colour fields behind the glass; the coral one shows only
+         while something is critical. -->
+    <div class="aurora" aria-hidden="true">
+      <i class="a1"></i><i class="a2"></i><i class="a3"></i><i class="a4"></i><i class="a-alert"></i>
     </div>
 
-    <!-- Add Server Form (hidden by default) -->
-    <div id="add-form-panel" class="add-form-panel">
-      <div class="add-form-inner">
-        <div class="form-title">Add Server</div>
-        <form id="add-form" autocomplete="off" novalidate>
-          <div class="form-group">
-            <label for="field-name">Name</label>
-            <input id="field-name" type="text"
-                   placeholder="e.g. prod-cluster" required>
-          </div>
-          <div class="form-group">
-            <label for="field-type">Type</label>
-            <select id="field-type">
-              <option value="k8s">Kubernetes</option>
-              <option value="ssh">SSH</option>
-            </select>
-          </div>
+    <header class="top" id="top"></header>
+    <main class="page" id="page"><div id="content"></div></main>
+    <footer class="bottom" id="bottom"></footer>
 
-          <!-- K8s-specific fields -->
-          <div class="form-group field-k8s">
-            <label for="field-kubeconfig">
-              Kubeconfig (optional, default ~/.kube/config)
-            </label>
-            <div class="input-with-button">
-              <input id="field-kubeconfig" type="text"
-                     placeholder="~/.kube/config">
-              <button type="button" id="btn-browse-kubeconfig"
-                      class="btn btn-browse"
-                      aria-label="Browse for kubeconfig">Browse&hellip;</button>
-            </div>
-          </div>
-          <div class="form-group field-k8s">
-            <label for="field-context">Context</label>
-            <input id="field-context" type="text"
-                   list="context-options"
-                   placeholder="e.g. prod-ctx">
-            <datalist id="context-options"></datalist>
-          </div>
-          <div class="form-group field-k8s">
-            <label for="field-namespace">Namespace</label>
-            <input id="field-namespace" type="text"
-                   placeholder="e.g. default">
-          </div>
-
-          <!-- SSH-specific fields -->
-          <div class="form-group field-ssh hidden">
-            <label for="field-host">Host</label>
-            <input id="field-host" type="text"
-                   placeholder="e.g. 10.0.1.50">
-          </div>
-          <div class="form-group field-ssh hidden">
-            <label for="field-port">Port</label>
-            <input id="field-port" type="number"
-                   value="22" min="1" max="65535">
-          </div>
-          <div class="form-group field-ssh hidden">
-            <label for="field-user">User</label>
-            <input id="field-user" type="text"
-                   placeholder="e.g. admin">
-          </div>
-          <div class="form-group field-ssh hidden">
-            <label for="field-keypath">Key path</label>
-            <div class="input-with-button">
-              <input id="field-keypath" type="text"
-                     placeholder="~/.ssh/id_ed25519">
-              <button type="button" id="btn-browse-keypath"
-                      class="btn btn-browse"
-                      aria-label="Browse for SSH key">Browse&hellip;</button>
-            </div>
-          </div>
-
-          <div id="form-error" class="form-error" aria-live="polite"></div>
-          <div class="form-actions">
-            <button type="submit" id="btn-add"
-                    class="btn btn-primary">Add</button>
-            <button type="button" id="btn-cancel"
-                    class="btn btn-cancel">Cancel</button>
-          </div>
-        </form>
-      </div>
+    <div class="menu" id="menu" role="menu" hidden></div>
+    <div class="overlay" id="overlay" hidden>
+      <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title"></div>
     </div>
-
-    <!-- Grafana Alerts (populated by alerts-update events) -->
-    <div id="alerts-section" class="alerts-section hidden">
-      <div class="alerts-header">
-        <span class="alerts-title">GRAFANA ALERTS</span>
-        <span id="alerts-status" class="alerts-status"></span>
-      </div>
-      <div id="alerts-list" class="alerts-list"></div>
-    </div>
-
-    <!-- Server List -->
-    <div id="server-list" class="server-list">
-      <div class="empty-state">
-        <div class="empty-state-icon">&#x25C8;</div>
-        <div class="empty-state-text">
-          No servers configured<br>
-          Click + to add one
-        </div>
-      </div>
-    </div>
-
-    <!-- Settings Panel (hidden by default) -->
-    <div id="settings-panel" class="settings-panel">
-      <div class="settings-header">
-        <span class="settings-title">SETTINGS</span>
-        <button id="btn-close-settings"
-                class="btn-icon">&times;</button>
-      </div>
-      <div class="settings-body">
-        <div class="settings-row">
-          <label for="fg-interval">
-            Foreground interval (s)
-          </label>
-          <input type="number" id="fg-interval"
-                 min="5" max="120" value="10">
-        </div>
-        <div class="settings-row">
-          <label for="bg-interval">
-            Background interval (s)
-          </label>
-          <input type="number" id="bg-interval"
-                 min="30" max="600" value="300">
-        </div>
-        <div class="settings-row">
-          <label for="autostart-toggle">
-            Launch at login
-          </label>
-          <label class="toggle-switch">
-            <input type="checkbox" id="autostart-toggle">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="settings-row">
-          <label for="notifications-toggle">
-            Threshold alerts
-          </label>
-          <label class="toggle-switch">
-            <input type="checkbox" id="notifications-toggle">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="settings-divider"></div>
-        <div class="settings-row">
-          <label for="grafana-enabled">Grafana alerts</label>
-          <label class="toggle-switch">
-            <input type="checkbox" id="grafana-enabled">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="settings-row">
-          <label for="grafana-url">Grafana URL</label>
-          <input type="text" id="grafana-url"
-                 placeholder="https://grafana.internal">
-        </div>
-        <div class="settings-row">
-          <label for="grafana-verify-tls">Verify TLS</label>
-          <label class="toggle-switch">
-            <input type="checkbox" id="grafana-verify-tls" checked>
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="settings-row">
-          <label for="grafana-token">API token</label>
-          <input type="password" id="grafana-token"
-                 placeholder="(stored; leave blank to keep)">
-        </div>
-        <div id="settings-error" class="form-error"></div>
-        <div class="settings-actions">
-          <button id="btn-save-settings"
-                  class="btn btn-primary">SAVE</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Footer -->
-    <div class="footer">
-      <button class="btn-settings" id="btn-settings">
-        &#x2699; Settings
-      </button>
-      <button class="btn-settings" id="btn-quit">Quit</button>
-    </div>
-
-    <div id="remove-modal" class="modal-overlay">
-      <div class="modal" role="dialog" aria-modal="true"
-           aria-labelledby="remove-modal-title">
-        <div id="remove-modal-title" class="modal-title">Remove?</div>
-        <p id="remove-modal-body" class="modal-body"></p>
-        <div class="modal-actions">
-          <button type="button" id="btn-remove-cancel"
-                  class="btn btn-cancel">Cancel</button>
-          <button type="button" id="btn-remove-confirm"
-                  class="btn btn-danger">Remove</button>
-        </div>
-      </div>
-    </div>
-
-    <div id="hidden-modal" class="modal-overlay">
-      <div class="modal" role="dialog" aria-modal="true"
-           aria-labelledby="hidden-modal-title">
-        <div id="hidden-modal-title" class="modal-title">Hidden</div>
-        <p id="hidden-modal-error" class="modal-body modal-error" hidden></p>
-        <ul id="hidden-modal-list" class="hidden-list"></ul>
-        <div class="modal-actions">
-          <button type="button" id="btn-hidden-close"
-                  class="btn btn-cancel">Close</button>
-        </div>
-      </div>
-    </div>
-
   </div>
 
-  <!-- Context Menu (hidden) -->
-  <div id="context-menu" class="context-menu">
-    <div id="ctx-open-terminal" class="context-menu-item">Open Terminal</div>
-    <div id="ctx-copy-kubectl" class="context-menu-item">Copy kubectl context</div>
-    <div id="ctx-view-logs" class="context-menu-item">View Logs</div>
-    <div id="ctx-copy-metrics" class="context-menu-item">Copy Metrics</div>
-    <div id="ctx-copy-error" class="context-menu-item">Copy Error</div>
-    <div class="context-menu-separator"></div>
-    <div id="ctx-remove" class="context-menu-item danger">Remove</div>
-  </div>
+  <!-- Shared soft glow for gauge arcs and sparklines. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </svg>
 
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

@@ -1114,7 +1114,7 @@ mod tests {
 
         assert_eq!(config.foreground_poll_secs, 10);
         assert_eq!(config.background_poll_secs, 300);
-        assert!(config.servers.is_empty());
+        assert_eq!(config.servers, []);
         assert!(config.grafana.is_none());
         validate_fresh(&config).expect("defaults are valid");
     }
@@ -1207,7 +1207,7 @@ mod tests {
 
         let config = load_config_from(&dir.path().join("config.json")).expect("load");
 
-        assert!(config.servers.is_empty());
+        assert_eq!(config.servers, []);
     }
 
     #[tokio::test]
@@ -1243,7 +1243,7 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ConfigError::Invalid { .. })));
-        assert!(store.snapshot().await.servers.is_empty());
+        assert_eq!(store.snapshot().await.servers, []);
         assert!(!path.exists());
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ConfigError::CreateDir { .. })));
-        assert!(store.snapshot().await.servers.is_empty());
+        assert_eq!(store.snapshot().await.servers, []);
     }
 
     #[tokio::test]
@@ -1377,7 +1377,7 @@ mod tests {
 
         let config = load_config_or_default(&path);
 
-        assert!(config.servers.is_empty());
+        assert_eq!(config.servers, []);
         let backup = fs::read_to_string(path.with_extension("json.invalid")).expect("backup");
         assert_eq!(backup, "{ not valid json }");
     }

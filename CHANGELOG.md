@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Grafana URLs must be https (http only for loopback), so the token never crosses the network in cleartext
 - A host key that cannot be written to `known_hosts` is refused instead of accepted unrecorded
 - CI runs the full `cargo deny check` (licenses, bans, sources, advisories)
+- Rust toolchain pinned to 1.99.1 (was 1.98.0), which picks up the 1.98.1 fix for a vtable miscompile that crashed boxed async trait objects on aarch64-apple-darwin, and the 1.99.1 fix for x86_64 `extern "C"` functions returning `bool`
 
 ### Fixed
 

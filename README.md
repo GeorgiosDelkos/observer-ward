@@ -52,7 +52,7 @@ Colour only ever means state: green below 60%, amber from 60%, red from 85%.
 
 ## Install
 
-You need macOS (Apple Silicon or Intel), [Rust](https://rustup.rs/) (this repo pins 1.98.0 via `rust-toolchain.toml`), the Xcode Command Line Tools (`xcode-select --install`), and the Tauri CLI.
+You need macOS (Apple Silicon or Intel), [Rust](https://rustup.rs/) (this repo pins 1.99.1 via `rust-toolchain.toml`), the Xcode Command Line Tools (`xcode-select --install`), and the Tauri CLI.
 
 ```sh
 git clone https://github.com/GeorgiosDelkos/observer-ward.git
@@ -171,7 +171,7 @@ Every change made through the app is validated: new server names must be unique 
 
 ```
 observer-ward/
-├── rust-toolchain.toml     # Pins rustc 1.98.0 (also under src-tauri/)
+├── rust-toolchain.toml     # Pins rustc 1.99.1 (also under src-tauri/)
 ├── docs/images/            # README screenshots
 ├── src-tauri/              # Rust / Tauri
 │   └── src/

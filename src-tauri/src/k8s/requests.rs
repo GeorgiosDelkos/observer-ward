@@ -15,6 +15,7 @@ use kube::Client;
 use kube::api::{Api, ListParams};
 
 use super::CpuMem;
+use super::error::QuantityParseError;
 use super::quantity::{parse_cpu_quantity, parse_memory_quantity};
 
 /// Time allowed for the cluster-wide pod list. The figure is optional, so
@@ -71,7 +72,9 @@ pub(super) async fn list_requests(client: &Client) -> RequestList {
 ///   sidecars started before it. The pod needs room for the largest of
 ///   those steps.
 ///
-/// The reservation is the larger of the two.
+/// The reservation is the larger of the two. A pod-level request
+/// (`spec.resources`, beta in Kubernetes 1.34) replaces the containers'
+/// for its resource.
 fn pod_requests(pod: &Pod) -> CpuMem {
     let Some(spec) = &pod.spec else {
         return CpuMem::default();
@@ -92,7 +95,14 @@ fn pod_requests(pod: &Pod) -> CpuMem {
         init_peak = init_peak.max(step);
     }
 
-    [running.max(init_peak), quantities(spec.overhead.as_ref())]
+    let containers = running.max(init_peak);
+
+    let pod_level = spec.resources.as_ref().and_then(|r| r.requests.as_ref());
+    let reserved = CpuMem {
+        cpu: quantity(pod_level, "cpu", parse_cpu_quantity).unwrap_or(containers.cpu),
+        mem: quantity(pod_level, "memory", parse_memory_quantity).unwrap_or(containers.mem),
+    };
+    [reserved, quantities(spec.overhead.as_ref())]
         .into_iter()
         .sum()
 }
@@ -109,15 +119,20 @@ fn container_requests(container: &Container) -> CpuMem {
 /// The `cpu` and `memory` entries of a resource map. A missing or
 /// malformed one counts as zero, as the scheduler counts a missing one.
 fn quantities(map: Option<&BTreeMap<String, Quantity>>) -> CpuMem {
-    let cpu = map
-        .and_then(|m| m.get("cpu"))
-        .and_then(|q| parse_cpu_quantity(q).ok())
-        .unwrap_or(0.0);
-    let mem = map
-        .and_then(|m| m.get("memory"))
-        .and_then(|q| parse_memory_quantity(q).ok())
-        .unwrap_or(0);
-    CpuMem { cpu, mem }
+    CpuMem {
+        cpu: quantity(map, "cpu", parse_cpu_quantity).unwrap_or(0.0),
+        mem: quantity(map, "memory", parse_memory_quantity).unwrap_or(0),
+    }
+}
+
+/// The `resource` entry of a resource map, unless missing or malformed.
+fn quantity<T>(
+    map: Option<&BTreeMap<String, Quantity>>,
+    resource: &str,
+    parse: fn(&Quantity) -> Result<T, QuantityParseError>,
+) -> Option<T> {
+    map.and_then(|m| m.get(resource))
+        .and_then(|q| parse(q).ok())
 }
 
 #[cfg(test)]
@@ -194,6 +209,25 @@ mod tests {
 
         assert!((requests.cpu - 1.5).abs() < 1e-9);
         assert_eq!(requests.mem, 3 * 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_pod_level_request_replaces_the_containers_for_its_resource() {
+        let mut pod = pod(vec![container("250m", "1Gi")], Vec::new());
+        if let Some(spec) = pod.spec.as_mut() {
+            spec.resources = Some(ResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "cpu".to_string(),
+                    Quantity("2".to_string()),
+                )])),
+                ..ResourceRequirements::default()
+            });
+        }
+
+        let requests = pod_requests(&pod);
+
+        assert!((requests.cpu - 2.0).abs() < 1e-9);
+        assert_eq!(requests.mem, 1024 * 1024 * 1024);
     }
 
     #[test]

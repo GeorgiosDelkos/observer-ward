@@ -291,7 +291,7 @@ pub struct PodMetrics {
     /// The node the pod is scheduled on; `None` while it is unscheduled.
     pub node: Option<String>,
     /// `None` when metrics-server has no sample for the pod yet.
-    pub usage: Option<ResourceUsage>,
+    pub usage: Option<PodUsage>,
     pub net: Option<NetRate>,
     /// Summed over the pod's PVC-backed volumes; `None` without any.
     pub pvc: Option<Capacity>,
@@ -304,6 +304,40 @@ pub struct ResourceUsage {
     pub usage: Usage,
     #[serde(flatten)]
     pub used: Resources,
+}
+
+/// A pod's usage from its metrics-server sample: percentages of
+/// `ceiling`, and raw values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PodUsage {
+    #[serde(flatten)]
+    pub usage: Usage,
+    #[serde(flatten)]
+    pub used: Resources,
+    pub ceiling: Ceiling,
+}
+
+/// What a pod's CPU and memory percentages are shares of. The two may come
+/// from different places: a pod can limit memory and not CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Ceiling {
+    #[serde(flatten)]
+    pub resources: Resources,
+    pub cpu: CeilingSource,
+    pub memory: CeilingSource,
+}
+
+/// Where a pod's ceiling for one resource comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeilingSource {
+    /// The pod's limit, pod-level or summed over its containers.
+    Limit,
+    /// Without a limit, the pod may use whatever its node has free.
+    Node,
+    /// The pod's node is not known this poll; the cluster's allocatable
+    /// stands in, which understates the pod.
+    Cluster,
 }
 
 /// A pod's phase, or a container state specific enough to override it.
@@ -596,7 +630,15 @@ pub(crate) mod tests {
             start_time: None,
             last_event: None,
             node: None,
-            usage: usage.map(sampled),
+            usage: usage.map(|usage| PodUsage {
+                usage,
+                used: Resources::default(),
+                ceiling: Ceiling {
+                    resources: Resources::default(),
+                    cpu: CeilingSource::Limit,
+                    memory: CeilingSource::Limit,
+                },
+            }),
             net: None,
             pvc: None,
         }

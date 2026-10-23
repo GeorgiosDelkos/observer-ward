@@ -552,6 +552,7 @@ function renderPodCard(pod) {
   return `
     <div class="${cardClass}"
          data-server-name="${escapeHtml(name)}"
+         data-cluster="${escapeHtml(pod.cluster)}"
          data-card-type="pod">
       <div class="server-card-header">
         <span class="status-dot ${statusClass}"></span>
@@ -635,12 +636,16 @@ function renderClusterSummary(group, clusterPods) {
   const collapsed = collapsedClusters.has(group.key);
   const chevronClass = collapsed ? "chevron collapsed" : "chevron";
 
+  // The row carries the cluster's alias unless the row has its own.
+  const label = `${getDisplayName(group.cluster, group.cluster)} / ${group.namespace}`;
+
   return `
     <div class="cluster-summary"
          data-cluster="${escapeHtml(group.cluster)}"
-         data-group="${escapeHtml(group.key)}">
+         data-group="${escapeHtml(group.key)}"
+         data-label="${escapeHtml(label)}">
       <span class="${chevronClass}">&#x25B8;</span>
-      <span class="cluster-name">${escapeHtml(getDisplayName(group.key, group.key))}</span>
+      <span class="cluster-name">${escapeHtml(getDisplayName(group.key, label))}</span>
       <span class="cluster-stat">${clusterPods.length} pods</span>
       <span class="cluster-stat">${formatMillicores(totalCpu)} CPU</span>
       <span class="cluster-stat">${formatMemory(totalMem)} MEM</span>
@@ -1534,6 +1539,10 @@ function handleMetricsUpdate(event) {
   const currentPods = [];
   const receivedPodNames = new Set();
   const polledGroups = new Set();
+  // Against the config as it is now: a namespace unwatched while this poll
+  // ran gets no cards.
+  const watchedGroups = new Set(servers.flatMap((s) =>
+    s.type === "k8s" ? s.namespaces.map((ns) => groupKey(s.name, ns.name)) : []));
 
   for (const report of payload.servers) {
     const name = report.name;
@@ -1564,7 +1573,7 @@ function handleMetricsUpdate(event) {
     for (const ns of m.namespaces ?? []) {
       // `pods` is null when the backend failed to list them: only a
       // successful listing is authoritative enough to prune old cards.
-      if (!Array.isArray(ns.pods)) {
+      if (!Array.isArray(ns.pods) || !watchedGroups.has(groupKey(name, ns.name))) {
         continue;
       }
       polledGroups.add(groupKey(name, ns.name));
@@ -1605,8 +1614,6 @@ function handleMetricsUpdate(event) {
   // Keys are server names or "cluster/namespace/pod". A legacy server name
   // may contain "/" too, so server keys are recognised by name, not shape.
   const activeServerNames = new Set(servers.map((s) => s.name));
-  const watchedGroups = new Set(servers.flatMap((s) =>
-    s.type === "k8s" ? s.namespaces.map((ns) => groupKey(s.name, ns.name)) : []));
   const isPodKey = (key) => !activeServerNames.has(key) && key.includes("/");
   // Pod and namespace names never contain "/", so the last one splits off
   // the pod, even under a legacy cluster name.
@@ -1965,10 +1972,7 @@ serverListEl.addEventListener("contextmenu", (e) => {
   const isPod = card.dataset.cardType === "pod";
   let serverType = card.dataset.serverType || "";
   if (isPod) {
-    const slashIdx = name.lastIndexOf("/");
-    const clusterName = slashIdx >= 0 ? name.substring(0, slashIdx) : "";
-    const cfg = findServerConfig(clusterName);
-    serverType = cfg ? cfg.type : "k8s";
+    serverType = findServerConfig(card.dataset.cluster)?.type ?? "k8s";
   }
   showContextMenu(e, {
     name,
@@ -2016,7 +2020,7 @@ serverListEl.addEventListener("dblclick", (e) => {
   function commit() {
     const val = input.value.trim();
     const podCard = nameEl.closest("[data-card-type='pod']");
-    let fallback = fullName;
+    let fallback = summary ? summary.dataset.label : fullName;
     if (podCard) {
       const slashIdx = fullName.lastIndexOf("/");
       fallback = slashIdx >= 0

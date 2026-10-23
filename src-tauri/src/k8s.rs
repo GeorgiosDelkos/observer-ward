@@ -5,7 +5,7 @@
 //! events and Jobs are read for each watched namespace over the same
 //! connection.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Node, Pod};
@@ -184,13 +184,11 @@ impl K8sBackend {
         let totals = node_totals(&nodes);
 
         self.namespaces.retain(|name, _| watched.contains(name));
-        let mut namespaces = Vec::with_capacity(listings.len());
-        for listing in listings {
-            namespaces.push(
-                self.namespace_metrics(client, listing, &stats, totals.allocatable)
-                    .await,
-            );
-        }
+        self.resolve_jobs(client, &listings).await;
+        let namespaces = listings
+            .into_iter()
+            .map(|listing| self.namespace_metrics(listing, &stats, totals.allocatable))
+            .collect();
 
         let fs_net = cluster_totals(&stats);
         Ok(ClusterMetrics {
@@ -257,9 +255,8 @@ impl K8sBackend {
 
     /// Pod cards for one namespace. A failed pod listing leaves `pods`
     /// `None`, so the UI keeps the cards it has.
-    async fn namespace_metrics(
+    fn namespace_metrics(
         &mut self,
-        client: &Client,
         listing: NamespaceListing,
         stats: &[StatsSummary],
         allocatable: Resources,
@@ -267,7 +264,6 @@ impl K8sBackend {
         let NamespaceListing { name, pods, events } = listing;
         let pods = match pods {
             Ok((samples, specs)) => {
-                self.resolve_jobs(client, &name, &specs).await;
                 Some(self.pod_cards(&name, &samples, &specs, stats, &events, allocatable))
             }
             Err(e) => {
@@ -282,27 +278,61 @@ impl K8sBackend {
         NamespaceMetrics { name, pods }
     }
 
-    /// Re-list the namespace's Jobs when a Job with pods is not in the last
-    /// list: a new cron job run. Otherwise the last list still answers.
-    async fn resolve_jobs(&mut self, client: &Client, namespace: &str, specs: &[Pod]) {
-        let state = self.namespaces.entry(namespace.to_string()).or_default();
-        let wanted = jobs_of(specs);
-        let known = wanted.iter().all(|job| state.job_owners.contains_key(*job));
-        if known || state.jobs_forbidden {
-            return;
-        }
-        match list_job_owners(client, namespace, &wanted).await {
-            JobList::Owners(owners) => state.job_owners = owners,
-            JobList::Forbidden => {
-                tracing::warn!(
-                    "no permission to list jobs in {}/{namespace}: \
-                     hidden cron jobs are matched by run name only",
-                    self.target.name
-                );
-                state.jobs_forbidden = true;
+    /// Re-list the Jobs of each namespace where a Job with pods is not in
+    /// the last list (a new cron job run), all namespaces at once. Elsewhere
+    /// the last list still answers.
+    async fn resolve_jobs(&mut self, client: &Client, listings: &[NamespaceListing]) {
+        let stale = self.stale_jobs(listings);
+        let lists = stale.iter().map(|(namespace, wanted)| {
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let wanted = wanted.clone();
+            async move {
+                let wanted: HashSet<&str> = wanted.iter().map(String::as_str).collect();
+                list_job_owners(&client, &namespace, &wanted).await
             }
-            JobList::Failed => {}
+        });
+        let lists = join_ordered(lists, |_, e| {
+            tracing::warn!("job listing task failed: {e}");
+            JobList::Failed
+        })
+        .await;
+
+        for ((namespace, _), list) in stale.into_iter().zip(lists) {
+            let state = self.namespaces.entry(namespace.clone()).or_default();
+            match list {
+                JobList::Owners(owners) => state.job_owners = owners,
+                JobList::Forbidden => {
+                    tracing::warn!(
+                        "no permission to list jobs in {}/{namespace}: \
+                         hidden cron jobs are matched by run name only",
+                        self.target.name
+                    );
+                    state.jobs_forbidden = true;
+                }
+                JobList::Failed => {}
+            }
         }
+    }
+
+    /// Each listed namespace whose pods name a Job the last Job list did
+    /// not have, with those Jobs; namespaces where listing Jobs was refused
+    /// are left out.
+    fn stale_jobs(&self, listings: &[NamespaceListing]) -> Vec<(String, HashSet<String>)> {
+        listings
+            .iter()
+            .filter_map(|listing| {
+                let (_, specs) = listing.pods.as_ref().ok()?;
+                let wanted = jobs_of(specs);
+                let state = self.namespaces.get(&listing.name);
+                let forbidden = state.is_some_and(|s| s.jobs_forbidden);
+                let known = wanted
+                    .iter()
+                    .all(|job| state.is_some_and(|s| s.job_owners.contains_key(*job)));
+                let wanted = wanted.into_iter().map(str::to_string).collect();
+                (!known && !forbidden).then(|| (listing.name.clone(), wanted))
+            })
+            .collect()
     }
 
     fn pod_cards(
@@ -524,5 +554,64 @@ mod tests {
             None
         );
         assert!(backend.requests_forbidden, "a refusal is not");
+    }
+
+    /// A listing of `namespace` whose pods are each run by one Job.
+    fn listing(namespace: &str, jobs: &[&str]) -> NamespaceListing {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        use kube::api::ObjectMeta;
+
+        let specs = jobs
+            .iter()
+            .map(|job| Pod {
+                metadata: ObjectMeta {
+                    name: Some(format!("{job}-pod")),
+                    owner_references: Some(vec![OwnerReference {
+                        kind: "Job".to_string(),
+                        name: (*job).to_string(),
+                        controller: Some(true),
+                        ..OwnerReference::default()
+                    }]),
+                    ..ObjectMeta::default()
+                },
+                ..Pod::default()
+            })
+            .collect();
+        NamespaceListing {
+            name: namespace.to_string(),
+            pods: Ok((Vec::new(), specs)),
+            events: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn only_namespaces_with_unknown_jobs_are_relisted() {
+        let mut backend = backend();
+        let known = backend.namespaces.entry("known".to_string()).or_default();
+        known
+            .job_owners
+            .insert("backup-1".to_string(), Some("backup".to_string()));
+        backend
+            .namespaces
+            .entry("refused".to_string())
+            .or_default()
+            .jobs_forbidden = true;
+        let mut failed = listing("failed", &["x-1"]);
+        failed.pods = Err(K8sError::ListNodes(Box::new(
+            kube::Error::LinesCodecMaxLineLengthExceeded,
+        )));
+
+        let stale = backend.stale_jobs(&[
+            listing("known", &["backup-1"]),
+            listing("new", &["sweep-7"]),
+            listing("refused", &["sweep-8"]),
+            listing("no-jobs", &[]),
+            failed,
+        ]);
+
+        assert_eq!(
+            stale,
+            [("new".to_string(), HashSet::from(["sweep-7".to_string()]))]
+        );
     }
 }

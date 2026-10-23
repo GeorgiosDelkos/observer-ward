@@ -8,20 +8,21 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::config::WorkloadRef;
 use crate::metrics::{
-    Capacity, NetSample, PodMetrics, PodStatus, ResourceUsage, Resources, Usage, percent,
+    Capacity, NetSample, NodeMetrics, PodMetrics, PodStatus, ResourceUsage, Resources, Usage,
 };
 
 use super::error::K8sError;
 use super::jobs::{CRON_JOB, JOB, JobOwners};
 use super::metrics_api::PodMetrics as PodMetricsSample;
+use super::nodes::node_totals;
 use super::quantity::{parse_cpu_quantity, parse_memory_quantity};
 
 /// Cluster-wide inputs shared by every pod card of one poll.
 pub(super) struct PodContext<'a> {
-    /// Allocatable CPU (cores) and memory (bytes), the fallback base for
-    /// a pod without limits or requests.
-    pub(super) cluster_cpu: f64,
-    pub(super) cluster_mem: u64,
+    /// The cluster's node reports. A pod without a limit may use whatever
+    /// its node has free, so its node's allocatable is the ceiling it is
+    /// measured against.
+    pub(super) nodes: &'a [NodeMetrics],
     pub(super) pvc: &'a HashMap<String, Capacity>,
     pub(super) net: &'a HashMap<String, NetSample>,
     pub(super) prev_net: &'a HashMap<String, NetSample>,
@@ -130,42 +131,64 @@ fn pod_card(
 }
 
 /// Usage of one pod from its metrics-server sample, as a share of its
-/// limits (else requests, else the cluster's allocatable capacity).
+/// ceiling: its limits, else its node's allocatable (see
+/// [`node_allocatable`]).
+///
+/// Requests are never the ceiling. A request only reserves room on the
+/// node; a pod without a limit may run past it, so usage against a request
+/// reads over 100% for a pod that is merely busy.
 fn sample_usage(
     name: &str,
     sample: &PodMetricsSample,
     spec: &Pod,
     ctx: &PodContext<'_>,
 ) -> Result<ResourceUsage, K8sError> {
-    let mut cpu_used = 0.0_f64;
-    let mut mem_used = 0_u64;
+    let mut used = Resources::default();
     for container in &sample.containers {
-        cpu_used += parse_cpu_quantity(&container.usage.cpu)?;
-        mem_used = mem_used.saturating_add(parse_memory_quantity(&container.usage.memory)?);
+        used.add(Resources {
+            cpu_millicores: parse_cpu_quantity(&container.usage.cpu)? * 1000.0,
+            memory_bytes: parse_memory_quantity(&container.usage.memory)?,
+        });
     }
 
-    let (cpu_cap, mem_cap) = pod_allocations(spec);
-    let cpu_base = cpu_cap.unwrap_or(ctx.cluster_cpu);
-    let mem_base = mem_cap.unwrap_or(ctx.cluster_mem);
+    let ceiling = match pod_limits(spec) {
+        Limits {
+            cpu_millicores: Some(cpu_millicores),
+            memory_bytes: Some(memory_bytes),
+        } => Resources {
+            cpu_millicores,
+            memory_bytes,
+        },
+        limits => {
+            let node = node_allocatable(spec, ctx.nodes);
+            Resources {
+                cpu_millicores: limits.cpu_millicores.unwrap_or(node.cpu_millicores),
+                memory_bytes: limits.memory_bytes.unwrap_or(node.memory_bytes),
+            }
+        }
+    };
     let disk = ctx.pvc.get(name);
-
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "byte counts fit comfortably in f64 for a percentage"
-    )]
-    let memory_percent = percent(mem_used as f64, mem_base as f64);
 
     Ok(ResourceUsage {
         usage: Usage {
-            cpu_percent: percent(cpu_used, cpu_base),
-            memory_percent,
             disk_percent: disk.map_or(0.0, Capacity::percent),
+            ..used.share_of(&ceiling)
         },
-        used: Resources {
-            cpu_millicores: cpu_used * 1000.0,
-            memory_bytes: mem_used,
-        },
+        used,
     })
+}
+
+/// Allocatable of the node `pod` runs on, else of the whole cluster: a
+/// node missing from this poll's listing, or with a malformed allocatable
+/// (logged by `node_metrics`), must not cost the pod its usage. The
+/// cluster is a ceiling the pod cannot reach, so the fallback understates
+/// usage and never raises a false warning.
+fn node_allocatable(pod: &Pod, nodes: &[NodeMetrics]) -> Resources {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_deref())
+        .and_then(|node| nodes.iter().find(|n| n.name == node)?.allocatable)
+        .unwrap_or_else(|| node_totals(nodes).allocatable)
 }
 
 /// Kind of a pod without a controller, which is its own workload.
@@ -308,41 +331,58 @@ fn container_override(status: &K8sPodStatus) -> Option<PodStatus> {
         })
 }
 
-/// A pod's CPU (cores) and memory (bytes) caps: each container's limit,
-/// else its request. A resource is `None` unless *every* container caps
-/// it: summing only the capped containers would compare the whole pod's
-/// usage against part of its budget and overstate the percentage.
-pub(super) fn pod_allocations(pod: &Pod) -> (Option<f64>, Option<u64>) {
+/// A pod's CPU and memory limits. `None` where the pod has no limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Limits {
+    cpu_millicores: Option<f64>,
+    memory_bytes: Option<u64>,
+}
+
+/// A pod's limits, summed over the containers that run alongside each
+/// other: the app containers and native sidecars (init containers that
+/// restart always), whose usage the Metrics API reports with the pod's. A
+/// resource is `None` unless *every* one of them is limited: summing only
+/// the limited containers would compare the whole pod's usage against part
+/// of its budget and overstate the percentage.
+///
+/// Pod-level limits (`spec.resources`, beta in Kubernetes 1.34) are not
+/// read: the `v1_31` API types lack the field. Such a pod is measured
+/// against its node, which understates it.
+fn pod_limits(pod: &Pod) -> Limits {
     let Some(spec) = &pod.spec else {
-        return (None, None);
+        return Limits::default();
     };
     if spec.containers.is_empty() {
-        return (None, None);
+        return Limits::default();
     }
+    let sidecars = spec
+        .init_containers
+        .iter()
+        .flatten()
+        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
 
     let mut cpu = Some(0.0_f64);
     let mut mem = Some(0_u64);
-    for container in &spec.containers {
+    for container in spec.containers.iter().chain(sidecars) {
         let container_cpu =
-            container_cap(container, "cpu").and_then(|q| parse_logged(q, parse_cpu_quantity));
-        let container_mem =
-            container_cap(container, "memory").and_then(|q| parse_logged(q, parse_memory_quantity));
-        cpu = cpu.zip(container_cpu).map(|(total, c)| total + c);
+            container_limit(container, "cpu").and_then(|q| parse_logged(q, parse_cpu_quantity));
+        let container_mem = container_limit(container, "memory")
+            .and_then(|q| parse_logged(q, parse_memory_quantity));
+        cpu = cpu.zip(container_cpu).map(|(total, c)| total + c * 1000.0);
         mem = mem
             .zip(container_mem)
             .map(|(total, m)| total.saturating_add(m));
     }
-    (cpu, mem)
+    Limits {
+        cpu_millicores: cpu,
+        memory_bytes: mem,
+    }
 }
 
-/// The container's limit for `resource`, else its request.
-fn container_cap<'a>(container: &'a Container, resource: &str) -> Option<&'a Quantity> {
-    let resources = container.resources.as_ref()?;
-    resources
-        .limits
-        .as_ref()
-        .and_then(|l| l.get(resource))
-        .or_else(|| resources.requests.as_ref().and_then(|r| r.get(resource)))
+/// The container's limit for `resource`. A request is deliberately no
+/// fallback: it reserves room, it does not cap usage.
+fn container_limit<'a>(container: &'a Container, resource: &str) -> Option<&'a Quantity> {
+    container.resources.as_ref()?.limits.as_ref()?.get(resource)
 }
 
 fn parse_logged<T>(
@@ -350,7 +390,9 @@ fn parse_logged<T>(
     parse: fn(&Quantity) -> Result<T, super::error::QuantityParseError>,
 ) -> Option<T> {
     parse(quantity)
-        .inspect_err(|e| tracing::warn!("ignoring container cap: {}", crate::error::error_chain(e)))
+        .inspect_err(|e| {
+            tracing::warn!("ignoring container limit: {}", crate::error::error_chain(e));
+        })
         .ok()
 }
 
@@ -479,6 +521,33 @@ mod tests {
         }
     }
 
+    /// `pod` scheduled on `node`.
+    fn on_node(mut pod: Pod, node: &str) -> Pod {
+        pod.spec.get_or_insert_default().node_name = Some(node.to_string());
+        pod
+    }
+
+    fn node(name: &str, allocatable: Option<Resources>) -> NodeMetrics {
+        NodeMetrics {
+            name: name.to_string(),
+            roles: Vec::new(),
+            ready: true,
+            unschedulable: false,
+            problems: Vec::new(),
+            kubelet_version: None,
+            allocatable,
+            usage: None,
+            disk: None,
+        }
+    }
+
+    /// The allocatable of [`NODE`], the node every [`Maps::empty`] has.
+    const NODE_ALLOCATABLE: Resources = Resources {
+        cpu_millicores: 16_000.0,
+        memory_bytes: 64 * 1024 * 1024 * 1024,
+    };
+    const NODE: &str = "node-a";
+
     fn sample(name: &str, cpu: &str, memory: &str) -> PodMetricsSample {
         PodMetricsSample {
             metadata: ObjectMeta {
@@ -501,6 +570,7 @@ mod tests {
         events: HashMap<String, String>,
         hidden: BTreeSet<WorkloadRef>,
         job_owners: JobOwners,
+        nodes: Vec<NodeMetrics>,
     }
 
     impl Maps {
@@ -512,13 +582,13 @@ mod tests {
                 events: HashMap::new(),
                 hidden: BTreeSet::new(),
                 job_owners: JobOwners::new(),
+                nodes: vec![node(NODE, Some(NODE_ALLOCATABLE))],
             }
         }
 
         fn ctx(&self) -> PodContext<'_> {
             PodContext {
-                cluster_cpu: 64.0,
-                cluster_mem: 256 * 1024 * 1024 * 1024,
+                nodes: &self.nodes,
                 pvc: &self.pvc,
                 net: &self.net,
                 prev_net: &self.prev_net,
@@ -529,8 +599,33 @@ mod tests {
         }
     }
 
+    const GI: u64 = 1024 * 1024 * 1024;
+
+    fn init_container(restart_policy: Option<&str>, cpu_limit: Option<&str>) -> Container {
+        Container {
+            name: "init".to_string(),
+            restart_policy: restart_policy.map(str::to_string),
+            resources: Some(ResourceRequirements {
+                limits: qty_map(cpu_limit, cpu_limit.map(|_| "1Gi")),
+                ..ResourceRequirements::default()
+            }),
+            ..Container::default()
+        }
+    }
+
+    fn limited_app(name: &str) -> Pod {
+        make_pod_with_resources(
+            name,
+            &[ContainerRes {
+                cpu_limit: Some("1"),
+                mem_limit: Some("1Gi"),
+                ..NO_CAPS
+            }],
+        )
+    }
+
     #[test]
-    fn pod_allocations_prefers_limits_over_requests() {
+    fn pod_limits_ignore_requests() {
         let pod = make_pod_with_resources(
             "hcfs-server",
             &[ContainerRes {
@@ -540,14 +635,11 @@ mod tests {
                 mem_limit: Some("1Gi"),
             }],
         );
-        let (cpu, mem) = pod_allocations(&pod);
-        assert_f64_near(cpu.unwrap(), 1.0, 1e-9);
-        assert_eq!(mem, Some(1024 * 1024 * 1024));
-    }
+        let limits = pod_limits(&pod);
+        assert_f64_near(limits.cpu_millicores.unwrap(), 1000.0, 1e-9);
+        assert_eq!(limits.memory_bytes, Some(GI));
 
-    #[test]
-    fn pod_allocations_uses_requests_when_limits_absent() {
-        let pod = make_pod_with_resources(
+        let requests_only = make_pod_with_resources(
             "worker",
             &[ContainerRes {
                 cpu_request: Some("250m"),
@@ -555,13 +647,11 @@ mod tests {
                 ..NO_CAPS
             }],
         );
-        let (cpu, mem) = pod_allocations(&pod);
-        assert_f64_near(cpu.unwrap(), 0.25, 1e-9);
-        assert_eq!(mem, Some(256 * 1024 * 1024));
+        assert_eq!(pod_limits(&requests_only), Limits::default());
     }
 
     #[test]
-    fn pod_allocations_cpu_and_memory_caps_are_independent() {
+    fn pod_limits_cpu_and_memory_are_independent() {
         let pod = make_pod_with_resources(
             "mixed",
             &[ContainerRes {
@@ -571,14 +661,14 @@ mod tests {
                 mem_limit: None,
             }],
         );
-        let (cpu, mem) = pod_allocations(&pod);
-        assert_f64_near(cpu.unwrap(), 2.0, 1e-9);
-        assert_eq!(mem, Some(512 * 1024 * 1024));
+        let limits = pod_limits(&pod);
+        assert_f64_near(limits.cpu_millicores.unwrap(), 2000.0, 1e-9);
+        assert_eq!(limits.memory_bytes, None);
     }
 
     #[test]
-    fn pod_allocations_need_every_container_capped() {
-        // A sidecar without caps: summing only the app's 1 core would make
+    fn pod_limits_need_every_container_limited() {
+        // A sidecar without limits: summing only the app's 1 core would make
         // the whole pod's usage look like a share of the app alone.
         let pod = make_pod_with_resources(
             "with-sidecar",
@@ -591,12 +681,32 @@ mod tests {
                 NO_CAPS,
             ],
         );
-        assert_eq!(pod_allocations(&pod), (None, None));
-        assert_eq!(pod_allocations(&named_pod("no-spec")), (None, None));
+        assert_eq!(pod_limits(&pod), Limits::default());
+        assert_eq!(pod_limits(&named_pod("no-spec")), Limits::default());
     }
 
     #[test]
-    fn pod_allocations_accept_canonical_milli_byte_limits() {
+    fn pod_limits_count_native_sidecars_but_not_init_containers() {
+        let mut pod = limited_app("with-native-sidecar");
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![
+            init_container(None, Some("4")),
+            init_container(None, None),
+            init_container(Some("Always"), Some("500m")),
+        ]);
+        let limits = pod_limits(&pod);
+        assert_f64_near(limits.cpu_millicores.unwrap(), 1500.0, 1e-9);
+        assert_eq!(limits.memory_bytes, Some(2 * GI));
+
+        // An unlimited native sidecar runs with the app, so the pod has no
+        // ceiling of its own.
+        let mut pod = limited_app("with-unlimited-sidecar");
+        pod.spec.as_mut().unwrap().init_containers =
+            Some(vec![init_container(Some("Always"), None)]);
+        assert_eq!(pod_limits(&pod), Limits::default());
+    }
+
+    #[test]
+    fn pod_limits_accept_canonical_milli_byte_limits() {
         let pod = make_pod_with_resources(
             "canonical",
             &[ContainerRes {
@@ -604,7 +714,65 @@ mod tests {
                 ..NO_CAPS
             }],
         );
-        assert_eq!(pod_allocations(&pod).1, Some(1_288_490_189));
+        assert_eq!(pod_limits(&pod).memory_bytes, Some(1_288_490_189));
+    }
+
+    #[test]
+    fn usage_without_a_limit_is_a_share_of_its_node_not_its_request() {
+        // hcfs-server: a 1-core request and no CPU limit, bursting to 1.6
+        // cores. Against the request that read 160%; the node has room.
+        let spec = on_node(
+            make_pod_with_resources(
+                "hcfs-server",
+                &[ContainerRes {
+                    cpu_request: Some("1"),
+                    mem_request: Some("2Gi"),
+                    mem_limit: Some("8Gi"),
+                    ..NO_CAPS
+                }],
+            ),
+            NODE,
+        );
+        let maps = Maps::empty();
+
+        let usage = sample_usage(
+            "hcfs-server",
+            &sample("hcfs-server", "1600m", "2Gi"),
+            &spec,
+            &maps.ctx(),
+        )
+        .expect("usage");
+
+        assert_f64_near(usage.usage.cpu_percent, 10.0, 0.01);
+        assert_f64_near(usage.usage.memory_percent, 25.0, 0.01);
+    }
+
+    #[test]
+    fn usage_falls_back_to_the_cluster_when_the_node_is_unknown() {
+        let mut maps = Maps::empty();
+        maps.nodes.push(node("node-b", None));
+        maps.nodes.push(node("node-c", Some(NODE_ALLOCATABLE)));
+        let spec = make_pod_with_resources(
+            "worker",
+            &[ContainerRes {
+                cpu_limit: Some("4"),
+                ..NO_CAPS
+            }],
+        );
+        let sampled = sample("worker", "1600m", "8Gi");
+
+        // Unscheduled, on a node without allocatable, on a node gone from the
+        // listing: CPU keeps its limit, memory is a share of both nodes.
+        for spec in [
+            spec.clone(),
+            on_node(spec.clone(), "node-b"),
+            on_node(spec, "gone"),
+        ] {
+            let usage = sample_usage("worker", &sampled, &spec, &maps.ctx()).expect("usage");
+            assert_f64_near(usage.usage.cpu_percent, 40.0, 0.01);
+            assert_f64_near(usage.usage.memory_percent, 6.25, 0.01);
+            assert_eq!(usage.used.memory_bytes, 8 * GI);
+        }
     }
 
     #[test]
@@ -651,7 +819,7 @@ mod tests {
                 ..K8sPodStatus::default()
             },
         );
-        let web = named_pod("web");
+        let web = on_node(named_pod("web"), NODE);
         let mut maps = Maps::empty();
         maps.events.insert(
             "pending".to_string(),
@@ -870,7 +1038,7 @@ mod tests {
                 sample("web", "10m", "1Mi"),
                 sample("gone", "1m", "1Mi"),
             ],
-            &[api_sampled, api_pending, named_pod("web")],
+            &[api_sampled, api_pending, on_node(named_pod("web"), NODE)],
             &maps.ctx(),
         );
 

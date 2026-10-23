@@ -16,8 +16,8 @@ use tokio::task::{JoinError, JoinSet};
 
 use crate::config::K8sTarget;
 use crate::metrics::{
-    ClusterMetrics, NamespaceMetrics, NetRate, NetSample, PodMetrics, Requested, ResourceUsage,
-    Resources, Usage,
+    ClusterMetrics, NamespaceMetrics, NetRate, NetSample, NodeMetrics, PodMetrics, Requested,
+    ResourceUsage, Resources, Usage,
 };
 
 mod error;
@@ -174,7 +174,7 @@ impl K8sBackend {
         self.resolve_jobs(client, &listings).await;
         let namespaces = listings
             .into_iter()
-            .map(|listing| self.namespace_metrics(listing, &stats, totals.allocatable))
+            .map(|listing| self.namespace_metrics(listing, &stats, &nodes))
             .collect();
 
         let fs_net = cluster_totals(&stats);
@@ -246,12 +246,12 @@ impl K8sBackend {
         &mut self,
         listing: NamespaceListing,
         stats: &[StatsSummary],
-        allocatable: Resources,
+        nodes: &[NodeMetrics],
     ) -> NamespaceMetrics {
         let NamespaceListing { name, pods, events } = listing;
         let pods = match pods {
             Ok((samples, specs)) => {
-                Some(self.pod_cards(&name, &samples, &specs, stats, &events, allocatable))
+                Some(self.pod_cards(&name, &samples, &specs, stats, &events, nodes))
             }
             Err(e) => {
                 tracing::warn!(
@@ -329,7 +329,7 @@ impl K8sBackend {
         specs: &[Pod],
         stats: &[StatsSummary],
         events: &HashMap<String, String>,
-        allocatable: Resources,
+        nodes: &[NodeMetrics],
     ) -> Vec<PodMetrics> {
         let pvc = extract_pod_pvc(stats, namespace);
         let net = extract_pod_network(stats, namespace, Instant::now());
@@ -344,8 +344,7 @@ impl K8sBackend {
             samples,
             specs,
             &PodContext {
-                cluster_cpu: allocatable.cpu_millicores / 1000.0,
-                cluster_mem: allocatable.memory_bytes,
+                nodes,
                 pvc: &pvc,
                 net: &net,
                 prev_net: &state.prev_pod_net,

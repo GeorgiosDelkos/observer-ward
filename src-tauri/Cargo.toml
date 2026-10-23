@@ -9,7 +9,7 @@ homepage = "https://github.com/GeorgiosDelkos/observer-ward"
 readme = "../README.md"
 authors = ["Georgios Delkos"]
 # Application pin: matches rust-toolchain.toml. Not a published library.
-rust-version = "1.98"
+rust-version = "1.99"
 
 [lib]
 name = "observer_ward_lib"

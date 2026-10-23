@@ -35,10 +35,6 @@ use tray::setup_tray_and_window;
 ///
 /// Returns an error if the config directory cannot be determined, the
 /// Tauri runtime fails to start, or the tray icon cannot be created.
-#[expect(
-    clippy::exit,
-    reason = "tauri::generate_context! macro calls process::exit"
-)]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();

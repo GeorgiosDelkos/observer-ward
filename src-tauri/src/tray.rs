@@ -261,7 +261,7 @@ impl Drop for NativeDialogGuard {
             let _always_ok =
                 state
                     .native_dialogs_open
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                         Some(n.saturating_sub(1))
                     });
         }

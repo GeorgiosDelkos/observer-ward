@@ -683,13 +683,13 @@ mod tests {
             tray_alerts_after_grafana(Some(&failed), &last_good),
             last_good
         );
-        assert!(tray_alerts_after_grafana(Some(&failed), &[]).is_empty());
+        assert_eq!(tray_alerts_after_grafana(Some(&failed), &[]), []);
     }
 
     #[test]
     fn tray_alerts_disabled_grafana_is_empty() {
         let last_good = vec![sample_alert("stale")];
-        assert!(tray_alerts_after_grafana(None, &last_good).is_empty());
+        assert_eq!(tray_alerts_after_grafana(None, &last_good), []);
     }
 
     #[test]
@@ -927,7 +927,7 @@ mod tests {
         let first = notifier.metric_notices(&reports);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].title, "prod/default/web: MEM CRITICAL");
-        assert!(notifier.metric_notices(&reports).is_empty());
+        assert_eq!(notifier.metric_notices(&reports), []);
     }
 
     #[test]
@@ -940,7 +940,7 @@ mod tests {
         let first = notifier.alert_notices(&alerts);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].title, "Grafana CRITICAL: Test");
-        assert!(notifier.alert_notices(&alerts).is_empty());
+        assert_eq!(notifier.alert_notices(&alerts), []);
 
         notifier.forget_alerts();
         assert_eq!(notifier.alert_notices(&alerts).len(), 1);

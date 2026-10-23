@@ -579,12 +579,12 @@ mod tests {
         );
         assert_ne!(alerts[0].fingerprint, alerts[1].fingerprint);
         assert_eq!(alerts[0].fingerprint, alerts[2].fingerprint);
-        assert!(!alerts[0].fingerprint.is_empty());
+        assert_ne!(alerts[0].fingerprint, "");
     }
 
     #[test]
     fn empty_and_invalid_bodies() {
-        assert!(parse("[]").is_empty());
+        assert_eq!(parse("[]"), []);
         assert!(parse_alerts(b"not json").is_err());
     }
 

@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { capacity, cores, kindBadge, level, middle, percentText, worse } from "../../ui/js/format.js";
+import {
+  bytesShort,
+  capacity,
+  cores,
+  kindBadge,
+  level,
+  middle,
+  ofCeiling,
+  percentText,
+  worse,
+} from "../../ui/js/format.js";
 
 const GiB = 1024 ** 3;
 const TiB = 1024 ** 4;
@@ -41,4 +51,9 @@ test("workload kinds get short badges", () => {
   assert.equal(kindBadge("StatefulSet"), "STS");
   assert.equal(kindBadge("Rollout"), "RO");
   assert.equal(kindBadge("ScaledJob"), "SCA");
+});
+
+test("a pod's usage reads against its ceiling and where it comes from", () => {
+  assert.equal(ofCeiling(1600, 16000, "node", cores), "1.6c of 16.0c · node");
+  assert.equal(ofCeiling(2 * GiB, 8 * GiB, "limit", bytesShort), "2.0G of 8.0G · limit");
 });

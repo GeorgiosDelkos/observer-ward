@@ -40,7 +40,9 @@ cargo tauri build                                   # production build
 - `ssh.rs` + `ssh/` -- SSH remote command parsing (top/free/df/proc)
 - `grafana.rs` -- Grafana Alertmanager firing alerts; token in Keychain
 
-**Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update`, `poll-start`, and `alerts-update` events from the backend.
+**Frontend:** Vanilla JS as native ES modules, no build step. `ui/js/model.js` holds state and derived health (no DOM); `view.js` renders the overview, cluster and namespace pages as HTML strings with `data-action` attributes that `app.js` dispatches; `forms.js` owns the add and settings pages (a metrics update never re-renders a form). Receives `metrics-update`, `poll-start`, and `alerts-update` events. Pure modules are tested with `node --test "tests/ui/*.test.mjs"`.
+
+**Design ("Night Glass"):** every size on a 4px grid; all text on one 22px edge (8px page inset + 14px card padding); concentric corners (window 24, card 16, inner list 10, control 8); borders as inset box-shadows so they never shift the text edge; colour only for state (mint/amber/coral) and iris for interactive. Native macOS blur comes from `windowEffects` (`hudWindow`) in `tauri.conf.json`. Fonts are bundled in `ui/fonts/` because the CSP only allows `'self'`. Verify layout changes visually before calling them done.
 
 Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`. A `K8sTarget` is one cluster (kubeconfig + context) watching several namespaces; legacy one-namespace entries merge on load (`AppConfig::merge_clusters`). Pods are hidden by owning workload per namespace (`WatchedNamespace.hidden`), filtered in the poller so hidden pods never reach the tray, notifier, or UI.
 

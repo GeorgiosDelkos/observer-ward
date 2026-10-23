@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Night Glass popover: overview (attention list, cluster rings with requested capacity, node matrix, namespace rows, hosts), cluster page (sparkline history, nodes with conditions and their pods, namespaces), and namespace page (pods grouped by workload with a ready count); native macOS blur behind the window, bundled Geist fonts
+- Add form picks namespaces from the cluster (`list_namespaces` command) and can watch another namespace of an existing cluster
+- UI unit tests for the model and formatting, run in CI with `node --test`
 - Per-node reports: ready, cordoned, pressure conditions, roles, kubelet version, allocatable, and CPU/memory/disk usage; a node at a threshold now notifies on its own and colours the tray (one-node clusters count once, as the cluster)
 - Requested CPU and memory across the cluster, against allocatable, when pods can be listed in all namespaces
 - Each pod reports the node it runs on

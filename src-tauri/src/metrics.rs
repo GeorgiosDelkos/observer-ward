@@ -321,10 +321,37 @@ pub struct PodUsage {
 /// from different places: a pod can limit memory and not CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Ceiling {
-    #[serde(flatten)]
-    pub resources: Resources,
-    pub cpu: CeilingSource,
-    pub memory: CeilingSource,
+    /// In millicores.
+    pub cpu: Bound<f64>,
+    /// In bytes.
+    pub memory: Bound<u64>,
+}
+
+impl Ceiling {
+    #[must_use]
+    pub fn resources(&self) -> Resources {
+        Resources {
+            cpu_millicores: self.cpu.amount,
+            memory_bytes: self.memory.amount,
+        }
+    }
+}
+
+/// One resource's ceiling and where it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Bound<T> {
+    pub amount: T,
+    pub source: CeilingSource,
+}
+
+impl<T> Bound<T> {
+    /// A ceiling set by the pod's own limit.
+    pub fn limit(amount: T) -> Self {
+        Self {
+            amount,
+            source: CeilingSource::Limit,
+        }
+    }
 }
 
 /// Where a pod's ceiling for one resource comes from.
@@ -634,9 +661,14 @@ pub(crate) mod tests {
                 usage,
                 used: Resources::default(),
                 ceiling: Ceiling {
-                    resources: Resources::default(),
-                    cpu: CeilingSource::Limit,
-                    memory: CeilingSource::Limit,
+                    cpu: Bound {
+                        amount: 0.0,
+                        source: CeilingSource::Limit,
+                    },
+                    memory: Bound {
+                        amount: 0,
+                        source: CeilingSource::Limit,
+                    },
                 },
             }),
             net: None,

@@ -54,6 +54,6 @@ test("workload kinds get short badges", () => {
 });
 
 test("a pod's usage reads against its ceiling and where it comes from", () => {
-  assert.equal(ofCeiling(1600, 16000, "node", cores), "1.6c of 16.0c · node");
-  assert.equal(ofCeiling(2 * GiB, 8 * GiB, "limit", bytesShort), "2.0G of 8.0G · limit");
+  assert.equal(ofCeiling(1600, { amount: 16000, source: "node" }, cores), "1.6c of 16.0c · node");
+  assert.equal(ofCeiling(2 * GiB, { amount: 8 * GiB, source: "limit" }, bytesShort), "2.0G of 8.0G · limit");
 });

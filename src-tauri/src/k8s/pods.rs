@@ -8,8 +8,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::config::WorkloadRef;
 use crate::metrics::{
-    Capacity, Ceiling, CeilingSource, NetSample, NodeMetrics, PodMetrics, PodStatus, PodUsage,
-    Resources, Usage,
+    Bound, Capacity, Ceiling, CeilingSource, NetSample, NodeMetrics, PodMetrics, PodStatus,
+    PodUsage, Resources, Usage,
 };
 
 use super::error::K8sError;
@@ -153,7 +153,7 @@ fn sample_usage(
     Ok(PodUsage {
         usage: Usage {
             disk_percent: disk.map_or(0.0, Capacity::percent),
-            ..used.share_of(&ceiling.resources)
+            ..used.share_of(&ceiling.resources())
         },
         used,
         ceiling,
@@ -168,24 +168,29 @@ fn sample_usage(
 /// reads over 100% for a pod that is merely busy.
 fn pod_ceiling(pod: &Pod, nodes: &[NodeMetrics]) -> Ceiling {
     let limits = pod_limits(pod);
-    let (node, source) = node_allocatable(pod, nodes);
-    let (cpu_millicores, cpu) = limits
-        .cpu_millicores
-        .map_or((node.cpu_millicores, source), |cpu| {
-            (cpu, CeilingSource::Limit)
-        });
-    let (memory_bytes, memory) = limits
-        .memory_bytes
-        .map_or((node.memory_bytes, source), |mem| {
-            (mem, CeilingSource::Limit)
-        });
+    // The node is looked up only for a resource without a limit.
+    let node = || node_allocatable(pod, nodes);
     Ceiling {
-        resources: Resources {
-            cpu_millicores,
-            memory_bytes,
-        },
-        cpu,
-        memory,
+        cpu: limits.cpu_millicores.map_or_else(
+            || {
+                let (node, source) = node();
+                Bound {
+                    amount: node.cpu_millicores,
+                    source,
+                }
+            },
+            Bound::limit,
+        ),
+        memory: limits.memory_bytes.map_or_else(
+            || {
+                let (node, source) = node();
+                Bound {
+                    amount: node.memory_bytes,
+                    source,
+                }
+            },
+            Bound::limit,
+        ),
     }
 }
 
@@ -392,6 +397,8 @@ fn zip_with<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option<
 ///
 /// The ceiling is the larger of the two. A resource is `None` unless
 /// *every* container is limited: an unlimited one may use the whole node.
+/// Unlike `PodLimits`, the pod overhead is not added: metrics-server
+/// reports container usage only, which the overhead never holds.
 /// A pod-level limit (`spec.resources`, beta in Kubernetes 1.34) replaces
 /// the containers' for its resource, as Kubernetes applies it.
 fn pod_limits(pod: &Pod) -> Limits {
@@ -452,7 +459,7 @@ fn parse_logged<T>(
 ) -> Option<T> {
     parse(quantity)
         .inspect_err(|e| {
-            tracing::warn!("ignoring container limit: {}", crate::error::error_chain(e));
+            tracing::warn!("ignoring limit: {}", crate::error::error_chain(e));
         })
         .ok()
 }
@@ -825,10 +832,12 @@ mod tests {
         // Over fully limited containers, the pod-level limit still wins.
         let mut pod = limited_app("pod-level-over-limits");
         pod.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
-            limits: qty_map(Some("500m"), None),
+            limits: qty_map(Some("500m"), Some("3Gi")),
             ..ResourceRequirements::default()
         });
-        assert_f64_near(pod_limits(&pod).cpu_millicores.unwrap(), 500.0, 1e-9);
+        let limits = pod_limits(&pod);
+        assert_f64_near(limits.cpu_millicores.unwrap(), 500.0, 1e-9);
+        assert_eq!(limits.memory_bytes, Some(3 * GI));
     }
 
     #[test]
@@ -874,22 +883,21 @@ mod tests {
         assert_eq!(
             usage.ceiling,
             Ceiling {
-                resources: Resources {
-                    cpu_millicores: 16_000.0,
-                    memory_bytes: 8 * GI,
+                cpu: Bound {
+                    amount: 16_000.0,
+                    source: CeilingSource::Node,
                 },
-                cpu: CeilingSource::Node,
-                memory: CeilingSource::Limit,
+                memory: Bound::limit(8 * GI),
             }
         );
 
         // The UI reads the ceiling beside the flattened usage.
         let json = serde_json::to_value(usage).expect("json");
         assert_eq!(json["cpu_percent"], 10.0);
-        assert_eq!(json["ceiling"]["cpu_millicores"], 16_000.0);
-        assert_eq!(json["ceiling"]["memory_bytes"], 8 * GI);
-        assert_eq!(json["ceiling"]["cpu"], "node");
-        assert_eq!(json["ceiling"]["memory"], "limit");
+        assert_eq!(json["ceiling"]["cpu"]["amount"], 16_000.0);
+        assert_eq!(json["ceiling"]["cpu"]["source"], "node");
+        assert_eq!(json["ceiling"]["memory"]["amount"], 8 * GI);
+        assert_eq!(json["ceiling"]["memory"]["source"], "limit");
     }
 
     #[test]
@@ -917,8 +925,8 @@ mod tests {
             assert_f64_near(usage.usage.cpu_percent, 40.0, 0.01);
             assert_f64_near(usage.usage.memory_percent, 6.25, 0.01);
             assert_eq!(usage.used.memory_bytes, 8 * GI);
-            assert_eq!(usage.ceiling.cpu, CeilingSource::Limit);
-            assert_eq!(usage.ceiling.memory, CeilingSource::Cluster);
+            assert_eq!(usage.ceiling.cpu, Bound::limit(4000.0));
+            assert_eq!(usage.ceiling.memory.source, CeilingSource::Cluster);
         }
     }
 

@@ -222,11 +222,15 @@ mod tests {
                 )])),
                 ..ResourceRequirements::default()
             });
+            spec.overhead = Some(BTreeMap::from([(
+                "cpu".to_string(),
+                Quantity("100m".to_string()),
+            )]));
         }
 
         let requests = pod_requests(&pod);
 
-        assert!((requests.cpu - 2.0).abs() < 1e-9);
+        assert!((requests.cpu - 2.1).abs() < 1e-9, "overhead still adds");
         assert_eq!(requests.mem, 1024 * 1024 * 1024);
     }
 

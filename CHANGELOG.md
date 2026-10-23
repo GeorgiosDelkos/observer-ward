@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Requested CPU and memory across the cluster, against allocatable, when pods can be listed in all namespaces
 - Each pod reports the node it runs on
 - `unwatch_namespace` command
-- The pod sheet shows what each usage bar is measured against, for example `1.6c of 16.0c · node` (pod `usage.ceiling`, with `cpu` and `memory` set to `limit`, `node` or `cluster`)
+- The pod sheet shows what each usage bar is measured against, for example `1.6c of 16.0c · node` (pod `usage.ceiling.cpu` and `.memory`, each `{ amount, source }` with source `limit`, `node` or `cluster`)
 - Pod-level resources (`spec.resources`, Kubernetes 1.34) count as the pod's limits and requests
 
 ### Changed

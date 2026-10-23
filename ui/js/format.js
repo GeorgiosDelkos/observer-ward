@@ -49,11 +49,12 @@ export function cores(millicores) {
 }
 
 /**
- * A pod's use of one resource against its ceiling, and where the ceiling
- * comes from: "1.6c of 16.0c · node". `unit` formats both amounts.
+ * A pod's use of one resource against its ceiling (`{ amount, source }`),
+ * and where the ceiling comes from: "1.6c of 16.0c · node". `unit` formats
+ * both amounts.
  */
-export function ofCeiling(used, ceiling, source, unit) {
-  return `${unit(used)} of ${unit(ceiling)} · ${source}`;
+export function ofCeiling(used, ceiling, unit) {
+  return `${unit(used)} of ${unit(ceiling.amount)} · ${ceiling.source}`;
 }
 
 /** Bytes as the largest unit that keeps a short number: "512M", "1.4G", "4.5T". */

@@ -61,32 +61,38 @@ pub(super) async fn list_requests(client: &Client) -> RequestList {
     }
 }
 
-/// What the scheduler reserves for `pod`: per resource, the larger of its
-/// containers' summed requests and its largest init container request,
-/// plus the pod overhead. Restartable init containers (sidecars) are
-/// counted like other init containers, so a pod with sidecars reads a
-/// little low.
+/// What the scheduler reserves for `pod`, per resource, plus the pod
+/// overhead. This follows Kubernetes' `PodRequests`
+/// (`k8s.io/component-helpers/resource`):
+///
+/// - App containers and native sidecars (init containers that restart
+///   always) run together, so their requests add up.
+/// - Init containers run one at a time, in order, each alongside the
+///   sidecars started before it. The pod needs room for the largest of
+///   those steps.
+///
+/// The reservation is the larger of the two.
 fn pod_requests(pod: &Pod) -> CpuMem {
     let Some(spec) = &pod.spec else {
         return CpuMem::default();
     };
 
-    let running: CpuMem = spec.containers.iter().map(container_requests).sum();
-    let init = spec
-        .init_containers
-        .iter()
-        .flatten()
-        .map(container_requests)
-        .fold(CpuMem::default(), |max, c| CpuMem {
-            cpu: max.cpu.max(c.cpu),
-            mem: max.mem.max(c.mem),
-        });
-    let reserved = CpuMem {
-        cpu: running.cpu.max(init.cpu),
-        mem: running.mem.max(init.mem),
-    };
+    let mut running: CpuMem = spec.containers.iter().map(container_requests).sum();
+    let mut sidecars = CpuMem::default();
+    let mut init_peak = CpuMem::default();
+    for init in spec.init_containers.iter().flatten() {
+        let requests = container_requests(init);
+        let step = if init.restart_policy.as_deref() == Some("Always") {
+            running = [running, requests].into_iter().sum();
+            sidecars = [sidecars, requests].into_iter().sum();
+            sidecars
+        } else {
+            [sidecars, requests].into_iter().sum()
+        };
+        init_peak = init_peak.max(step);
+    }
 
-    [reserved, quantities(spec.overhead.as_ref())]
+    [running.max(init_peak), quantities(spec.overhead.as_ref())]
         .into_iter()
         .sum()
 }
@@ -153,6 +159,41 @@ mod tests {
 
         assert!((requests.cpu - 1.0).abs() < 1e-9, "init needs a whole core");
         assert_eq!(requests.mem, 2 * 1024 * 1024 * 1024, "containers need 2Gi");
+    }
+
+    fn sidecar(cpu: &str, mem: &str) -> Container {
+        Container {
+            restart_policy: Some("Always".to_string()),
+            ..container(cpu, mem)
+        }
+    }
+
+    #[test]
+    fn native_sidecars_add_to_the_running_containers() {
+        let requests = pod_requests(&pod(
+            vec![container("250m", "1Gi")],
+            vec![sidecar("100m", "256Mi"), container("100m", "128Mi")],
+        ));
+
+        assert!((requests.cpu - 0.35).abs() < 1e-9);
+        assert_eq!(requests.mem, (1024 + 256) * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_init_container_runs_beside_the_sidecars_started_before_it() {
+        // The second init container runs with the first sidecar (1.5 cores)
+        // but not the second; the app and both sidecars need only 0.7.
+        let requests = pod_requests(&pod(
+            vec![container("100m", "64Mi")],
+            vec![
+                sidecar("500m", "64Mi"),
+                container("1", "64Mi"),
+                sidecar("100m", "64Mi"),
+            ],
+        ));
+
+        assert!((requests.cpu - 1.5).abs() < 1e-9);
+        assert_eq!(requests.mem, 3 * 64 * 1024 * 1024);
     }
 
     #[test]

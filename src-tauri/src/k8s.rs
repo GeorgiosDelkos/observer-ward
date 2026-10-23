@@ -63,6 +63,14 @@ impl CpuMem {
             memory_bytes: self.mem,
         }
     }
+
+    /// The larger of `self` and `other`, per resource.
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(other.cpu),
+            mem: self.mem.max(other.mem),
+        }
+    }
 }
 
 impl std::iter::Sum for CpuMem {

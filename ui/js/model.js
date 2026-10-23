@@ -28,9 +28,9 @@ export const state = {
   reports: new Map(),
   /** Latest `alerts-update` payload, or null before the first one. */
   alerts: null,
-  /** Card key -> { cpu, mem, disk } arrays of recent percentages. */
+  /** Cluster name -> { cpu, mem, disk } arrays of recent total percentages. */
   history: new Map(),
-  /** Pod key -> { count, raisedAt } where raisedAt is when it last rose. */
+  /** Pod key -> { cluster, count, raisedAt }; raisedAt is when it last rose. */
   restarts: new Map(),
   updatedAt: 0,
   syncing: false,
@@ -102,28 +102,30 @@ export function ingestMetrics(update) {
     if (next.status !== "online") {
       continue;
     }
-    seen.add(report.name);
+    if (server.type !== "k8s") {
+      continue;
+    }
+    // Only cluster totals are drawn as history.
     record(report.name, next.metrics);
     for (const ns of next.metrics.namespaces ?? []) {
       for (const pod of ns.pods ?? []) {
         const key = podKey(report.name, ns.name, pod.name);
         seen.add(key);
-        record(key, pod.usage);
-        trackRestarts(key, pod.restart_count, now);
+        trackRestarts(key, report.name, pod.restart_count, now);
       }
     }
   }
 
   state.reports = reports;
-  // An offline server keeps its history for when it returns; anything else
-  // not reported this poll is gone.
+  // An offline cluster keeps its history and restart flags for when it
+  // returns; a removed one, or a pod no longer listed, is gone.
   for (const key of state.history.keys()) {
-    if (!seen.has(key) && reports.get(ownerOf(key))?.status !== "offline") {
+    if (!reports.has(key)) {
       state.history.delete(key);
     }
   }
-  for (const key of state.restarts.keys()) {
-    if (!seen.has(key)) {
+  for (const [key, entry] of state.restarts) {
+    if (!seen.has(key) && reports.get(entry.cluster)?.status !== "offline") {
       state.restarts.delete(key);
     }
   }
@@ -145,7 +147,8 @@ function keepListedPods(report, before) {
       return ns;
     }
     const last = before.metrics.namespaces.find((b) => b.name === ns.name);
-    return { ...ns, pods: last?.pods ?? null, stale: true };
+    // Stale only when there is an earlier list to show.
+    return { ...ns, pods: last?.pods ?? null, stale: Boolean(last?.pods) };
   });
   return { ...report, metrics: { ...report.metrics, namespaces } };
 }
@@ -189,20 +192,10 @@ function push(series, value) {
   }
 }
 
-function trackRestarts(key, count, now) {
+function trackRestarts(key, cluster, count, now) {
   const before = state.restarts.get(key);
   const raisedAt = before && count > before.count ? now : before?.raisedAt ?? 0;
-  state.restarts.set(key, { count, raisedAt });
-}
-
-/** The server a history key belongs to. Server names may hold "/" only in
- * legacy files, so a configured name is matched first. */
-function ownerOf(key) {
-  if (serverConfig(key)) {
-    return key;
-  }
-  const parts = key.split("/");
-  return parts.slice(0, -2).join("/");
+  state.restarts.set(key, { cluster, count, raisedAt });
 }
 
 /** Whether the newest sample is more than 3σ from the window's mean. */

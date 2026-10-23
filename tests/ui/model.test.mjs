@@ -157,3 +157,40 @@ test("pods group by workload, both sorted naturally", () => {
   assert.deepEqual(groups.map((g) => g.name), ["api", "web"]);
   assert.deepEqual(groups[1].pods.map((p) => p.name), ["web-9", "web-10"]);
 });
+
+test("an offline poll keeps history and restart flags; removal drops them", () => {
+  const at = (count) => [{ name: "s3", pods: [pod("gw-1", { restart_count: count })] }];
+  ingestMetrics({ servers: [cluster({ namespaces: at(1) })] });
+  ingestMetrics({ servers: [cluster({ namespaces: at(2) })] });
+  assert.equal(recentlyRestarted("prod/s3/gw-1"), true);
+
+  ingestMetrics({ servers: [{ kind: "k8s", name: "prod", status: "offline", error: "timeout" }] });
+  assert.equal(recentlyRestarted("prod/s3/gw-1"), true, "a blip does not clear it");
+  assert.equal(state.history.get("prod").cpu.length, 2, "history kept while offline");
+
+  setConfig({ servers: [], grafana: null });
+  ingestMetrics({ servers: [] });
+  assert.equal(state.history.size, 0);
+  assert.equal(state.restarts.size, 0);
+  assert.equal(metricsOf("prod"), null, "a removed cluster's report is dropped at once");
+});
+
+test("history is kept for clusters only", () => {
+  ingestMetrics({ servers: [cluster({ namespaces: [{ name: "s3", pods: [pod("gw-1")] }] }), host] });
+
+  assert.deepEqual([...state.history.keys()], ["prod"]);
+});
+
+test("a namespace that never listed is not called stale", () => {
+  const offline = { kind: "k8s", name: "prod", status: "offline", error: "x" };
+  ingestMetrics({ servers: [offline] });
+  ingestMetrics({ servers: [cluster({ namespaces: [{ name: "s3", pods: null }] })] });
+
+  const [s3] = metricsOf("prod").namespaces;
+  assert.equal(s3.pods, null);
+  assert.equal(s3.stale, undefined);
+
+  ingestMetrics({ servers: [cluster({ namespaces: [{ name: "s3", pods: [pod("gw-1")] }] })] });
+  ingestMetrics({ servers: [cluster({ namespaces: [{ name: "s3", pods: null }] })] });
+  assert.equal(metricsOf("prod").namespaces[0].stale, true);
+});

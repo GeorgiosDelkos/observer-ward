@@ -75,9 +75,13 @@ impl AppConfig {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::AlreadyWatched`] when that cluster already watches
-    /// every namespace of `server`; nothing changes then.
+    /// [`ConfigError::Invalid`] for a Kubernetes entry with a bad namespace
+    /// list, or [`ConfigError::AlreadyWatched`] when its cluster already
+    /// watches every namespace of `server`; nothing changes then.
     pub fn add_server(&mut self, server: ServerConfig) -> Result<(), ConfigError> {
+        if let ServerConfig::K8s(target) = &server {
+            target.validate_namespaces()?;
+        }
         if let ServerConfig::K8s(target) = &server
             && let Some(existing) = self.cluster_mut(target)
             && target
@@ -932,6 +936,14 @@ mod tests {
             Err(ConfigError::AlreadyWatched { cluster, .. }) if cluster.as_str() == "hippius"
         ));
         assert_eq!(config.servers, before, "a refused add changes nothing");
+
+        let mut empty = k8s("empty");
+        target(&mut empty).namespaces.clear();
+        assert!(matches!(
+            config.add_server(empty),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert_eq!(config.servers, before);
     }
 
     #[test]

@@ -30,7 +30,7 @@ Built with [Tauri](https://tauri.app/) 2, Rust and plain JavaScript. The fronten
   <tr>
     <td valign="top"><b>Overview</b><br>Anything that needs attention, then one card per cluster (rings for CPU, memory and disk; the faint arc is what pods have requested), one cell per node, and a row per watched namespace. SSH hosts follow.</td>
     <td valign="top"><b>Cluster</b><br>Usage over the last polls, with requested capacity. Every node with its health, roles, kubelet version, usage and the pods it runs, or the list of watched namespaces.</td>
-    <td valign="top"><b>Namespace</b><br>Pods grouped by the workload that owns them, with a ready count. Open a pod for its usage against its limits, node, volume, network, last event, logs, and a button to hide it.</td>
+    <td valign="top"><b>Namespace</b><br>Pods grouped by the workload that owns them, with a ready count. Open a pod for its usage against its limits (or its node, for a pod without limits), node, volume, network, last event, logs, and a button to hide it.</td>
   </tr>
 </table>
 

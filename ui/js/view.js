@@ -541,7 +541,7 @@ function podDetail(nav, pod) {
     ? `<div class="bars">${bar("CPU", u.cpu_percent)}${bar("MEM", u.memory_percent)}${pod.pvc ? bar("PVC", diskPercent(pod.pvc)) : ""}</div>`
     : '<p class="wait inline">No metrics sample for this pod yet.</p>';
   const rows = [
-    u ? `<dt>Usage</dt><dd>${cores(u.cpu_millicores)} · ${bytesShort(u.memory_bytes)}, of limits</dd>` : "",
+    u ? `<dt>Usage</dt><dd>${cores(u.cpu_millicores)} · ${bytesShort(u.memory_bytes)}, of limits or node</dd>` : "",
     `<dt>Status</dt><dd>${escapeHtml(pod.status ?? "unknown")}${pod.restart_count ? ` · ${pod.restart_count} restarts` : ""}</dd>`,
     pod.node ? `<dt>Node</dt><dd>${escapeHtml(pod.node)}</dd>` : "<dt>Node</dt><dd>not scheduled</dd>",
     pod.pvc ? `<dt>Volume</dt><dd>${capacity(pod.pvc.used_bytes, pod.pvc.capacity_bytes)}</dd>` : "",

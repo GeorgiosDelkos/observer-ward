@@ -366,7 +366,7 @@ function podAttention(cluster, namespace, pod) {
     return { level: "warn", icon: "↻", title: `${pod.name} restarted ${times}`, detail: `${where}${event}`, go };
   }
   if (level(Math.max(pod.usage?.cpu_percent ?? 0, pod.usage?.memory_percent ?? 0)) === "crit") {
-    return { level: "crit", icon: "▲", title: `${pod.name} is near its limits`, detail: `${where} · ${hottest(pod.usage)}`, go };
+    return { level: "crit", icon: "▲", title: `${pod.name} is near its ceiling`, detail: `${where} · ${hottest(pod.usage)}`, go };
   }
   return null;
 }

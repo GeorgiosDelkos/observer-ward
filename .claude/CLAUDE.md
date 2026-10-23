@@ -34,15 +34,15 @@ cargo tauri build                                   # production build
 - `terminal.rs` -- open ssh/kubectl in Warp or Terminal.app
 - `config.rs` -- `AppConfig`/`ServerConfig` models, `ConfigStore` (validated, serialized writes), JSON persistence
 - `error.rs` -- error-chain formatting at the Tauri command boundary
-- `metrics.rs` -- `ServerReport` (per-kind `Health<HostMetrics|ClusterMetrics>`, pods nested in clusters), levels, alert types
+- `metrics.rs` -- `ServerReport` (per-kind `Health<HostMetrics|ClusterMetrics>`, clusters hold `nodes` and `namespaces` with their pods), levels, alert types
 - `poller.rs` -- async poll loop with failure tracking and backoff
-- `k8s.rs` + `k8s/` -- Kubernetes Metrics API + kubelet stats
+- `k8s.rs` + `k8s/` -- one backend per cluster: Metrics API + kubelet stats, per-node reports (`k8s/nodes.rs`), cluster-wide requests (`k8s/requests.rs`), pods per watched namespace
 - `ssh.rs` + `ssh/` -- SSH remote command parsing (top/free/df/proc)
 - `grafana.rs` -- Grafana Alertmanager firing alerts; token in Keychain
 
 **Frontend:** Single-page vanilla JS app. No build step. State in module-level variables, renders server/pod cards with color-coded metric bars. Receives `metrics-update`, `poll-start`, and `alerts-update` events from the backend.
 
-Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`. Pods are hidden by owning workload (`K8sTarget.hidden`), filtered in the poller so hidden pods never reach the tray, notifier, or UI.
+Poll intervals: foreground (popover open, default 10s) and background (hidden, default 300s). Do not attach an NSMenu to the tray icon (macOS 27 swallows left-click). Remove confirmation is an in-window overlay, never `window.confirm`. A `K8sTarget` is one cluster (kubeconfig + context) watching several namespaces; legacy one-namespace entries merge on load (`AppConfig::merge_clusters`). Pods are hidden by owning workload per namespace (`WatchedNamespace.hidden`), filtered in the poller so hidden pods never reach the tray, notifier, or UI.
 
 **Data flow:** Poll loop -> collect metrics per server -> emit Tauri event -> frontend re-renders.
 

@@ -94,15 +94,19 @@ pub(crate) fn ssh_command(target: &SshTarget) -> Result<String, TerminalError> {
     ))
 }
 
-/// `kubectl logs -f` invocation for `pod` on a saved cluster.
-pub(crate) fn pod_logs_command(target: &K8sTarget, pod: &str) -> Result<String, TerminalError> {
+/// `kubectl logs -f` invocation for `pod` in `namespace` of a saved cluster.
+pub(crate) fn pod_logs_command(
+    target: &K8sTarget,
+    namespace: &str,
+    pod: &str,
+) -> Result<String, TerminalError> {
     validate_pod_name(pod)?;
-    validate_shell_safe(&target.namespace, "namespace")?;
+    validate_shell_safe(namespace, "namespace")?;
     validate_shell_safe(&target.context, "context")?;
 
     let mut cmd = format!(
-        "kubectl logs -f '{pod}' -n '{}' --context '{}'",
-        target.namespace, target.context
+        "kubectl logs -f '{pod}' -n '{namespace}' --context '{}'",
+        target.context
     );
     if let Some(kubeconfig) = &target.kubeconfig {
         let kubeconfig = expand_tilde(kubeconfig);
@@ -202,7 +206,6 @@ fn run_in_terminal_app(cmd: &str) -> Result<(), TerminalError> {
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
-    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
@@ -222,8 +225,7 @@ mod tests {
             name: "prod".into(),
             kubeconfig: kubeconfig.map(PathBuf::from),
             context: "prod-ctx".to_string(),
-            namespace: "default".to_string(),
-            hidden: BTreeSet::new(),
+            namespaces: Vec::new(),
         }
     }
 
@@ -275,18 +277,18 @@ mod tests {
 
     #[test]
     fn pod_logs_command_with_and_without_kubeconfig() {
-        let cmd = pod_logs_command(&k8s_target(None), "web-1").expect("command");
-        assert_eq!(
-            cmd,
-            "kubectl logs -f 'web-1' -n 'default' --context 'prod-ctx'"
-        );
+        let cmd = pod_logs_command(&k8s_target(None), "s3", "web-1").expect("command");
+        assert_eq!(cmd, "kubectl logs -f 'web-1' -n 's3' --context 'prod-ctx'");
 
-        let cmd = pod_logs_command(&k8s_target(Some("/etc/kube/prod")), "web-1").expect("command");
+        let target = k8s_target(Some("/etc/kube/prod"));
+        let cmd = pod_logs_command(&target, "s3", "web-1").expect("command");
         assert!(cmd.ends_with(" --kubeconfig '/etc/kube/prod'"), "{cmd}");
     }
 
     #[test]
-    fn pod_logs_command_rejects_flag_shaped_pod_names() {
-        assert!(pod_logs_command(&k8s_target(None), "--kubeconfig=/evil").is_err());
+    fn pod_logs_command_rejects_flag_shaped_pod_and_namespace_names() {
+        let target = k8s_target(None);
+        assert!(pod_logs_command(&target, "s3", "--kubeconfig=/evil").is_err());
+        assert!(pod_logs_command(&target, "-n;rm", "web-1").is_err());
     }
 }

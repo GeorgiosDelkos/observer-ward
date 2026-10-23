@@ -5,13 +5,13 @@
 //! something for pods cannot appear, zeroed, on an SSH host; and an
 //! offline server carries its error instead of a row of zeros.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::BuildHasher;
 use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::config::{ServerName, WorkloadRef};
+use crate::config::{K8sTarget, ServerName, WorkloadRef};
 
 /// Event payload sent to the frontend as `metrics-update`.
 #[derive(Debug, Clone, Serialize)]
@@ -149,28 +149,131 @@ pub struct HostMetrics {
     pub net: Option<NetRate>,
 }
 
+/// One cluster: totals over all its nodes, each node, and the pods of each
+/// watched namespace.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClusterMetrics {
+    // Totals over the nodes with a metrics-server sample, against their
+    // allocatable capacity.
     #[serde(flatten)]
-    pub usage: Usage,
+    pub usage: ResourceUsage,
     pub net: Option<NetRate>,
-    pub cpu_millicores: f64,
-    pub memory_bytes: u64,
     pub disk: Capacity,
-    pub node_count: usize,
-    /// Pods in the configured namespace. `None` when listing them failed:
-    /// the UI must then keep the previous cards, not treat the cluster as
-    /// having no pods.
-    pub pods: Option<Vec<PodMetrics>>,
+    /// What the cluster's pods reserve, as a share of allocatable. `None`
+    /// when pods cannot be listed across all namespaces.
+    pub requested: Option<Requested>,
+
+    /// Sorted by name.
+    pub nodes: Vec<NodeMetrics>,
+    /// In the order the cluster's config lists them.
+    pub namespaces: Vec<NamespaceMetrics>,
 }
 
 impl ClusterMetrics {
-    /// Drop the pods of every workload in `hidden`.
-    pub fn hide(&mut self, hidden: &BTreeSet<WorkloadRef>) {
-        if let Some(pods) = &mut self.pods {
-            pods.retain(|pod| !hidden.contains(&pod.workload));
+    /// Every listed pod with its namespace.
+    pub fn pods(&self) -> impl Iterator<Item = (&str, &PodMetrics)> {
+        self.namespaces.iter().flat_map(|namespace| {
+            let pods = namespace.pods.iter().flatten();
+            pods.map(|pod| (namespace.name.as_str(), pod))
+        })
+    }
+
+    /// Drop every namespace `target` no longer watches, and the pods of
+    /// every workload it hides in the rest. A namespace unwatched while a
+    /// poll was running must not notify or reach the tray.
+    pub fn hide(&mut self, target: &K8sTarget) {
+        self.namespaces
+            .retain(|ns| target.namespace(&ns.name).is_some());
+        for namespace in &mut self.namespaces {
+            let (Some(watched), Some(pods)) =
+                (target.namespace(&namespace.name), &mut namespace.pods)
+            else {
+                continue;
+            };
+            pods.retain(|pod| !watched.hidden.contains(&pod.workload));
         }
     }
+}
+
+/// CPU and memory reserved by the requests of every pod placed on a node
+/// and not finished, against the allocatable capacity of the nodes that
+/// report it. The scheduler
+/// places pods by requests, so a cluster can idle at low usage and still
+/// have no room for a new pod.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Requested {
+    pub cpu_percent: f64,
+    pub memory_percent: f64,
+}
+
+/// CPU in millicores and memory in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Resources {
+    pub cpu_millicores: f64,
+    pub memory_bytes: u64,
+}
+
+impl Resources {
+    pub fn add(&mut self, other: Resources) {
+        self.cpu_millicores += other.cpu_millicores;
+        self.memory_bytes = self.memory_bytes.saturating_add(other.memory_bytes);
+    }
+
+    /// CPU and memory percentages of `self` against `whole`; disk is left
+    /// at 0 for the caller to fill in.
+    #[must_use]
+    pub fn share_of(&self, whole: &Resources) -> Usage {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "byte counts fit comfortably in f64 for a percentage"
+        )]
+        let memory_percent = percent(self.memory_bytes as f64, whole.memory_bytes as f64);
+        Usage {
+            cpu_percent: percent(self.cpu_millicores, whole.cpu_millicores),
+            memory_percent,
+            disk_percent: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeMetrics {
+    pub name: String,
+    /// From `node-role.kubernetes.io/<role>` labels, e.g. `control-plane`.
+    pub roles: Vec<String>,
+    /// The `Ready` condition is `True`.
+    pub ready: bool,
+    /// Cordoned: no new pods are scheduled here.
+    pub unschedulable: bool,
+    /// Conditions that are `True` and mean trouble.
+    pub problems: Vec<NodeProblem>,
+    pub kubelet_version: Option<String>,
+    /// `None` when the node reports no allocatable CPU and memory.
+    pub allocatable: Option<Resources>,
+    /// Against allocatable, with the root filesystem as disk. `None` when
+    /// metrics-server has no sample for the node.
+    pub usage: Option<ResourceUsage>,
+    /// The node's root filesystem. `None` when its kubelet stats failed.
+    pub disk: Option<Capacity>,
+}
+
+/// A node condition that is `True` when something is wrong. Serialized
+/// with Kubernetes' own spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum NodeProblem {
+    MemoryPressure,
+    DiskPressure,
+    #[serde(rename = "PIDPressure")]
+    PidPressure,
+    NetworkUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NamespaceMetrics {
+    pub name: String,
+    /// `None` when listing them failed: the UI must then keep the previous
+    /// cards, not treat the namespace as empty.
+    pub pods: Option<Vec<PodMetrics>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -185,19 +288,22 @@ pub struct PodMetrics {
     pub start_time: Option<String>,
     /// Newest event, as `"{type}: {reason}"`.
     pub last_event: Option<String>,
+    /// The node the pod is scheduled on; `None` while it is unscheduled.
+    pub node: Option<String>,
     /// `None` when metrics-server has no sample for the pod yet.
-    pub usage: Option<PodUsage>,
+    pub usage: Option<ResourceUsage>,
     pub net: Option<NetRate>,
     /// Summed over the pod's PVC-backed volumes; `None` without any.
     pub pvc: Option<Capacity>,
 }
 
+/// Usage from a metrics-server sample, as percentages and raw values.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct PodUsage {
+pub struct ResourceUsage {
     #[serde(flatten)]
     pub usage: Usage,
-    pub cpu_millicores: f64,
-    pub memory_bytes: u64,
+    #[serde(flatten)]
+    pub used: Resources,
 }
 
 /// A pod's phase, or a container state specific enough to override it.
@@ -262,7 +368,9 @@ impl Usage {
 }
 
 /// Every online card's usage with the label used in notifications:
-/// server names for hosts and clusters, `cluster/pod` for pods.
+/// server names for hosts and clusters, `cluster node <name>` for nodes,
+/// and `cluster/namespace/pod` for pods. A node label never looks like a
+/// pod label, even under a legacy cluster name with `/`.
 pub fn online_usage(reports: &[ServerReport]) -> impl Iterator<Item = (String, Usage)> + '_ {
     reports.iter().flat_map(|report| {
         let mut entries = Vec::new();
@@ -275,10 +383,22 @@ pub fn online_usage(reports: &[ServerReport]) -> impl Iterator<Item = (String, U
                 name,
                 health: Health::Online { metrics },
             } => {
-                entries.push((name.to_string(), metrics.usage));
-                for pod in metrics.pods.iter().flatten() {
+                entries.push((name.to_string(), metrics.usage.usage));
+                // A one-node cluster's total is that node: one problem, one
+                // notification.
+                let nodes = if metrics.nodes.len() > 1 {
+                    metrics.nodes.as_slice()
+                } else {
+                    &[]
+                };
+                for node in nodes {
+                    if let Some(usage) = node.usage {
+                        entries.push((format!("{name} node {}", node.name), usage.usage));
+                    }
+                }
+                for (namespace, pod) in metrics.pods() {
                     if let Some(usage) = pod.usage {
-                        entries.push((format!("{name}/{}", pod.name), usage.usage));
+                        entries.push((format!("{name}/{namespace}/{}", pod.name), usage.usage));
                     }
                 }
             }
@@ -310,11 +430,7 @@ pub fn has_restarts(reports: &[ServerReport]) -> bool {
         ServerReport::K8s {
             health: Health::Online { metrics },
             ..
-        } => metrics
-            .pods
-            .iter()
-            .flatten()
-            .any(|pod| pod.restart_count > 0),
+        } => metrics.pods().any(|(_, pod)| pod.restart_count > 0),
         ServerReport::K8s {
             health: Health::Offline { .. },
             ..
@@ -436,9 +552,11 @@ pub fn newly_firing<'a, S: BuildHasher>(
     reason = "panicking on failure is standard in tests"
 )]
 pub(crate) mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use super::*;
+    use crate::config::WatchedNamespace;
 
     pub(crate) fn usage(cpu: f64, memory: f64, disk: f64) -> Usage {
         Usage {
@@ -477,62 +595,118 @@ pub(crate) mod tests {
             restart_count: restarts,
             start_time: None,
             last_event: None,
-            usage: usage.map(|usage| PodUsage {
-                usage,
-                cpu_millicores: 0.0,
-                memory_bytes: 0,
-            }),
+            node: None,
+            usage: usage.map(sampled),
             net: None,
             pvc: None,
         }
     }
 
+    fn sampled(usage: Usage) -> ResourceUsage {
+        ResourceUsage {
+            usage,
+            used: Resources::default(),
+        }
+    }
+
+    /// A ready node with a metrics sample.
+    pub(crate) fn node(name: &str, usage: Usage) -> NodeMetrics {
+        NodeMetrics {
+            name: name.to_string(),
+            roles: Vec::new(),
+            ready: true,
+            unschedulable: false,
+            problems: Vec::new(),
+            kubelet_version: None,
+            allocatable: None,
+            usage: Some(sampled(usage)),
+            disk: None,
+        }
+    }
+
+    /// An online cluster without nodes, watching one namespace, `default`.
     pub(crate) fn cluster(name: &str, usage: Usage, pods: Option<Vec<PodMetrics>>) -> ServerReport {
         ServerReport::K8s {
             name: name.into(),
             health: Health::Online {
                 metrics: ClusterMetrics {
-                    usage,
+                    usage: sampled(usage),
                     net: None,
-                    cpu_millicores: 0.0,
-                    memory_bytes: 0,
                     disk: Capacity::default(),
-                    node_count: 1,
-                    pods,
+                    requested: None,
+                    nodes: Vec::new(),
+                    namespaces: vec![NamespaceMetrics {
+                        name: "default".to_string(),
+                        pods,
+                    }],
                 },
             },
         }
     }
 
+    pub(crate) fn metrics_mut(report: &mut ServerReport) -> &mut ClusterMetrics {
+        match report {
+            ServerReport::K8s {
+                health: Health::Online { metrics },
+                ..
+            } => metrics,
+            ServerReport::K8s { .. } | ServerReport::Ssh { .. } => {
+                panic!("not an online cluster")
+            }
+        }
+    }
+
     #[test]
-    fn hide_drops_only_pods_of_hidden_workloads() {
+    fn hide_drops_only_pods_of_hidden_workloads_in_their_namespace() {
         let mut report = cluster(
             "prod",
             usage(0.0, 0.0, 0.0),
             Some(vec![pod("api-1", 0, None), pod("db-0", 0, None)]),
         );
-        let ServerReport::K8s {
-            health: Health::Online { metrics },
-            ..
-        } = &mut report
-        else {
-            panic!("cluster fixture is online");
+        let metrics = metrics_mut(&mut report);
+        metrics.namespaces.push(NamespaceMetrics {
+            name: "s3".to_string(),
+            pods: Some(vec![pod("api-1", 0, None)]),
+        });
+        let api = metrics.namespaces[0].pods.as_ref().expect("pods")[0]
+            .workload
+            .clone();
+        let target = K8sTarget {
+            name: "prod".into(),
+            kubeconfig: None,
+            context: "ctx".to_string(),
+            namespaces: vec![
+                WatchedNamespace {
+                    name: "default".to_string(),
+                    hidden: [api].into(),
+                },
+                WatchedNamespace {
+                    name: "s3".to_string(),
+                    hidden: BTreeSet::new(),
+                },
+            ],
         };
-        let hidden = BTreeSet::from([metrics.pods.as_ref().expect("pods")[0].workload.clone()]);
 
-        metrics.hide(&hidden);
+        metrics.hide(&target);
 
         let names: Vec<_> = metrics
-            .pods
-            .iter()
-            .flatten()
-            .map(|p| p.name.as_str())
+            .pods()
+            .map(|(ns, p)| format!("{ns}/{}", p.name))
             .collect();
-        assert_eq!(names, ["db-0"]);
+        assert_eq!(names, ["default/db-0", "s3/api-1"]);
 
-        metrics.pods = None;
-        metrics.hide(&hidden);
-        assert!(metrics.pods.is_none(), "a failed listing stays failed");
+        metrics.namespaces[0].pods = None;
+        metrics.hide(&target);
+        assert!(
+            metrics.namespaces[0].pods.is_none(),
+            "a failed listing stays failed"
+        );
+
+        let mut unwatched = target;
+        unwatched.namespaces.retain(|ns| ns.name != "s3");
+        metrics.hide(&unwatched);
+        let names: Vec<&str> = metrics.namespaces.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["default"], "unwatched mid-poll");
     }
 
     #[test]
@@ -560,18 +734,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cluster_serializes_pods_or_null() {
+    fn cluster_serializes_namespaces_with_pods_or_null() {
         let listed = cluster("prod", Usage::default(), Some(vec![pod("web", 2, None)]));
         let json = serde_json::to_value(listed).expect("json");
         assert_eq!(json["kind"], "k8s");
-        assert_eq!(json["metrics"]["pods"][0]["name"], "web");
-        assert_eq!(json["metrics"]["pods"][0]["status"], "Running");
-        assert_eq!(json["metrics"]["pods"][0]["restart_count"], 2);
-        assert!(json["metrics"]["pods"][0]["usage"].is_null());
+        let namespace = &json["metrics"]["namespaces"][0];
+        assert_eq!(namespace["name"], "default");
+        assert_eq!(namespace["pods"][0]["name"], "web");
+        assert_eq!(namespace["pods"][0]["status"], "Running");
+        assert_eq!(namespace["pods"][0]["restart_count"], 2);
+        assert!(namespace["pods"][0]["usage"].is_null());
+        assert!(json["metrics"]["requested"].is_null());
 
         let failed = cluster("prod", Usage::default(), None);
         let json = serde_json::to_value(failed).expect("json");
-        assert!(json["metrics"]["pods"].is_null());
+        assert!(json["metrics"]["namespaces"][0]["pods"].is_null());
+    }
+
+    #[test]
+    fn node_serializes_flat_usage_and_kubernetes_problem_names() {
+        let mut node = node("hp-07", usage(12.0, 39.0, 88.0));
+        node.problems = vec![NodeProblem::DiskPressure, NodeProblem::PidPressure];
+        node.usage = node.usage.map(|u| ResourceUsage {
+            used: Resources {
+                cpu_millicores: 6720.0,
+                memory_bytes: 64,
+            },
+            ..u
+        });
+
+        let json = serde_json::to_value(&node).expect("json");
+
+        assert_eq!(json["usage"]["disk_percent"], 88.0);
+        assert_eq!(json["usage"]["cpu_millicores"], 6720.0);
+        assert_eq!(json["usage"]["memory_bytes"], 64);
+        assert_eq!(
+            json["problems"],
+            serde_json::json!(["DiskPressure", "PIDPressure"])
+        );
     }
 
     #[test]
@@ -607,19 +807,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn online_usage_labels_pods_with_their_cluster() {
-        let reports = [cluster(
+    fn online_usage_labels_nodes_and_pods_with_their_cluster() {
+        let mut report = cluster(
             "prod",
             Usage::default(),
             Some(vec![
                 pod("web", 0, Some(Usage::default())),
                 pod("idle", 0, None),
             ]),
-        )];
+        );
+        let metrics = metrics_mut(&mut report);
+        metrics.nodes = vec![node("n1", usage(1.0, 1.0, 95.0))];
+        let mut unsampled = node("n2", Usage::default());
+        unsampled.usage = None;
+        metrics.nodes.push(unsampled);
+        let reports = [report];
 
         let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
 
-        assert_eq!(labels, ["prod", "prod/web"]);
+        assert_eq!(labels, ["prod", "prod node n1", "prod/default/web"]);
+        assert_eq!(worst_level(&reports), MetricLevel::Crit, "a full node disk");
+
+        let [mut single] = reports;
+        metrics_mut(&mut single).nodes.truncate(1);
+        let labels: Vec<String> = online_usage(std::slice::from_ref(&single))
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["prod", "prod/default/web"],
+            "a lone node is the cluster total"
+        );
     }
 
     #[test]

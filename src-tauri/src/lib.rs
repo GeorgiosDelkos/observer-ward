@@ -22,7 +22,7 @@ use commands::{
     delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics, has_grafana_token,
     hide_workload, inspect_kubeconfig, open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig,
     pick_ssh_key, quit_app, remove_server, resize_window, save_settings, set_grafana_token,
-    show_workload,
+    show_workload, unwatch_namespace,
 };
 use config::ConfigStore;
 use grafana::TokenEpoch;
@@ -80,6 +80,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             remove_server,
             hide_workload,
             show_workload,
+            unwatch_namespace,
             resize_window,
             open_ssh_terminal,
             open_pod_logs,

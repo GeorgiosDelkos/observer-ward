@@ -69,6 +69,12 @@ pub(crate) enum K8sError {
         #[source]
         source: http::Error,
     },
+    #[error("listing namespace {namespace} failed")]
+    NamespaceTask {
+        namespace: String,
+        #[source]
+        source: tokio::task::JoinError,
+    },
     #[error("failed to fetch stats for node {node}")]
     FetchNodeStats {
         node: String,

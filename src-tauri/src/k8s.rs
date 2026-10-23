@@ -1,22 +1,33 @@
 //! Kubernetes Metrics API + kubelet stats collection.
+//!
+//! One backend per cluster. Nodes, node metrics and kubelet stats are read
+//! once per poll and reported both per node and as cluster totals; pods,
+//! events and Jobs are read for each watched namespace over the same
+//! connection.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams};
+use tokio::task::{JoinError, JoinSet};
 
-use crate::config::{K8sTarget, WorkloadRef};
-use crate::metrics::{ClusterMetrics, NetSample, PodMetrics, Usage, percent};
+use crate::config::K8sTarget;
+use crate::metrics::{
+    ClusterMetrics, NamespaceMetrics, NetRate, NetSample, PodMetrics, Requested, ResourceUsage,
+    Resources, Usage,
+};
 
 mod error;
 mod events;
 mod jobs;
 mod kubeconfig;
 mod metrics_api;
+mod nodes;
 mod pods;
 mod quantity;
+mod requests;
 mod stats;
 
 pub(crate) use error::K8sError;
@@ -24,11 +35,14 @@ pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
 use jobs::{JobList, JobOwners, list_job_owners};
-use metrics_api::{NodeMetrics, PodMetrics as PodMetricsSample};
+use metrics_api::{NodeMetrics as NodeMetricsSample, PodMetrics as PodMetricsSample};
+use nodes::{node_metrics, node_totals};
 use pods::{PodContext, assemble_pods, jobs_of};
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
+use requests::{RequestList, list_requests};
 use stats::{
-    StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc, fetch_all_node_stats,
+    ClusterTotals, StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc,
+    fetch_all_node_stats, node_disks,
 };
 
 const KUBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,24 +56,52 @@ struct CpuMem {
 }
 
 impl CpuMem {
-    fn add(&mut self, cpu: f64, mem: u64) {
-        self.cpu += cpu;
-        self.mem = self.mem.saturating_add(mem);
+    fn resources(self) -> Resources {
+        Resources {
+            cpu_millicores: self.cpu * 1000.0,
+            memory_bytes: self.mem,
+        }
     }
 }
 
-/// Kubernetes backend that collects cluster-wide metrics by aggregating
-/// across all nodes, plus one card per pod in the configured namespace.
+impl std::iter::Sum for CpuMem {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |total, next| Self {
+            cpu: total.cpu + next.cpu,
+            mem: total.mem.saturating_add(next.mem),
+        })
+    }
+}
+
+/// Kubernetes backend for one cluster: node totals and per-node reports,
+/// plus one card per pod in each watched namespace.
 pub(crate) struct K8sBackend {
     target: K8sTarget,
     client: Option<Client>,
     prev_net: Option<NetSample>,
+    /// Keyed by namespace name; only watched namespaces are kept.
+    namespaces: HashMap<String, NamespaceState>,
+    /// Listing pods in all namespaces was refused; not retried until the
+    /// client is rebuilt (new credentials may allow it).
+    requests_forbidden: bool,
+}
+
+/// What a backend remembers about one watched namespace between polls.
+#[derive(Default)]
+struct NamespaceState {
     prev_pod_net: HashMap<String, NetSample>,
     /// From the last Job list, kept until a Job with pods is missing from it.
     job_owners: JobOwners,
-    /// Reading Jobs was refused; not retried until the client is rebuilt
-    /// (new credentials may allow it).
+    /// Reading Jobs was refused; not retried until the client is rebuilt.
     jobs_forbidden: bool,
+}
+
+/// One namespace's pod listing and events, read concurrently with the
+/// other namespaces.
+struct NamespaceListing {
+    name: String,
+    pods: Result<(Vec<PodMetricsSample>, Vec<Pod>), K8sError>,
+    events: HashMap<String, String>,
 }
 
 impl K8sBackend {
@@ -68,37 +110,40 @@ impl K8sBackend {
             target,
             client: None,
             prev_net: None,
-            prev_pod_net: HashMap::new(),
-            job_owners: JobOwners::new(),
-            jobs_forbidden: false,
+            namespaces: HashMap::new(),
+            requests_forbidden: false,
         }
     }
 
-    /// Take the current hidden workloads. Only `hidden` may change without
-    /// a new backend: anything else is a different connection.
-    pub(crate) fn set_hidden(&mut self, hidden: BTreeSet<WorkloadRef>) {
-        self.target.hidden = hidden;
+    /// Take an edited target for the same cluster (see
+    /// [`K8sTarget::same_connection`]): watched namespaces and hidden
+    /// workloads may change without a new connection.
+    pub(crate) fn set_target(&mut self, target: K8sTarget) {
+        self.target = target;
     }
 
     pub(crate) fn target(&self) -> &K8sTarget {
         &self.target
     }
 
-    /// Collect node aggregates and pod cards. Any failure drops the client
-    /// so the next poll rebuilds it from the kubeconfig (picking up
-    /// refreshed credentials).
+    /// Collect node reports, cluster totals and pod cards. Any failure
+    /// drops the client so the next poll rebuilds it from the kubeconfig
+    /// (picking up refreshed credentials).
     ///
     /// # Errors
     ///
     /// [`K8sError`] if the client cannot be built or a required API call
-    /// (nodes, node metrics) fails. Pod and event listing failures only
-    /// degrade the result.
+    /// (nodes, node metrics) fails. Pod, event, Job and request listing
+    /// failures only degrade the result.
     pub(crate) async fn collect(&mut self) -> Result<ClusterMetrics, K8sError> {
         let client = if let Some(client) = &self.client {
             client.clone()
         } else {
-            // New credentials may be allowed to read Jobs.
-            self.jobs_forbidden = false;
+            // New credentials may be allowed what the old ones were not.
+            self.requests_forbidden = false;
+            for state in self.namespaces.values_mut() {
+                state.jobs_forbidden = false;
+            }
             self.connect().await?
         };
         let result = self.collect_with(&client).await;
@@ -121,52 +166,83 @@ impl K8sBackend {
     }
 
     async fn collect_with(&mut self, client: &Client) -> Result<ClusterMetrics, K8sError> {
-        let namespace = self.target.namespace.as_str();
         let nodes = fetch_nodes(client).await?;
-        let allocatable = sum_allocatable(&nodes)?;
+        let watched: Vec<String> = self
+            .target
+            .namespaces
+            .iter()
+            .map(|ns| ns.name.clone())
+            .collect();
 
-        let (stats, usage, events, pod_lists) = tokio::join!(
+        let (stats, node_usage, requests, listings) = tokio::join!(
             fetch_all_node_stats(client, &nodes),
-            fetch_cpu_mem_usage(client),
-            fetch_pod_events(client, namespace),
-            fetch_pod_lists(client, namespace),
+            fetch_node_usage(client),
+            self.read_requests(client),
+            fetch_namespaces(client, &watched),
         );
-        let used = usage?;
-        let events = events.unwrap_or_else(|e| {
-            tracing::warn!(
-                "failed to fetch pod events for {}/{namespace}: {}",
-                self.target.name,
-                crate::error::error_chain(&e)
-            );
-            HashMap::new()
-        });
+        let nodes = node_metrics(&nodes, &node_usage?, &node_disks(&stats));
+        let totals = node_totals(&nodes);
 
-        let pods = match pod_lists {
-            Ok((samples, specs)) => {
-                self.resolve_jobs(client, &specs).await;
-                Some(self.pod_cards(&samples, &specs, &stats, &events, allocatable))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to collect pod metrics for {}/{namespace}: {}",
-                    self.target.name,
-                    crate::error::error_chain(&e)
-                );
-                None
-            }
-        };
+        self.namespaces.retain(|name, _| watched.contains(name));
+        self.resolve_jobs(client, &listings).await;
+        let namespaces = listings
+            .into_iter()
+            .map(|listing| self.namespace_metrics(listing, &stats, totals.allocatable))
+            .collect();
 
-        Ok(self.cluster_metrics(&stats, allocatable, used, pods))
+        let fs_net = cluster_totals(&stats);
+        Ok(ClusterMetrics {
+            usage: ResourceUsage {
+                usage: Usage {
+                    disk_percent: fs_net.disk.percent(),
+                    ..totals.usage
+                },
+                used: totals.used,
+            },
+            net: self.net_rate(&fs_net),
+            disk: fs_net.disk,
+            requested: self.requested(requests, &totals.allocatable),
+            nodes,
+            namespaces,
+        })
     }
 
-    fn cluster_metrics(
-        &mut self,
-        stats: &[StatsSummary],
-        allocatable: CpuMem,
-        used: CpuMem,
-        pods: Option<Vec<PodMetrics>>,
-    ) -> ClusterMetrics {
-        let totals = cluster_totals(stats);
+    /// Requests across the cluster, unless that was refused before.
+    async fn read_requests(&self, client: &Client) -> RequestList {
+        if self.requests_forbidden {
+            return RequestList::Forbidden;
+        }
+        list_requests(client).await
+    }
+
+    /// `requests` as a share of `allocatable`. A refusal is logged once and
+    /// remembered until the client is rebuilt.
+    fn requested(&mut self, requests: RequestList, allocatable: &Resources) -> Option<Requested> {
+        match requests {
+            RequestList::Requested(requested) => {
+                let share = requested.resources().share_of(allocatable);
+                Some(Requested {
+                    cpu_percent: share.cpu_percent,
+                    memory_percent: share.memory_percent,
+                })
+            }
+            RequestList::Forbidden => {
+                if !self.requests_forbidden {
+                    tracing::warn!(
+                        "no permission to list pods in all namespaces of {}: \
+                         requested capacity is not shown",
+                        self.target.name
+                    );
+                    self.requests_forbidden = true;
+                }
+                None
+            }
+            RequestList::Failed => None,
+        }
+    }
+
+    /// Cluster network throughput since the last poll.
+    fn net_rate(&mut self, totals: &ClusterTotals) -> Option<NetRate> {
         let now = NetSample {
             rx_bytes: totals.rx_bytes,
             tx_bytes: totals.tx_bytes,
@@ -174,80 +250,195 @@ impl K8sBackend {
         };
         let net = self.prev_net.and_then(|prev| now.rate_since(&prev));
         self.prev_net = Some(now);
+        net
+    }
 
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "byte counts fit comfortably in f64 for a percentage"
-        )]
-        let memory_percent = percent(used.mem as f64, allocatable.mem as f64);
+    /// Pod cards for one namespace. A failed pod listing leaves `pods`
+    /// `None`, so the UI keeps the cards it has.
+    fn namespace_metrics(
+        &mut self,
+        listing: NamespaceListing,
+        stats: &[StatsSummary],
+        allocatable: Resources,
+    ) -> NamespaceMetrics {
+        let NamespaceListing { name, pods, events } = listing;
+        let pods = match pods {
+            Ok((samples, specs)) => {
+                Some(self.pod_cards(&name, &samples, &specs, stats, &events, allocatable))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to collect pod metrics for {}/{name}: {}",
+                    self.target.name,
+                    crate::error::error_chain(&e)
+                );
+                None
+            }
+        };
+        NamespaceMetrics { name, pods }
+    }
 
-        ClusterMetrics {
-            usage: Usage {
-                cpu_percent: percent(used.cpu, allocatable.cpu),
-                memory_percent,
-                disk_percent: totals.disk.percent(),
-            },
-            net,
-            cpu_millicores: used.cpu * 1000.0,
-            memory_bytes: used.mem,
-            disk: totals.disk,
-            node_count: stats.len(),
-            pods,
+    /// Re-list the Jobs of each namespace where a Job with pods is not in
+    /// the last list (a new cron job run), all namespaces at once. Elsewhere
+    /// the last list still answers.
+    async fn resolve_jobs(&mut self, client: &Client, listings: &[NamespaceListing]) {
+        let stale = self.stale_jobs(listings);
+        let lists = stale.iter().map(|(namespace, wanted)| {
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let wanted = wanted.clone();
+            async move {
+                let wanted: HashSet<&str> = wanted.iter().map(String::as_str).collect();
+                list_job_owners(&client, &namespace, &wanted).await
+            }
+        });
+        let lists = join_ordered(lists, |_, e| {
+            tracing::warn!("job listing task failed: {e}");
+            JobList::Failed
+        })
+        .await;
+
+        for ((namespace, _), list) in stale.into_iter().zip(lists) {
+            let state = self.namespaces.entry(namespace.clone()).or_default();
+            match list {
+                JobList::Owners(owners) => state.job_owners = owners,
+                JobList::Forbidden => {
+                    tracing::warn!(
+                        "no permission to list jobs in {}/{namespace}: \
+                         hidden cron jobs are matched by run name only",
+                        self.target.name
+                    );
+                    state.jobs_forbidden = true;
+                }
+                JobList::Failed => {}
+            }
         }
     }
 
-    /// Re-list the namespace's Jobs when a Job with pods is not in the last
-    /// list: a new cron job run. Otherwise the last list still answers.
-    async fn resolve_jobs(&mut self, client: &Client, specs: &[Pod]) {
-        let wanted = jobs_of(specs);
-        let known = wanted.iter().all(|job| self.job_owners.contains_key(*job));
-        if known || self.jobs_forbidden {
-            return;
-        }
-        let namespace = &self.target.namespace;
-        match list_job_owners(client, namespace, &wanted).await {
-            JobList::Owners(owners) => self.job_owners = owners,
-            JobList::Forbidden => {
-                tracing::warn!(
-                    "no permission to list jobs in {}/{namespace}: \
-                     hidden cron jobs are matched by run name only",
-                    self.target.name
-                );
-                self.jobs_forbidden = true;
-            }
-            JobList::Failed => {}
-        }
+    /// Each listed namespace whose pods name a Job the last Job list did
+    /// not have, with those Jobs; namespaces where listing Jobs was refused
+    /// are left out.
+    fn stale_jobs(&self, listings: &[NamespaceListing]) -> Vec<(String, HashSet<String>)> {
+        listings
+            .iter()
+            .filter_map(|listing| {
+                let (_, specs) = listing.pods.as_ref().ok()?;
+                let wanted = jobs_of(specs);
+                let state = self.namespaces.get(&listing.name);
+                let forbidden = state.is_some_and(|s| s.jobs_forbidden);
+                let known = wanted
+                    .iter()
+                    .all(|job| state.is_some_and(|s| s.job_owners.contains_key(*job)));
+                let wanted = wanted.into_iter().map(str::to_string).collect();
+                (!known && !forbidden).then(|| (listing.name.clone(), wanted))
+            })
+            .collect()
     }
 
     fn pod_cards(
         &mut self,
+        namespace: &str,
         samples: &[PodMetricsSample],
         specs: &[Pod],
         stats: &[StatsSummary],
         events: &HashMap<String, String>,
-        allocatable: CpuMem,
+        allocatable: Resources,
     ) -> Vec<PodMetrics> {
-        let namespace = self.target.namespace.as_str();
         let pvc = extract_pod_pvc(stats, namespace);
         let net = extract_pod_network(stats, namespace, Instant::now());
+        let unhidden = BTreeSet::new();
+        let hidden = self
+            .target
+            .namespace(namespace)
+            .map_or(&unhidden, |ns| &ns.hidden);
+        let state = self.namespaces.entry(namespace.to_string()).or_default();
 
         let pods = assemble_pods(
             samples,
             specs,
             &PodContext {
-                cluster_cpu: allocatable.cpu,
-                cluster_mem: allocatable.mem,
+                cluster_cpu: allocatable.cpu_millicores / 1000.0,
+                cluster_mem: allocatable.memory_bytes,
                 pvc: &pvc,
                 net: &net,
-                prev_net: &self.prev_pod_net,
+                prev_net: &state.prev_pod_net,
                 events,
-                hidden: &self.target.hidden,
-                job_owners: &self.job_owners,
+                hidden,
+                job_owners: &state.job_owners,
             },
         );
-        self.prev_pod_net = net;
+        state.prev_pod_net = net;
         pods
     }
+}
+
+/// Pod lists and events of every namespace in `names`, concurrently, one
+/// listing per name in the order given. A task that panics counts as a
+/// failed pod listing, so the UI and the notifier treat it like one.
+/// Events are decoration: a failed event list is logged and leaves the
+/// namespace without them.
+async fn fetch_namespaces(client: &Client, names: &[String]) -> Vec<NamespaceListing> {
+    let fetches = names.iter().map(|name| {
+        let client = client.clone();
+        let name = name.clone();
+        async move {
+            let (pods, events) = tokio::join!(
+                fetch_pod_lists(&client, &name),
+                fetch_pod_events(&client, &name),
+            );
+            let events = events.unwrap_or_else(|e| {
+                tracing::warn!(
+                    "failed to fetch pod events in {name}: {}",
+                    crate::error::error_chain(&e)
+                );
+                HashMap::new()
+            });
+            NamespaceListing { name, pods, events }
+        }
+    });
+    join_ordered(fetches, |index, source| NamespaceListing {
+        name: names[index].clone(),
+        pods: Err(K8sError::NamespaceTask {
+            namespace: names[index].clone(),
+            source,
+        }),
+        events: HashMap::new(),
+    })
+    .await
+}
+
+/// Run `futures` concurrently, each on its own task, and return their
+/// outputs in input order. A future that panics yields `failed(index,
+/// error)` in its place, so the output always has one entry per input.
+async fn join_ordered<T, F>(
+    futures: impl IntoIterator<Item = F>,
+    failed: impl Fn(usize, JoinError) -> T,
+) -> Vec<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut tasks = JoinSet::new();
+    let mut index_of = HashMap::new();
+    for (index, future) in futures.into_iter().enumerate() {
+        index_of.insert(tasks.spawn(future).id(), index);
+    }
+
+    let mut outputs: Vec<Option<T>> = std::iter::repeat_with(|| None)
+        .take(index_of.len())
+        .collect();
+    while let Some(joined) = tasks.join_next_with_id().await {
+        let (id, output) = match joined {
+            Ok((id, output)) => (id, Ok(output)),
+            Err(e) => (e.id(), Err(e)),
+        };
+        let Some(&index) = index_of.get(&id) else {
+            continue;
+        };
+        outputs[index] = Some(output.unwrap_or_else(|e| failed(index, e)));
+    }
+    // Every spawned task is joined exactly once, so every slot is filled.
+    outputs.into_iter().flatten().collect()
 }
 
 async fn fetch_pod_lists(
@@ -279,94 +470,148 @@ async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, K8sError> {
     Ok(nodes.items)
 }
 
-/// Sum allocatable CPU and memory over the nodes that report both.
-fn sum_allocatable(nodes: &[Node]) -> Result<CpuMem, K8sError> {
-    let mut total = CpuMem::default();
-
-    for node in nodes {
-        let name = node.metadata.name.as_deref().unwrap_or("unknown");
-        let allocatable = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
-        let Some((cpu, mem)) = allocatable.and_then(|a| a.get("cpu").zip(a.get("memory"))) else {
-            tracing::warn!("node {name} reports no allocatable cpu/memory, skipping");
-            continue;
-        };
-        total.add(parse_cpu_quantity(cpu)?, parse_memory_quantity(mem)?);
-    }
-
-    Ok(total)
-}
-
-/// Total CPU and memory currently used across all nodes, from the
-/// Metrics API.
-async fn fetch_cpu_mem_usage(client: &Client) -> Result<CpuMem, K8sError> {
-    let metrics_api: Api<NodeMetrics> = Api::all(client.clone());
+/// CPU and memory each node is using now, from the Metrics API, keyed by
+/// node name.
+async fn fetch_node_usage(client: &Client) -> Result<HashMap<String, CpuMem>, K8sError> {
+    let metrics_api: Api<NodeMetricsSample> = Api::all(client.clone());
     let node_metrics = metrics_api
         .list(&ListParams::default())
         .await
         .map_err(|source| K8sError::ListNodeMetrics(Box::new(source)))?;
 
-    let mut total = CpuMem::default();
-    for nm in &node_metrics {
-        total.add(
-            parse_cpu_quantity(&nm.usage.cpu)?,
-            parse_memory_quantity(&nm.usage.memory)?,
-        );
+    let mut usage = HashMap::with_capacity(node_metrics.items.len());
+    for sample in &node_metrics {
+        let Some(name) = sample.metadata.name.clone() else {
+            continue;
+        };
+        let used = CpuMem {
+            cpu: parse_cpu_quantity(&sample.usage.cpu)?,
+            mem: parse_memory_quantity(&sample.usage.memory)?,
+        };
+        usage.insert(name, used);
     }
-    Ok(total)
+    Ok(usage)
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "panicking on failure is standard in tests"
-)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use k8s_openapi::api::core::v1::NodeStatus;
-    use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-    use kube::api::ObjectMeta;
+    use std::time::Duration;
 
     use super::*;
+    use crate::config::{K8sTarget, WatchedNamespace};
 
-    fn node(name: &str, cpu: Option<&str>, memory: Option<&str>) -> Node {
-        let mut allocatable = BTreeMap::new();
-        if let Some(cpu) = cpu {
-            allocatable.insert("cpu".to_string(), Quantity(cpu.to_string()));
-        }
-        if let Some(memory) = memory {
-            allocatable.insert("memory".to_string(), Quantity(memory.to_string()));
-        }
-        Node {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                ..ObjectMeta::default()
-            },
-            status: Some(NodeStatus {
-                allocatable: Some(allocatable),
-                ..NodeStatus::default()
-            }),
-            ..Node::default()
+    #[tokio::test]
+    async fn join_ordered_keeps_input_order_and_reports_panics_in_place() {
+        let futures = [30_u64, 0, 10]
+            .into_iter()
+            .enumerate()
+            .map(|(i, delay)| async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                assert_ne!(i, 1, "namespace task blew up");
+                Ok::<usize, usize>(i)
+            });
+
+        let outputs = join_ordered(futures, |index, _| Err(index)).await;
+
+        assert_eq!(outputs, [Ok(0), Err(1), Ok(2)]);
+    }
+
+    fn backend() -> K8sBackend {
+        K8sBackend::new(K8sTarget {
+            name: "prod".into(),
+            kubeconfig: None,
+            context: "ctx".to_string(),
+            namespaces: vec![WatchedNamespace {
+                name: "default".to_string(),
+                hidden: std::collections::BTreeSet::new(),
+            }],
+        })
+    }
+
+    #[test]
+    fn requested_is_a_share_of_allocatable_and_a_refusal_is_remembered() {
+        let mut backend = backend();
+        let allocatable = Resources {
+            cpu_millicores: 4000.0,
+            memory_bytes: 8,
+        };
+        let requested = RequestList::Requested(CpuMem { cpu: 1.0, mem: 6 });
+
+        assert_eq!(
+            backend.requested(requested, &allocatable),
+            Some(Requested {
+                cpu_percent: 25.0,
+                memory_percent: 75.0,
+            })
+        );
+        assert!(!backend.requests_forbidden);
+
+        assert_eq!(backend.requested(RequestList::Failed, &allocatable), None);
+        assert!(!backend.requests_forbidden, "a failure is retried");
+
+        assert_eq!(
+            backend.requested(RequestList::Forbidden, &allocatable),
+            None
+        );
+        assert!(backend.requests_forbidden, "a refusal is not");
+    }
+
+    /// A listing of `namespace` whose pods are each run by one Job.
+    fn listing(namespace: &str, jobs: &[&str]) -> NamespaceListing {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        use kube::api::ObjectMeta;
+
+        let specs = jobs
+            .iter()
+            .map(|job| Pod {
+                metadata: ObjectMeta {
+                    name: Some(format!("{job}-pod")),
+                    owner_references: Some(vec![OwnerReference {
+                        kind: "Job".to_string(),
+                        name: (*job).to_string(),
+                        controller: Some(true),
+                        ..OwnerReference::default()
+                    }]),
+                    ..ObjectMeta::default()
+                },
+                ..Pod::default()
+            })
+            .collect();
+        NamespaceListing {
+            name: namespace.to_string(),
+            pods: Ok((Vec::new(), specs)),
+            events: HashMap::new(),
         }
     }
 
     #[test]
-    fn allocatable_sums_complete_nodes_only() {
-        let nodes = [
-            node("a", Some("3920m"), Some("16Gi")),
-            node("b", Some("2"), Some("8Gi")),
-            node("c", Some("4"), None),
-            Node::default(),
-        ];
+    fn only_namespaces_with_unknown_jobs_are_relisted() {
+        let mut backend = backend();
+        let known = backend.namespaces.entry("known".to_string()).or_default();
+        known
+            .job_owners
+            .insert("backup-1".to_string(), Some("backup".to_string()));
+        backend
+            .namespaces
+            .entry("refused".to_string())
+            .or_default()
+            .jobs_forbidden = true;
+        let mut failed = listing("failed", &["x-1"]);
+        failed.pods = Err(K8sError::ListNodes(Box::new(
+            kube::Error::LinesCodecMaxLineLengthExceeded,
+        )));
 
-        let total = sum_allocatable(&nodes).expect("sum");
+        let stale = backend.stale_jobs(&[
+            listing("known", &["backup-1"]),
+            listing("new", &["sweep-7"]),
+            listing("refused", &["sweep-8"]),
+            listing("no-jobs", &[]),
+            failed,
+        ]);
 
-        assert!((total.cpu - 5.92).abs() < 1e-9);
-        assert_eq!(total.mem, 24 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn allocatable_rejects_malformed_quantities() {
-        assert!(sum_allocatable(&[node("a", Some("lots"), Some("1Gi"))]).is_err());
+        assert_eq!(
+            stale,
+            [("new".to_string(), HashSet::from(["sweep-7".to_string()]))]
+        );
     }
 }

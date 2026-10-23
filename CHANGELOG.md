@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Per-node reports: ready, cordoned, pressure conditions, roles, kubelet version, allocatable, and CPU/memory/disk usage; a node at a threshold now notifies on its own
+- Per-node reports: ready, cordoned, pressure conditions, roles, kubelet version, allocatable, and CPU/memory/disk usage; a node at a threshold now notifies on its own and colours the tray (one-node clusters count once, as the cluster)
 - Requested CPU and memory across the cluster, against allocatable, when pods can be listed in all namespaces
 - Each pod reports the node it runs on
 - `unwatch_namespace` command
@@ -16,9 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - A Kubernetes entry is one cluster watching several namespaces (`namespaces`, each with its own `hidden`); entries sharing a kubeconfig context merge on load, and adding a known context adds its namespace to that cluster. Nodes are polled once per cluster instead of once per namespace
-- `metrics-update` cluster payload: `nodes`, `namespaces` (each with `pods`), and `requested` replace `pods` and `node_count`; notification labels are `cluster/node` and `cluster/namespace/pod`
+- `metrics-update` cluster payload: `nodes`, `namespaces` (each with `pods`), and `requested` replace `pods` and `node_count`; notification labels are `cluster node <name>` and `cluster/namespace/pod`
 - `hide_workload`, `show_workload` and `open_pod_logs` take a `namespace`
-
 - The `metrics-update` payload is typed per server kind (`kind`, `status`, `metrics` or `error`), with pods nested inside their cluster
 - `save_config_cmd` is replaced by `save_settings`, which never touches the server list; terminal commands take a server name instead of connection details
 - Config changes are validated (new names unique and without `/`, changed poll intervals in range); the `poll_interval_secs` alias is gone

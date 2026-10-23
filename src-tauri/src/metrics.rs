@@ -178,8 +178,12 @@ impl ClusterMetrics {
         })
     }
 
-    /// Drop the pods of every workload `target` hides in their namespace.
+    /// Drop every namespace `target` no longer watches, and the pods of
+    /// every workload it hides in the rest. A namespace unwatched while a
+    /// poll was running must not notify or reach the tray.
     pub fn hide(&mut self, target: &K8sTarget) {
+        self.namespaces
+            .retain(|ns| target.namespace(&ns.name).is_some());
         for namespace in &mut self.namespaces {
             let (Some(watched), Some(pods)) =
                 (target.namespace(&namespace.name), &mut namespace.pods)
@@ -364,8 +368,9 @@ impl Usage {
 }
 
 /// Every online card's usage with the label used in notifications:
-/// server names for hosts and clusters, `cluster/node` for nodes, and
-/// `cluster/namespace/pod` for pods.
+/// server names for hosts and clusters, `cluster node <name>` for nodes,
+/// and `cluster/namespace/pod` for pods. A node label never looks like a
+/// pod label, even under a legacy cluster name with `/`.
 pub fn online_usage(reports: &[ServerReport]) -> impl Iterator<Item = (String, Usage)> + '_ {
     reports.iter().flat_map(|report| {
         let mut entries = Vec::new();
@@ -388,7 +393,7 @@ pub fn online_usage(reports: &[ServerReport]) -> impl Iterator<Item = (String, U
                 };
                 for node in nodes {
                     if let Some(usage) = node.usage {
-                        entries.push((format!("{name}/{}", node.name), usage.usage));
+                        entries.push((format!("{name} node {}", node.name), usage.usage));
                     }
                 }
                 for (namespace, pod) in metrics.pods() {
@@ -696,6 +701,12 @@ pub(crate) mod tests {
             metrics.namespaces[0].pods.is_none(),
             "a failed listing stays failed"
         );
+
+        let mut unwatched = target;
+        unwatched.namespaces.retain(|ns| ns.name != "s3");
+        metrics.hide(&unwatched);
+        let names: Vec<&str> = metrics.namespaces.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["default"], "unwatched mid-poll");
     }
 
     #[test]
@@ -814,7 +825,7 @@ pub(crate) mod tests {
 
         let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
 
-        assert_eq!(labels, ["prod", "prod/n1", "prod/default/web"]);
+        assert_eq!(labels, ["prod", "prod node n1", "prod/default/web"]);
         assert_eq!(worst_level(&reports), MetricLevel::Crit, "a full node disk");
 
         let [mut single] = reports;

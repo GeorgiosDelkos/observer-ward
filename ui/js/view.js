@@ -17,7 +17,6 @@ import {
   rate,
 } from "./format.js";
 import {
-  attention,
   clusterLevel,
   clusters,
   errorOf,
@@ -44,7 +43,7 @@ const ATTENTION_ROWS = 3;
 const svg = (body, extra = "") =>
   `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" ${extra}>${body}</svg>`;
 
-export const ICONS = {
+const ICONS = {
   chev: svg('<path d="M6 3.5 10.5 8 6 12.5" stroke-width="1.6"/>', 'class="chev"'),
   back: svg('<path d="M10 3.5 5.5 8 10 12.5" stroke-width="1.8"/>'),
   plus: svg('<path d="M8 3v10M3 8h10" stroke-width="1.8"/>'),
@@ -146,7 +145,7 @@ function liveText() {
   return seconds < 2 ? "Live" : `Live · ${seconds}s`;
 }
 
-export function livePill() {
+function livePill() {
   return `<span class="live" id="live"><span class="pulse${state.syncing ? " busy" : ""}"></span><span id="live-text">${liveText()}</span></span>`;
 }
 
@@ -157,9 +156,9 @@ export function updateLive() {
   }
 }
 
-export function subTop({ back, title, sub, action = "", rename = "" }) {
+export function subTop({ title, sub, action = "", rename = "" }) {
   const renameAttr = rename ? ` data-rename="${escapeHtml(rename)}"` : "";
-  return `<button class="round" data-action="back" data-to="${back}" aria-label="Back">${ICONS.back}</button>
+  return `<button class="round" data-action="back" aria-label="Back">${ICONS.back}</button>
     <span class="title grow"><b${renameAttr}>${escapeHtml(title)}</b><span>${escapeHtml(sub)}</span></span>${action}`;
 }
 
@@ -167,10 +166,10 @@ function moreButton(action, attrs) {
   return `<button class="round" data-action="${action}" ${attrs} aria-label="More actions">${ICONS.more}</button>`;
 }
 
-export function bottom() {
+export function bottom(issues) {
   const sources = state.servers.length;
-  const issues = attention().length;
-  const issuesText = issues === 0 ? "all clear" : `${issues} ${issues === 1 ? "issue" : "issues"}`;
+  const count = issues.length;
+  const issuesText = count === 0 ? "all clear" : `${count} ${count === 1 ? "issue" : "issues"}`;
   return `<span class="foot-text">${sources} ${sources === 1 ? "source" : "sources"} · ${issuesText}</span>
     <span class="foot-actions">
       <button class="round" data-action="settings" aria-label="Settings" title="Settings">${ICONS.gear}</button>
@@ -186,7 +185,7 @@ export function homeTop() {
     <button class="round" data-action="add" aria-label="Add a cluster or host" title="Add a cluster or host">${ICONS.plus}</button>`;
 }
 
-export function homePage(nav) {
+export function homePage(nav, issues) {
   if (state.servers.length === 0) {
     return `<div class="empty">
       <span class="mark big" aria-hidden="true"></span>
@@ -195,7 +194,7 @@ export function homePage(nav) {
       <button class="pill primary" data-action="add">Add a cluster or host</button>
     </div>`;
   }
-  const parts = [attentionCard(nav)];
+  const parts = [attentionCard(nav, issues)];
   const k8s = clusters();
   if (k8s.length > 0) {
     parts.push(sectionLabel("Clusters", k8s.length), ...k8s.map(clusterCard));
@@ -211,8 +210,7 @@ function sectionLabel(text, count) {
   return `<div class="sec"><span class="label">${text}</span><span class="count">${count}</span></div>`;
 }
 
-function attentionCard(nav) {
-  const items = attention();
+function attentionCard(nav, items) {
   if (items.length === 0) {
     return "";
   }
@@ -355,7 +353,6 @@ export function clusterTop(nav) {
   const metrics = metricsOf(nav.cluster);
   const nodes = metrics ? ` · ${metrics.nodes.length} nodes` : "";
   return subTop({
-    back: "home",
     title: displayName(nav.cluster),
     sub: `${server?.context ?? ""}${nodes}`,
     rename: nav.cluster,
@@ -465,7 +462,6 @@ function namespaceList(cluster, namespaces) {
 
 export function namespaceTop(nav) {
   return subTop({
-    back: "cluster",
     title: nav.namespace,
     sub: `${displayName(nav.cluster)} · namespace`,
     action: moreButton("menu-namespace", `data-cluster="${escapeHtml(nav.cluster)}" data-namespace="${escapeHtml(nav.namespace)}"`),

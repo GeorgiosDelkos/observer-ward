@@ -67,19 +67,32 @@ const FORM_PAGES = new Set(["add", "settings"]);
 
 // ── Rendering ───────────────────────────────────
 
-/** Re-render the data page (forms keep their DOM) and the chrome. */
+/**
+ * Re-render the data page and the chrome. Forms keep their DOM, and so
+ * does a page with a rename in progress: the rename re-renders when it
+ * ends. Focus and scroll survive a refresh; navigation focuses the new
+ * page's first control.
+ */
 function render({ direction = null } = {}) {
   validateNav();
-  if (!FORM_PAGES.has(nav.page)) {
+  const issues = attention();
+  const focus = direction ? null : focusKey(document.activeElement);
+  const editing = Boolean(els.win.querySelector("input.rename"));
+  if (!FORM_PAGES.has(nav.page) && !editing) {
     const scroll = direction ? 0 : els.page.scrollTop;
     els.top.innerHTML = topHtml();
-    els.content.innerHTML = pageHtml();
+    els.content.innerHTML = pageHtml(issues);
     els.page.scrollTop = scroll;
   }
-  els.bottom.innerHTML = bottom();
-  els.win.classList.toggle("troubled", attention().some((i) => i.level === "crit"));
+  els.bottom.innerHTML = bottom(issues);
+  els.win.classList.toggle("troubled", issues.some((i) => i.level === "crit"));
   if (direction) {
     animate(direction);
+    if (!FORM_PAGES.has(nav.page)) {
+      els.top.querySelector("button")?.focus({ preventScroll: true });
+    }
+  } else {
+    restoreFocus(focus);
   }
   resize();
   // A row opened by navigation (an attention item, a node cell) may sit
@@ -87,6 +100,27 @@ function render({ direction = null } = {}) {
   if (direction && nav.open) {
     const item = els.content.querySelector(`[data-key="${CSS.escape(nav.open)}"]`)?.closest(".item");
     requestAnimationFrame(() => scrollPageTo(item));
+  }
+}
+
+/** Attributes that, with `data-action`, identify a control across renders. */
+const FOCUS_IDS = ["key", "cluster", "namespace", "tab", "host"];
+
+/** A selector for the focused control, or null when focus is elsewhere. */
+function focusKey(el) {
+  const control = el?.closest?.("[data-action]");
+  if (!control || !els.win.contains(control)) {
+    return null;
+  }
+  const ids = FOCUS_IDS.filter((id) => control.dataset[id] !== undefined)
+    .map((id) => `[data-${id}="${CSS.escape(control.dataset[id])}"]`)
+    .join("");
+  return `[data-action="${CSS.escape(control.dataset.action)}"]${ids}`;
+}
+
+function restoreFocus(selector) {
+  if (selector && !els.win.contains(document.activeElement)) {
+    els.win.querySelector(selector)?.focus({ preventScroll: true });
   }
 }
 
@@ -111,14 +145,14 @@ function topHtml() {
   }
 }
 
-function pageHtml() {
+function pageHtml(issues) {
   switch (nav.page) {
     case "cluster":
       return clusterPage(nav);
     case "namespace":
       return namespacePage(nav);
     default:
-      return homePage(nav);
+      return homePage(nav, issues);
   }
 }
 
@@ -148,7 +182,9 @@ function resize() {
   const pagePad = parseFloat(getComputedStyle(els.page).paddingBottom) || 0;
   let height = chrome + els.content.offsetHeight + pagePad;
   if (!els.overlay.hidden) {
-    height = Math.max(height, els.sheet.offsetHeight + 2 * SHEET_MARGIN);
+    // scrollHeight: the sheet's own height is capped by the window it
+    // is trying to grow.
+    height = Math.max(height, els.sheet.scrollHeight + 2 * SHEET_MARGIN);
   }
   const fitted = Math.round(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, height)));
   invoke("resize_window", { width: WIN_WIDTH, height: fitted }).catch((err) => {
@@ -165,7 +201,6 @@ function go(next) {
   const direction = DEPTH[nav.page] >= DEPTH[from] ? "enter" : "back";
   if (nav.page === "add") {
     els.top.innerHTML = subTop({
-      back: nav.back,
       title: nav.cluster ? "Watch a namespace" : "Add a source",
       sub: nav.cluster ? displayName(nav.cluster) : "Kubernetes cluster or SSH host",
     });
@@ -178,7 +213,7 @@ function go(next) {
       onResize: resize,
     });
   } else if (nav.page === "settings") {
-    els.top.innerHTML = subTop({ back: nav.back, title: "Settings", sub: "Observer Ward" });
+    els.top.innerHTML = subTop({ title: "Settings", sub: "Observer Ward" });
     mountSettings(els.content, {
       onSaved: (config) => {
         setConfig(config);
@@ -327,6 +362,8 @@ async function hideWorkload(cluster, namespace, workload) {
 // ── Menus ───────────────────────────────────────
 
 let menuItems = [];
+/** The control that opened the menu, to take focus back when it closes. */
+let menuReturn = null;
 
 function clusterMenu(cluster) {
   const error = errorOf(cluster);
@@ -372,12 +409,20 @@ function openMenu(anchor, items) {
   const at = anchor.getBoundingClientRect();
   els.menu.style.top = `${at.bottom - win.top + 6}px`;
   els.menu.style.right = `${win.right - at.right}px`;
+  menuReturn = focusKey(anchor);
   els.menu.querySelector("button")?.focus();
 }
 
 function closeMenu() {
+  if (els.menu.hidden) {
+    return;
+  }
+  const hadFocus = els.menu.contains(document.activeElement);
   els.menu.hidden = true;
   menuItems = [];
+  if (hadFocus && menuReturn) {
+    els.win.querySelector(menuReturn)?.focus({ preventScroll: true });
+  }
 }
 
 function runMenuItem(index) {
@@ -388,8 +433,14 @@ function runMenuItem(index) {
 
 // ── Sheets ──────────────────────────────────────
 
-/** Show a sheet; resolves when it closes, with the button value. */
+/** The control focused when a sheet opened, to take focus back after. */
+let sheetReturn = null;
+
+/** Show a sheet over the page. Reopening an open sheet replaces it. */
 function openSheet(html) {
+  if (els.overlay.hidden) {
+    sheetReturn = focusKey(document.activeElement);
+  }
   closeMenu();
   els.sheet.innerHTML = html;
   els.overlay.hidden = false;
@@ -397,10 +448,15 @@ function openSheet(html) {
   els.sheet.querySelector("[data-autofocus]")?.focus();
 }
 
+/** Close the sheet and refresh the page under it, which it may have changed. */
 function closeSheet() {
   els.overlay.hidden = true;
   els.sheet.innerHTML = "";
-  resize();
+  sheetConfirm = null;
+  render();
+  if (sheetReturn) {
+    els.win.querySelector(sheetReturn)?.focus({ preventScroll: true });
+  }
 }
 
 let sheetConfirm = null;
@@ -471,7 +527,6 @@ els.overlay.addEventListener("click", async (e) => {
   const kind = button.dataset.sheet;
   if (kind === "cancel") {
     closeSheet();
-    render();
     return;
   }
   button.disabled = true;
@@ -487,7 +542,12 @@ els.overlay.addEventListener("click", async (e) => {
       openHiddenSheet(cluster, namespace);
     }
   } catch (err) {
+    // The sheet may have been closed while the request ran.
     const error = els.sheet.querySelector("#sheet-error");
+    if (!error) {
+      report(err);
+      return;
+    }
     error.textContent = String(err);
     error.hidden = false;
     button.disabled = false;
@@ -520,6 +580,8 @@ els.win.addEventListener("dblclick", (e) => {
     if (save) {
       saveAlias(name, input.value.trim());
     }
+    // Gone first: render() leaves the page alone while a rename is open.
+    input.remove();
     render();
   };
   input.addEventListener("blur", () => finish(true));

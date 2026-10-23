@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Requested CPU and memory across the cluster, against allocatable, when pods can be listed in all namespaces
 - Each pod reports the node it runs on
 - `unwatch_namespace` command
+- The pod sheet shows what each usage bar is measured against, for example `1.6c of 16.0c · node` (pod `usage.ceiling.cpu` and `.memory`, each `{ amount, source }` with source `limit`, `node` or `cluster`)
+- Pod-level resources (`spec.resources`, Kubernetes 1.34) count as the pod's limits and requests
 
 ### Changed
 
@@ -31,6 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A pod's CPU and memory percent no longer uses its requests as the ceiling. A pod without a limit is measured against its node, so a busy pod with no limit no longer reads 100% or more and raises a false crit
+- Pod limits and cluster requests follow Kubernetes' `PodLimits` and `PodRequests`. Native sidecars add to the app containers, a running init container is measured against its own step, and a zero limit is no limit
 - SSH host-key check failed open when `known_hosts` was unreadable or had an unparseable entry for the host, or named the host only in a line russh skips (tabs, wildcards, `@revoked`)
 - Tray click and blur grace windows used the wall clock and could swallow clicks after a clock step
 - Memory limits stored as milli-bytes (e.g. `1.2Gi` canonicalised by the API server) were ignored

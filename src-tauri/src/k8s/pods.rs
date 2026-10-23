@@ -338,12 +338,46 @@ struct Limits {
     memory_bytes: Option<u64>,
 }
 
-/// A pod's limits, summed over the containers that run alongside each
-/// other: the app containers and native sidecars (init containers that
-/// restart always), whose usage the Metrics API reports with the pod's. A
-/// resource is `None` unless *every* one of them is limited: summing only
-/// the limited containers would compare the whole pod's usage against part
-/// of its budget and overstate the percentage.
+impl Limits {
+    /// No containers yet: a zero budget that each one adds to.
+    const ZERO: Self = Self {
+        cpu_millicores: Some(0.0),
+        memory_bytes: Some(0),
+    };
+
+    /// Both budgets together. An unlimited side leaves the sum unlimited.
+    fn add(self, other: Self) -> Self {
+        Self {
+            cpu_millicores: zip_with(self.cpu_millicores, other.cpu_millicores, |a, b| a + b),
+            memory_bytes: zip_with(self.memory_bytes, other.memory_bytes, u64::saturating_add),
+        }
+    }
+
+    /// The larger budget. An unlimited side leaves the result unlimited.
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu_millicores: zip_with(self.cpu_millicores, other.cpu_millicores, f64::max),
+            memory_bytes: zip_with(self.memory_bytes, other.memory_bytes, u64::max),
+        }
+    }
+}
+
+fn zip_with<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option<T> {
+    a.zip(b).map(|(a, b)| f(a, b))
+}
+
+/// A pod's limits, computed as Kubernetes' `PodLimits`
+/// (`k8s.io/component-helpers/resource`) does, which is what the kubelet
+/// caps the pod's cgroup at:
+///
+/// - App containers and native sidecars (init containers that restart
+///   always) run together, so their limits add up.
+/// - Init containers run one at a time, in order, each alongside the
+///   sidecars started before it; the Metrics API reports a running init
+///   container's usage with the pod's. The pod may use the largest step.
+///
+/// The ceiling is the larger of the two. A resource is `None` unless
+/// *every* container is limited: an unlimited one may use the whole node.
 ///
 /// Pod-level limits (`spec.resources`, beta in Kubernetes 1.34) are not
 /// read: the `v1_31` API types lack the field. Such a pod is measured
@@ -355,34 +389,43 @@ fn pod_limits(pod: &Pod) -> Limits {
     if spec.containers.is_empty() {
         return Limits::default();
     }
-    let sidecars = spec
-        .init_containers
-        .iter()
-        .flatten()
-        .filter(|c| c.restart_policy.as_deref() == Some("Always"));
 
-    let mut cpu = Some(0.0_f64);
-    let mut mem = Some(0_u64);
-    for container in spec.containers.iter().chain(sidecars) {
-        let container_cpu =
-            container_limit(container, "cpu").and_then(|q| parse_logged(q, parse_cpu_quantity));
-        let container_mem = container_limit(container, "memory")
-            .and_then(|q| parse_logged(q, parse_memory_quantity));
-        cpu = cpu.zip(container_cpu).map(|(total, c)| total + c * 1000.0);
-        mem = mem
-            .zip(container_mem)
-            .map(|(total, m)| total.saturating_add(m));
+    let mut running = spec
+        .containers
+        .iter()
+        .map(container_limits)
+        .fold(Limits::ZERO, Limits::add);
+    let mut sidecars = Limits::ZERO;
+    let mut init_peak = Limits::ZERO;
+    for init in spec.init_containers.iter().flatten() {
+        let limits = container_limits(init);
+        let step = if init.restart_policy.as_deref() == Some("Always") {
+            running = running.add(limits);
+            sidecars = sidecars.add(limits);
+            sidecars
+        } else {
+            sidecars.add(limits)
+        };
+        init_peak = init_peak.max(step);
     }
-    Limits {
-        cpu_millicores: cpu,
-        memory_bytes: mem,
-    }
+    running.max(init_peak)
 }
 
-/// The container's limit for `resource`. A request is deliberately no
-/// fallback: it reserves room, it does not cap usage.
-fn container_limit<'a>(container: &'a Container, resource: &str) -> Option<&'a Quantity> {
-    container.resources.as_ref()?.limits.as_ref()?.get(resource)
+/// The container's limits. A request is deliberately no fallback: it
+/// reserves room, it does not cap usage. A zero limit is no limit, as the
+/// kubelet treats it.
+fn container_limits(container: &Container) -> Limits {
+    let limits = container.resources.as_ref().and_then(|r| r.limits.as_ref());
+    let limit = |resource: &str| limits.and_then(|l| l.get(resource));
+    Limits {
+        cpu_millicores: limit("cpu")
+            .and_then(|q| parse_logged(q, parse_cpu_quantity))
+            .filter(|&cores| cores > 0.0)
+            .map(|cores| cores * 1000.0),
+        memory_bytes: limit("memory")
+            .and_then(|q| parse_logged(q, parse_memory_quantity))
+            .filter(|&bytes| bytes > 0),
+    }
 }
 
 fn parse_logged<T>(
@@ -686,23 +729,52 @@ mod tests {
     }
 
     #[test]
-    fn pod_limits_count_native_sidecars_but_not_init_containers() {
+    fn pod_limits_add_native_sidecars_to_the_app() {
         let mut pod = limited_app("with-native-sidecar");
         pod.spec.as_mut().unwrap().init_containers = Some(vec![
-            init_container(None, Some("4")),
-            init_container(None, None),
+            init_container(None, Some("100m")),
             init_container(Some("Always"), Some("500m")),
         ]);
         let limits = pod_limits(&pod);
         assert_f64_near(limits.cpu_millicores.unwrap(), 1500.0, 1e-9);
         assert_eq!(limits.memory_bytes, Some(2 * GI));
+    }
 
-        // An unlimited native sidecar runs with the app, so the pod has no
-        // ceiling of its own.
-        let mut pod = limited_app("with-unlimited-sidecar");
-        pod.spec.as_mut().unwrap().init_containers =
-            Some(vec![init_container(Some("Always"), None)]);
-        assert_eq!(pod_limits(&pod), Limits::default());
+    #[test]
+    fn pod_limits_cover_the_largest_init_step() {
+        // A 4-core migration runs before the app's 1 core and beside the
+        // 500m sidecar started first: while it runs, the pod may use 4.5.
+        let mut pod = limited_app("migrating");
+        pod.spec.as_mut().unwrap().init_containers = Some(vec![
+            init_container(Some("Always"), Some("500m")),
+            init_container(None, Some("4")),
+        ]);
+        let limits = pod_limits(&pod);
+        assert_f64_near(limits.cpu_millicores.unwrap(), 4500.0, 1e-9);
+        assert_eq!(limits.memory_bytes, Some(2 * GI));
+    }
+
+    #[test]
+    fn pod_limits_are_unlimited_when_any_container_is() {
+        for init in [
+            init_container(Some("Always"), None),
+            init_container(None, None),
+            init_container(None, Some("0")),
+        ] {
+            let mut pod = limited_app("unlimited-init");
+            pod.spec.as_mut().unwrap().init_containers = Some(vec![init]);
+            assert_eq!(pod_limits(&pod).cpu_millicores, None);
+        }
+
+        let zero = make_pod_with_resources(
+            "zero",
+            &[ContainerRes {
+                cpu_limit: Some("0"),
+                mem_limit: Some("0"),
+                ..NO_CAPS
+            }],
+        );
+        assert_eq!(pod_limits(&zero), Limits::default(), "zero is no limit");
     }
 
     #[test]

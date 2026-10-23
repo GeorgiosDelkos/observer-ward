@@ -112,6 +112,10 @@ input:focus-visible {
   flex-direction: column;
   overflow: hidden;
   border-radius: var(--r-win);
+  /* overflow + radius does not clip the blurred aurora (a filtered
+     child), which would paint square corners past the native rounded
+     blur; a clip-path does. */
+  clip-path: inset(0 round var(--r-win));
   background: var(--glass);
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.09),

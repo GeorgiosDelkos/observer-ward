@@ -63,7 +63,9 @@ Click the tray icon to open the popover. Click outside it to dismiss.
 
 Adding checks the kubeconfig can be read and the context resolves to a cluster, so a mistyped path or context is reported in the form rather than saved. If a server goes offline later, its card shows why; right-click → **Copy Error** copies the full message.
 
-The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API (plus `list` on Jobs, to hide CronJobs).
+A cluster is one entry however many namespaces it watches: adding a namespace for a kubeconfig context that is already configured adds it to that cluster, and the name you typed is not used. Nodes are read once per poll and reported both one by one and as cluster totals; each watched namespace gets its own pod list. The trash icon on a namespace row stops watching it (a cluster keeps at least one; remove the cluster to drop the last).
+
+The cluster needs [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) and a kubeconfig that can read nodes, pods, events, and the metrics API (plus `list` on Jobs, to hide CronJobs). With `list` on pods in all namespaces, the cluster also reports how much CPU and memory its pods request; without it that figure is left out.
 
 Expanded pod lists show three pods at a time (scroll for the rest) and are sorted A–Z.
 
@@ -71,7 +73,7 @@ Expanded pod lists show three pods at a time (scroll for the rest) and are sorte
 
 Click the trash icon on a pod card to stop tracking it. This hides the workload that owns the pod (its Deployment, StatefulSet, DaemonSet, CronJob, or Argo Rollout; a pod with no controller is hidden by name), so it stays hidden across restarts and rollouts. Hidden pods are left out of the list, the tray icon, and threshold notifications; Grafana alerts about them still fire. Nothing is deleted from the cluster.
 
-The cluster row then shows **N hidden**; click it and choose **show** to track a workload again. Hidden pods are skipped as soon as they are listed, so no per-pod work is done for them.
+Workloads are hidden per namespace. The namespace row then shows **N hidden**; click it and choose **show** to track a workload again. Hidden pods are skipped as soon as they are listed, so no per-pod work is done for them.
 
 CronJob pods are matched to their CronJob through one list of the namespace's Jobs, refreshed only when a new run appears. Without permission to list Jobs, runs of a hidden CronJob are matched by their default name (`<cronjob>-<digits>`) instead.
 
@@ -127,8 +129,11 @@ Click the trash icon on the card or cluster row (or right-click → Remove). Con
       "type": "k8s",
       "name": "production",
       "context": "prod-ctx",
-      "namespace": "default",
-      "kubeconfig": null
+      "kubeconfig": null,
+      "namespaces": [
+        { "name": "default" },
+        { "name": "s3", "hidden": [{ "kind": "CronJob", "name": "sweep" }] }
+      ]
     },
     {
       "type": "ssh",
@@ -142,7 +147,9 @@ Click the trash icon on the card or cluster row (or right-click → Remove). Con
 }
 ```
 
-Every change made through the app is validated: new server names must be unique and must not contain `/`, and changed intervals must be 5–120 s (`foreground_poll_secs`) and 30–600 s (`background_poll_secs`). Existing entries that break these rules still load and do not block other edits. If the file cannot be read or parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
+Files from before clusters held several namespaces have one `namespace` (and `hidden`) per entry; entries that share a kubeconfig and context are merged into the first on load, which keeps its name, and the file is rewritten in the new shape on the next save.
+
+Every change made through the app is validated: new server names must be unique and must not contain `/`, a changed namespace list must be non-empty with unique names that do not contain `/`, and changed intervals must be 5–120 s (`foreground_poll_secs`) and 30–600 s (`background_poll_secs`). Existing entries that break these rules still load and do not block other edits. If the file cannot be read or parsed, the app starts with defaults and first copies it to `config.json.invalid`. The Grafana token is not in this file.
 
 ## Architecture
 

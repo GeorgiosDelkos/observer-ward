@@ -7,7 +7,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::config::WorkloadRef;
-use crate::metrics::{Capacity, NetSample, PodMetrics, PodStatus, PodUsage, Usage, percent};
+use crate::metrics::{
+    Capacity, NetSample, PodMetrics, PodStatus, ResourceUsage, Resources, Usage, percent,
+};
 
 use super::error::K8sError;
 use super::jobs::{CRON_JOB, JOB, JobOwners};
@@ -106,7 +108,7 @@ fn pod_card(
     name: &str,
     spec: &Pod,
     workload: WorkloadRef,
-    usage: Option<PodUsage>,
+    usage: Option<ResourceUsage>,
     ctx: &PodContext<'_>,
 ) -> PodMetrics {
     let net = match (ctx.net.get(name), ctx.prev_net.get(name)) {
@@ -120,6 +122,7 @@ fn pod_card(
         restart_count: pod_restart_count(spec),
         start_time: pod_start_time(spec),
         last_event: ctx.events.get(name).cloned(),
+        node: spec.spec.as_ref().and_then(|s| s.node_name.clone()),
         usage,
         net,
         pvc: ctx.pvc.get(name).copied(),
@@ -133,7 +136,7 @@ fn sample_usage(
     sample: &PodMetricsSample,
     spec: &Pod,
     ctx: &PodContext<'_>,
-) -> Result<PodUsage, K8sError> {
+) -> Result<ResourceUsage, K8sError> {
     let mut cpu_used = 0.0_f64;
     let mut mem_used = 0_u64;
     for container in &sample.containers {
@@ -152,14 +155,16 @@ fn sample_usage(
     )]
     let memory_percent = percent(mem_used as f64, mem_base as f64);
 
-    Ok(PodUsage {
+    Ok(ResourceUsage {
         usage: Usage {
             cpu_percent: percent(cpu_used, cpu_base),
             memory_percent,
             disk_percent: disk.map_or(0.0, Capacity::percent),
         },
-        cpu_millicores: cpu_used * 1000.0,
-        memory_bytes: mem_used,
+        used: Resources {
+            cpu_millicores: cpu_used * 1000.0,
+            memory_bytes: mem_used,
+        },
     })
 }
 
@@ -627,7 +632,7 @@ mod tests {
 
         assert_f64_near(usage.usage.cpu_percent, 9.0, 0.01);
         assert_f64_near(usage.usage.memory_percent, 6.25, 0.01);
-        assert_f64_near(usage.cpu_millicores, 90.0, 1e-9);
+        assert_f64_near(usage.used.cpu_millicores, 90.0, 1e-9);
     }
 
     #[test]

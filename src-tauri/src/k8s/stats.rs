@@ -22,7 +22,9 @@ pub(super) struct StatsSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct NodeStats {
+    node_name: Option<String>,
     fs: Option<FsStats>,
     network: Option<NetworkStats>,
 }
@@ -158,6 +160,23 @@ pub(super) fn cluster_totals(summaries: &[StatsSummary]) -> ClusterTotals {
     }
 
     totals
+}
+
+/// Each node's root filesystem, keyed by node name. A summary without a
+/// name or a filesystem is left out.
+pub(super) fn node_disks(summaries: &[StatsSummary]) -> HashMap<&str, Capacity> {
+    summaries
+        .iter()
+        .filter_map(|summary| {
+            let name = summary.node.node_name.as_deref()?;
+            let fs = summary.node.fs.as_ref()?;
+            let disk = Capacity {
+                used_bytes: fs.used_bytes.unwrap_or(0),
+                capacity_bytes: fs.capacity_bytes.unwrap_or(0),
+            };
+            Some((name, disk))
+        })
+        .collect()
 }
 
 /// PVC used/capacity bytes per pod in `namespace`, summed over the pod's
@@ -316,6 +335,29 @@ mod tests {
             }
         );
         assert_eq!((totals.rx_bytes, totals.tx_bytes), (1, 2));
+    }
+
+    #[test]
+    fn node_disks_are_keyed_by_node_name() {
+        let named = summary_json(
+            r#"{"node": {"nodeName": "n1", "fs": {"usedBytes": 10, "capacityBytes": 100}}}"#,
+        );
+        let unnamed = summary_json(r#"{"node": {"fs": {"usedBytes": 1, "capacityBytes": 2}}}"#);
+        let no_fs = summary_json(r#"{"node": {"nodeName": "n2"}}"#);
+        let summaries = [named, unnamed, no_fs];
+
+        let disks = node_disks(&summaries);
+
+        assert_eq!(
+            disks,
+            HashMap::from([(
+                "n1",
+                Capacity {
+                    used_bytes: 10,
+                    capacity_bytes: 100
+                }
+            )])
+        );
     }
 
     #[test]

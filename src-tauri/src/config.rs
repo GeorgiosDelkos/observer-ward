@@ -69,6 +69,73 @@ impl AppConfig {
         self.servers.iter().find(|s| s.name().as_str() == name)
     }
 
+    /// Add `server`. A Kubernetes entry for a kubeconfig context that is
+    /// already configured adds its namespaces to that cluster instead, and
+    /// its own name is not used: one cluster is one connection and one card.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::AlreadyWatched`] when that cluster already watches
+    /// every namespace of `server`; nothing changes then.
+    pub fn add_server(&mut self, server: ServerConfig) -> Result<(), ConfigError> {
+        if let ServerConfig::K8s(target) = &server
+            && let Some(existing) = self.cluster_mut(target)
+            && target
+                .namespaces
+                .iter()
+                .all(|ns| existing.namespace(&ns.name).is_some())
+        {
+            return Err(ConfigError::AlreadyWatched {
+                cluster: existing.name.clone(),
+                namespaces: target
+                    .namespaces
+                    .iter()
+                    .map(|ns| ns.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        self.insert(server);
+        Ok(())
+    }
+
+    /// Join Kubernetes entries that share a kubeconfig context into the
+    /// first of them, which keeps its name and position. Older files hold
+    /// one entry per namespace, so each poll read the same nodes once per
+    /// namespace and showed them as separate clusters.
+    pub fn merge_clusters(&mut self) {
+        for server in std::mem::take(&mut self.servers) {
+            self.insert(server);
+        }
+    }
+
+    /// Push `server`, or fold it into the cluster for its context.
+    fn insert(&mut self, server: ServerConfig) {
+        let target = match server {
+            ServerConfig::K8s(target) => target,
+            ServerConfig::Ssh(_) => {
+                self.servers.push(server);
+                return;
+            }
+        };
+        match self.cluster_mut(&target) {
+            Some(existing) => {
+                for namespace in target.namespaces {
+                    existing.watch(namespace);
+                }
+            }
+            None => self.servers.push(ServerConfig::K8s(target)),
+        }
+    }
+
+    /// The configured cluster for `target`'s kubeconfig context.
+    fn cluster_mut(&mut self, target: &K8sTarget) -> Option<&mut K8sTarget> {
+        self.servers.iter_mut().find_map(|s| match s {
+            ServerConfig::K8s(existing) if existing.same_cluster(target) => Some(existing),
+            ServerConfig::K8s(_) | ServerConfig::Ssh(_) => None,
+        })
+    }
+
     /// Check the config invariants a write must keep (poll intervals in the form's
     /// range; unique server names without `/`), but only for what differs
     /// from `previous`: changed intervals and servers that were not there
@@ -101,8 +168,26 @@ impl AppConfig {
             if count_named(self, name) > count_named(previous, name).max(1) {
                 return Err(ConfigError::DuplicateServer(name.clone()));
             }
+            if let ServerConfig::K8s(target) = server
+                && namespaces_changed(target, previous)
+            {
+                target.validate_namespaces()?;
+            }
         }
         Ok(())
+    }
+}
+
+/// Whether `target`'s namespace list differs from the entry of the same
+/// name in `previous` (or there is none). Hiding a workload keeps the list.
+fn namespaces_changed(target: &K8sTarget, previous: &AppConfig) -> bool {
+    match previous.server(target.name.as_str()) {
+        Some(ServerConfig::K8s(before)) => !before
+            .namespaces
+            .iter()
+            .map(|ns| &ns.name)
+            .eq(target.namespaces.iter().map(|ns| &ns.name)),
+        Some(ServerConfig::Ssh(_)) | None => true,
     }
 }
 
@@ -216,40 +301,139 @@ pub enum ServerConfig {
     Ssh(SshTarget),
 }
 
-/// A Kubernetes cluster: which kubeconfig context to use and which
-/// namespace's pods to show.
+/// A Kubernetes cluster: which kubeconfig context to use and which of its
+/// namespaces to watch. One entry per cluster, so nodes are polled once
+/// however many namespaces are watched.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "K8sTargetFile")]
 pub struct K8sTarget {
     pub name: ServerName,
     /// `None` uses `$KUBECONFIG` / `~/.kube/config`. May start with `~/`.
     pub kubeconfig: Option<PathBuf>,
     pub context: String,
-    pub namespace: String,
-    /// Workloads whose pods are not shown, counted in the tray, or raised
-    /// as threshold notifications (Grafana alerts are not filtered).
-    /// Omitted from the file when empty, so older files load as is.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub hidden: BTreeSet<WorkloadRef>,
+    /// In display order. A write keeps at least one, with unique names.
+    pub namespaces: Vec<WatchedNamespace>,
 }
 
 impl K8sTarget {
-    /// Whether `other` reaches the same cluster and namespace. `hidden`
-    /// only filters what is shown, so changing it must not drop the
-    /// connection or reset a backoff.
+    /// Whether `other` is the same configured entry, ignoring which
+    /// namespaces it watches. Namespaces are read over the one connection,
+    /// so watching another namespace or hiding a workload must not drop
+    /// the connection or reset a backoff.
     #[must_use]
     pub fn same_connection(&self, other: &K8sTarget) -> bool {
         // Destructured so a new field must be classified here.
         let K8sTarget {
             name,
-            kubeconfig,
-            context,
-            namespace,
-            hidden: _,
+            kubeconfig: _,
+            context: _,
+            namespaces: _,
         } = self;
-        *name == other.name
-            && *kubeconfig == other.kubeconfig
-            && *context == other.context
-            && *namespace == other.namespace
+        *name == other.name && self.same_cluster(other)
+    }
+
+    /// Whether `other` points at the same kubeconfig context, whatever
+    /// either entry is named. Paths are compared with `~` expanded; a
+    /// missing kubeconfig only matches another missing one, since what it
+    /// falls back to depends on `$KUBECONFIG`.
+    fn same_cluster(&self, other: &K8sTarget) -> bool {
+        let path = |t: &K8sTarget| t.kubeconfig.as_deref().map(expand_tilde);
+        self.context == other.context && path(self) == path(other)
+    }
+
+    /// The watched namespace named `name`.
+    #[must_use]
+    pub fn namespace(&self, name: &str) -> Option<&WatchedNamespace> {
+        self.namespaces.iter().find(|ns| ns.name == name)
+    }
+
+    /// Watch `namespace`, or, when it is already watched, add its hidden
+    /// workloads to the ones there.
+    fn watch(&mut self, namespace: WatchedNamespace) {
+        match self
+            .namespaces
+            .iter_mut()
+            .find(|ns| ns.name == namespace.name)
+        {
+            Some(existing) => existing.hidden.extend(namespace.hidden),
+            None => self.namespaces.push(namespace),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] without a namespace, or with one that is
+    /// blank, contains `/`, or is listed twice.
+    pub fn validate_namespaces(&self) -> Result<(), ConfigError> {
+        if self.namespaces.is_empty() {
+            return Err(invalid(format!(
+                "cluster '{}' must watch at least one namespace",
+                self.name
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for namespace in &self.namespaces {
+            let name = namespace.name.as_str();
+            // Pod keys in the UI are `cluster/namespace/pod`.
+            if name.trim().is_empty() || name.contains('/') {
+                return Err(invalid(format!(
+                    "namespace '{name}' must not be empty or contain '/'"
+                )));
+            }
+            if !seen.insert(name) {
+                return Err(invalid(format!(
+                    "namespace '{name}' is watched twice in '{}'",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One watched namespace and the workloads hidden in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchedNamespace {
+    pub name: String,
+    /// Workloads whose pods are not shown, counted in the tray, or raised
+    /// as threshold notifications (Grafana alerts are not filtered).
+    /// Omitted from the file when empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub hidden: BTreeSet<WorkloadRef>,
+}
+
+/// A [`K8sTarget`] as stored on disk. Files written before clusters held
+/// several namespaces have one `namespace` with its `hidden` workloads
+/// instead of `namespaces`; [`AppConfig::merge_clusters`] then joins the
+/// entries that share a context.
+#[derive(Deserialize)]
+struct K8sTargetFile {
+    name: ServerName,
+    kubeconfig: Option<PathBuf>,
+    context: String,
+    #[serde(default)]
+    namespaces: Vec<WatchedNamespace>,
+    namespace: Option<String>,
+    #[serde(default)]
+    hidden: BTreeSet<WorkloadRef>,
+}
+
+impl From<K8sTargetFile> for K8sTarget {
+    fn from(file: K8sTargetFile) -> Self {
+        let mut target = Self {
+            name: file.name,
+            kubeconfig: file.kubeconfig,
+            context: file.context,
+            namespaces: Vec::new(),
+        };
+        let legacy = file.namespace.map(|name| WatchedNamespace {
+            name,
+            hidden: file.hidden,
+        });
+        for namespace in file.namespaces.into_iter().chain(legacy) {
+            target.watch(namespace);
+        }
+        target
     }
 }
 
@@ -349,6 +533,11 @@ pub enum ConfigError {
     Invalid { reason: String },
     #[error("server '{0}' already exists")]
     DuplicateServer(ServerName),
+    #[error("cluster '{cluster}' already watches {namespaces}")]
+    AlreadyWatched {
+        cluster: ServerName,
+        namespaces: String,
+    },
 }
 
 /// The settings-form fields, saved without touching the server list so
@@ -484,10 +673,14 @@ pub fn load_config_from(path: &Path) -> Result<AppConfig, ConfigError> {
             });
         }
     };
-    serde_json::from_str(&contents).map_err(|source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
+    let mut config: AppConfig =
+        serde_json::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    // The merged shape reaches the file with the next save.
+    config.merge_clusters();
+    Ok(config)
 }
 
 /// Load the config, falling back to the default on any failure. A file
@@ -585,9 +778,22 @@ mod tests {
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),
-            namespace: "default".to_string(),
-            hidden: BTreeSet::new(),
+            namespaces: vec![watched("default")],
         })
+    }
+
+    fn watched(name: &str) -> WatchedNamespace {
+        WatchedNamespace {
+            name: name.to_string(),
+            hidden: BTreeSet::new(),
+        }
+    }
+
+    fn target(server: &mut ServerConfig) -> &mut K8sTarget {
+        match server {
+            ServerConfig::K8s(target) => target,
+            ServerConfig::Ssh(_) => panic!("k8s fixture"),
+        }
     }
 
     fn deployment(name: &str) -> WorkloadRef {
@@ -600,15 +806,15 @@ mod tests {
     #[test]
     fn hidden_workloads_round_trip_and_are_omitted_when_empty() {
         let json = serde_json::to_value(k8s("prod")).expect("serialize");
-        assert!(json.get("hidden").is_none(), "{json}");
+        assert!(json["namespaces"][0].get("hidden").is_none(), "{json}");
 
         let mut server = k8s("prod");
-        if let ServerConfig::K8s(target) = &mut server {
-            target.hidden.insert(deployment("api"));
-        }
+        target(&mut server).namespaces[0]
+            .hidden
+            .insert(deployment("api"));
         let json = serde_json::to_value(&server).expect("serialize");
         assert_eq!(
-            json["hidden"],
+            json["namespaces"][0]["hidden"],
             serde_json::json!([{ "kind": "Deployment", "name": "api" }])
         );
         let back: ServerConfig = serde_json::from_value(json).expect("deserialize");
@@ -616,16 +822,16 @@ mod tests {
     }
 
     #[test]
-    fn hiding_a_workload_keeps_the_connection() {
-        let ServerConfig::K8s(before) = k8s("prod") else {
-            panic!("k8s fixture");
-        };
-        let mut hidden = before.clone();
-        hidden.hidden.insert(deployment("api"));
+    fn namespace_edits_keep_the_connection() {
+        let mut before = k8s("prod");
+        let before = target(&mut before).clone();
+        let mut edited = before.clone();
+        edited.namespaces[0].hidden.insert(deployment("api"));
+        edited.namespaces.push(watched("s3"));
         let mut moved = before.clone();
-        moved.namespace = "other".to_string();
+        moved.context = "other".to_string();
 
-        assert!(before.same_connection(&hidden));
+        assert!(before.same_connection(&edited));
         assert!(!before.same_connection(&moved));
         assert!(!k8s("prod").same_connection(&ssh("prod")));
     }
@@ -637,12 +843,149 @@ mod tests {
             ..AppConfig::default()
         };
         let mut next = previous.clone();
-        if let Some(ServerConfig::K8s(target)) = next.servers.first_mut() {
-            target.hidden.insert(deployment("api"));
-        }
+        target(&mut next.servers[0]).namespaces[0]
+            .hidden
+            .insert(deployment("api"));
 
         next.validate_change_from(&previous)
             .expect("hiding a workload on a legacy entry is allowed");
+    }
+
+    #[test]
+    fn legacy_entries_of_one_context_merge_into_the_first() {
+        let json = r#"{ "servers": [
+            { "type": "k8s", "name": "hippius", "kubeconfig": null, "context": "hp",
+              "namespace": "hippius",
+              "hidden": [{ "kind": "Deployment", "name": "api" }] },
+            { "type": "ssh", "name": "bastion", "host": "h", "user": "u", "key_path": "/k" },
+            { "type": "k8s", "name": "S3", "kubeconfig": null, "context": "hp",
+              "namespace": "s3" },
+            { "type": "k8s", "name": "other", "kubeconfig": null, "context": "elsewhere",
+              "namespace": "s3" }
+        ] }"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(&path, json).expect("write");
+
+        let config = load_config_from(&path).expect("load");
+
+        let names: Vec<&str> = config.servers.iter().map(|s| s.name().as_str()).collect();
+        assert_eq!(names, ["hippius", "bastion", "other"]);
+        let Some(ServerConfig::K8s(hippius)) = config.server("hippius") else {
+            panic!("merged cluster");
+        };
+        let namespaces: Vec<&str> = hippius.namespaces.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(namespaces, ["hippius", "s3"]);
+        assert!(hippius.namespaces[0].hidden.contains(&deployment("api")));
+        assert!(hippius.namespaces[1].hidden.is_empty());
+    }
+
+    #[test]
+    fn merging_a_namespace_watched_twice_keeps_both_hidden_sets() {
+        let mut first = k8s("a");
+        target(&mut first).namespaces[0]
+            .hidden
+            .insert(deployment("api"));
+        let mut second = k8s("b");
+        target(&mut second).namespaces[0]
+            .hidden
+            .insert(deployment("web"));
+        let mut config = AppConfig {
+            servers: vec![first, second],
+            ..AppConfig::default()
+        };
+
+        config.merge_clusters();
+
+        assert_eq!(config.servers.len(), 1);
+        let merged = target(&mut config.servers[0]);
+        assert_eq!(merged.namespaces.len(), 1);
+        assert_eq!(
+            merged.namespaces[0].hidden,
+            BTreeSet::from([deployment("api"), deployment("web")])
+        );
+    }
+
+    #[test]
+    fn adding_a_known_context_watches_its_namespace_on_that_cluster() {
+        let mut s3 = k8s("S3");
+        target(&mut s3).namespaces = vec![watched("s3")];
+        let mut staging = k8s("staging");
+        target(&mut staging).context = "stage".to_string();
+        let mut config = AppConfig {
+            servers: vec![k8s("hippius"), ssh("bastion")],
+            ..AppConfig::default()
+        };
+
+        config.add_server(s3.clone()).expect("new namespace");
+        config.add_server(staging).expect("new context");
+
+        let names: Vec<&str> = config.servers.iter().map(|s| s.name().as_str()).collect();
+        assert_eq!(names, ["hippius", "bastion", "staging"]);
+        let hippius = target(&mut config.servers[0]);
+        let namespaces: Vec<&str> = hippius.namespaces.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(namespaces, ["default", "s3"]);
+
+        let before = config.servers.clone();
+        assert!(matches!(
+            config.add_server(s3),
+            Err(ConfigError::AlreadyWatched { cluster, .. }) if cluster.as_str() == "hippius"
+        ));
+        assert_eq!(config.servers, before, "a refused add changes nothing");
+    }
+
+    #[test]
+    fn kubeconfig_paths_match_with_tilde_expanded() {
+        let home = dirs::home_dir().expect("home dir");
+        let mut short = k8s("a");
+        target(&mut short).kubeconfig = Some(PathBuf::from("~/.kube/prod"));
+        let mut long = k8s("b");
+        target(&mut long).kubeconfig = Some(home.join(".kube/prod"));
+        target(&mut long).namespaces = vec![watched("s3")];
+        let mut config = AppConfig {
+            servers: vec![short, long, k8s("default-kubeconfig")],
+            ..AppConfig::default()
+        };
+
+        config.merge_clusters();
+
+        let names: Vec<&str> = config.servers.iter().map(|s| s.name().as_str()).collect();
+        assert_eq!(names, ["a", "default-kubeconfig"]);
+    }
+
+    #[test]
+    fn legacy_namespace_already_in_the_list_is_not_watched_twice() {
+        let json = r#"{ "type": "k8s", "name": "prod", "kubeconfig": null, "context": "c",
+            "namespaces": [{ "name": "s3" }],
+            "namespace": "s3", "hidden": [{ "kind": "Deployment", "name": "api" }] }"#;
+
+        let mut server: ServerConfig = serde_json::from_str(json).expect("deserialize");
+
+        let prod = target(&mut server);
+        assert_eq!(prod.namespaces.len(), 1);
+        assert!(prod.namespaces[0].hidden.contains(&deployment("api")));
+    }
+
+    #[test]
+    fn validate_rejects_bad_namespace_lists() {
+        let mut config = AppConfig {
+            servers: vec![k8s("prod")],
+            ..AppConfig::default()
+        };
+        validate_fresh(&config).expect("valid");
+
+        for namespaces in [
+            vec![],
+            vec![watched("")],
+            vec![watched("a/b")],
+            vec![watched("s3"), watched("s3")],
+        ] {
+            target(&mut config.servers[0]).namespaces = namespaces.clone();
+            assert!(
+                matches!(validate_fresh(&config), Err(ConfigError::Invalid { .. })),
+                "{namespaces:?}"
+            );
+        }
     }
 
     #[test]
@@ -703,11 +1046,15 @@ mod tests {
         assert_eq!(json["name"], "prod");
         assert!(json["kubeconfig"].is_null());
         assert_eq!(json["context"], "ctx");
-        assert_eq!(json["namespace"], "default");
+        assert_eq!(
+            json["namespaces"],
+            serde_json::json!([{ "name": "default" }])
+        );
+        assert!(json.get("namespace").is_none());
     }
 
     #[test]
-    fn deserialize_k8s_server() {
+    fn deserialize_legacy_single_namespace_k8s_server() {
         let json = r#"{
             "type": "k8s",
             "name": "staging",
@@ -723,7 +1070,7 @@ mod tests {
         assert_eq!(target.name.as_str(), "staging");
         assert_eq!(target.kubeconfig, Some(PathBuf::from("~/.kube/staging")));
         assert_eq!(target.context, "staging-ctx");
-        assert_eq!(target.namespace, "kube-system");
+        assert_eq!(target.namespaces, [watched("kube-system")]);
     }
 
     #[test]

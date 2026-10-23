@@ -108,14 +108,15 @@ impl Backend {
     }
 
     /// Take `server` if this backend connects where it does, adopting its
-    /// hidden workloads. Any other edit means a fresh connection.
+    /// watched namespaces and hidden workloads. Any other edit means a
+    /// fresh connection.
     fn adopt(&mut self, server: &ServerConfig) -> bool {
         match (self, server) {
             (Backend::Ssh(backend), ServerConfig::Ssh(target)) => backend.target() == target,
             (Backend::K8s(backend), ServerConfig::K8s(target)) => {
                 let same = backend.target().same_connection(target);
                 if same {
-                    backend.set_hidden(target.hidden.clone());
+                    backend.set_target(target.clone());
                 }
                 same
             }
@@ -334,7 +335,7 @@ fn hide_workloads(reports: &mut [ServerReport], config: &AppConfig) {
             continue;
         };
         if let Some(ServerConfig::K8s(target)) = config.server(name.as_str()) {
-            metrics.hide(&target.hidden);
+            metrics.hide(target);
         }
     }
 }
@@ -393,17 +394,19 @@ impl Notifier {
             levels.insert(label, now);
         }
 
-        // A cluster that is online but could not list its pods says
-        // nothing about them: keep their levels so the next good listing
-        // does not re-announce every pod that is still hot.
+        // A namespace whose pods could not be listed says nothing about
+        // them: keep their levels so the next good listing does not
+        // re-announce every pod that is still hot.
         for report in reports {
-            if let ServerReport::K8s {
+            let ServerReport::K8s {
                 name,
                 health: Health::Online { metrics },
             } = report
-                && metrics.pods.is_none()
-            {
-                let prefix = format!("{name}/");
+            else {
+                continue;
+            };
+            for namespace in metrics.namespaces.iter().filter(|ns| ns.pods.is_none()) {
+                let prefix = format!("{name}/{}/", namespace.name);
                 for (label, level) in &self.levels {
                     if label.starts_with(&prefix) {
                         levels.insert(label.clone(), *level);
@@ -601,9 +604,9 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{K8sTarget, SshTarget, WorkloadRef};
-    use crate::metrics::tests::{cluster, host, make_alert, offline, pod, usage};
-    use crate::metrics::{AlertSeverity, AlertState};
+    use crate::config::{K8sTarget, SshTarget, WatchedNamespace, WorkloadRef};
+    use crate::metrics::tests::{cluster, host, make_alert, metrics_mut, offline, pod, usage};
+    use crate::metrics::{AlertSeverity, AlertState, NamespaceMetrics, PodMetrics};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -741,13 +744,16 @@ mod tests {
         assert!(pool.backoff_error(&broken).is_none(), "state was reset");
     }
 
+    /// A cluster watching `default`, with `hidden` hidden there.
     fn k8s_server(name: &str, hidden: impl IntoIterator<Item = WorkloadRef>) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),
-            namespace: "default".to_string(),
-            hidden: hidden.into_iter().collect(),
+            namespaces: vec![WatchedNamespace {
+                name: "default".to_string(),
+                hidden: hidden.into_iter().collect(),
+            }],
         })
     }
 
@@ -772,7 +778,7 @@ mod tests {
         assert!(pool.backoff_error(&hiding).is_some());
 
         let hidden_of = |backend: &Backend| match backend {
-            Backend::K8s(k8s) => k8s.target().hidden.clone(),
+            Backend::K8s(k8s) => k8s.target().namespaces[0].hidden.clone(),
             Backend::Ssh(_) => BTreeSet::from([pod_workload("not a k8s backend")]),
         };
         let mut backend = Backend::new(&server);
@@ -806,7 +812,7 @@ mod tests {
         assert!(!has_restarts(&reports));
         assert_eq!(worst_level(&reports), MetricLevel::Ok);
         let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
-        assert_eq!(labels, ["prod", "prod/db-0"]);
+        assert_eq!(labels, ["prod", "prod/default/db-0"]);
     }
 
     #[test]
@@ -855,6 +861,36 @@ mod tests {
     }
 
     #[test]
+    fn only_the_namespace_that_failed_to_list_keeps_its_pod_levels() {
+        let hot = || Some(usage(95.0, 1.0, 1.0));
+        let two_namespaces = |default: Option<Vec<PodMetrics>>, s3: Option<Vec<PodMetrics>>| {
+            let mut report = cluster("prod", usage(1.0, 1.0, 1.0), default);
+            metrics_mut(&mut report).namespaces.push(NamespaceMetrics {
+                name: "s3".to_string(),
+                pods: s3,
+            });
+            [report]
+        };
+        let mut notifier = Notifier::default();
+        let both_hot = two_namespaces(
+            Some(vec![pod("web", 0, hot())]),
+            Some(vec![pod("db", 0, hot())]),
+        );
+        assert_eq!(notifier.metric_notices(&both_hot).len(), 2);
+
+        // `default` fails to list; `s3` lists with its pod cooled down.
+        notifier.metric_notices(&two_namespaces(None, Some(vec![pod("db", 0, None)])));
+
+        let notices = notifier.metric_notices(&both_hot);
+        let titles: Vec<&str> = notices.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["prod/s3/db: CPU CRITICAL"],
+            "default's level was kept, s3's was forgotten"
+        );
+    }
+
+    #[test]
     fn metric_notices_fire_once_per_rise() {
         let mut notifier = Notifier::default();
 
@@ -890,7 +926,7 @@ mod tests {
 
         let first = notifier.metric_notices(&reports);
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].title, "prod/web: MEM CRITICAL");
+        assert_eq!(first[0].title, "prod/default/web: MEM CRITICAL");
         assert!(notifier.metric_notices(&reports).is_empty());
     }
 

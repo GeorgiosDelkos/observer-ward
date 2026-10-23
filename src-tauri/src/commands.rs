@@ -15,7 +15,7 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::sync::Notify;
 
 use crate::config::{
-    self, AppConfig, ConfigError, ConfigStore, ServerConfig, Settings, WorkloadRef,
+    self, AppConfig, ConfigError, ConfigStore, K8sTarget, ServerConfig, Settings, WorkloadRef,
 };
 use crate::error::error_chain;
 use crate::grafana::{self, GrafanaError, TokenEpoch};
@@ -43,6 +43,10 @@ pub(crate) enum CommandError {
     Terminal(#[from] TerminalError),
     #[error("server '{0}' not found")]
     UnknownServer(String),
+    #[error("cluster '{server}' does not watch namespace '{namespace}'")]
+    UnknownNamespace { server: String, namespace: String },
+    #[error("'{0}' watches no other namespace; remove the cluster instead")]
+    LastNamespace(String),
     #[error("server '{name}' is not {expected} server")]
     WrongServerKind {
         name: String,
@@ -110,6 +114,8 @@ pub(crate) async fn save_settings(
     Ok(next)
 }
 
+/// Add a server; see [`AppConfig::add_server`] for a context that is
+/// already configured.
 #[tauri::command]
 pub(crate) async fn add_server(
     store: State<'_, Arc<ConfigStore>>,
@@ -118,13 +124,39 @@ pub(crate) async fn add_server(
 ) -> CommandResult<AppConfig> {
     validate_new_server(&server).await?;
     let next = store
-        .update(|config| {
-            config.servers.push(server);
-            Ok::<_, CommandError>(())
-        })
+        .update(|config| config.add_server(server).map_err(CommandError::from))
         .await?;
     wake.0.notify_one();
     Ok(next)
+}
+
+/// Stop watching `namespace` of cluster `server`, with its hidden
+/// workloads. The last namespace is not removed: removing the cluster says
+/// that more plainly.
+#[tauri::command]
+pub(crate) async fn unwatch_namespace(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    server: String,
+    namespace: String,
+) -> CommandResult<AppConfig> {
+    let next = store
+        .update(|config| unwatch(config, server, &namespace))
+        .await?;
+    wake.0.notify_one();
+    Ok(next)
+}
+
+fn unwatch(config: &mut AppConfig, server: String, namespace: &str) -> CommandResult<()> {
+    let target = k8s_target_mut(config, &server)?;
+    if target.namespace(namespace).is_none() {
+        return Err(unknown_namespace(server, namespace));
+    }
+    if target.namespaces.len() == 1 {
+        return Err(CommandError::LastNamespace(server));
+    }
+    target.namespaces.retain(|ns| ns.name != namespace);
+    Ok(())
 }
 
 /// Reject entries the poller could never connect with (a mistyped
@@ -161,17 +193,19 @@ pub(crate) async fn remove_server(
 }
 
 /// Stop showing, counting, and raising threshold notifications for the
-/// pods of `workload` in cluster `server`. Hiding an already hidden workload is a no-op.
+/// pods of `workload` in `namespace` of cluster `server`. Hiding an
+/// already hidden workload is a no-op.
 #[tauri::command]
 pub(crate) async fn hide_workload(
     store: State<'_, Arc<ConfigStore>>,
     wake: State<'_, WakeState>,
     server: String,
+    namespace: String,
     workload: WorkloadRef,
 ) -> CommandResult<AppConfig> {
     let next = store
         .update(|config| {
-            k8s_hidden_mut(config, server)?.insert(workload);
+            hidden_mut(config, server, &namespace)?.insert(workload);
             Ok::<_, CommandError>(())
         })
         .await?;
@@ -186,11 +220,12 @@ pub(crate) async fn show_workload(
     store: State<'_, Arc<ConfigStore>>,
     wake: State<'_, WakeState>,
     server: String,
+    namespace: String,
     workload: WorkloadRef,
 ) -> CommandResult<AppConfig> {
     let next = store
         .update(|config| {
-            k8s_hidden_mut(config, server)?.remove(&workload);
+            hidden_mut(config, server, &namespace)?.remove(&workload);
             Ok::<_, CommandError>(())
         })
         .await?;
@@ -198,18 +233,35 @@ pub(crate) async fn show_workload(
     Ok(next)
 }
 
-fn k8s_hidden_mut(
-    config: &mut AppConfig,
+/// The hidden workloads of `namespace` in cluster `server`.
+fn hidden_mut<'a>(
+    config: &'a mut AppConfig,
     server: String,
-) -> CommandResult<&mut BTreeSet<WorkloadRef>> {
+    namespace: &str,
+) -> CommandResult<&'a mut BTreeSet<WorkloadRef>> {
+    let target = k8s_target_mut(config, &server)?;
+    match target.namespaces.iter_mut().find(|ns| ns.name == namespace) {
+        Some(watched) => Ok(&mut watched.hidden),
+        None => Err(unknown_namespace(server, namespace)),
+    }
+}
+
+fn k8s_target_mut<'a>(config: &'a mut AppConfig, server: &str) -> CommandResult<&'a mut K8sTarget> {
     match config
         .servers
         .iter_mut()
         .find(|s| s.name().as_str() == server)
     {
-        Some(ServerConfig::K8s(target)) => Ok(&mut target.hidden),
-        Some(ServerConfig::Ssh(_)) => Err(wrong_kind(server, "a Kubernetes")),
-        None => Err(CommandError::UnknownServer(server)),
+        Some(ServerConfig::K8s(target)) => Ok(target),
+        Some(ServerConfig::Ssh(_)) => Err(wrong_kind(server.to_string(), "a Kubernetes")),
+        None => Err(CommandError::UnknownServer(server.to_string())),
+    }
+}
+
+fn unknown_namespace(server: String, namespace: &str) -> CommandError {
+    CommandError::UnknownNamespace {
+        server,
+        namespace: namespace.to_string(),
     }
 }
 
@@ -317,11 +369,13 @@ pub(crate) async fn open_ssh_terminal(
     Ok(())
 }
 
-/// Tail the logs of `pod` on the saved cluster `server`.
+/// Tail the logs of `pod` in a namespace the saved cluster `server`
+/// watches.
 #[tauri::command]
 pub(crate) async fn open_pod_logs(
     store: State<'_, Arc<ConfigStore>>,
     server: String,
+    namespace: String,
     pod: String,
 ) -> CommandResult<()> {
     let config = store.snapshot().await;
@@ -330,7 +384,10 @@ pub(crate) async fn open_pod_logs(
         Some(ServerConfig::Ssh(_)) => return Err(wrong_kind(server, "a Kubernetes")),
         None => return Err(CommandError::UnknownServer(server)),
     };
-    terminal::run_in_terminal(&terminal::pod_logs_command(target, &pod)?)?;
+    if target.namespace(&namespace).is_none() {
+        return Err(unknown_namespace(server, &namespace));
+    }
+    terminal::run_in_terminal(&terminal::pod_logs_command(target, &namespace, &pod)?)?;
     Ok(())
 }
 
@@ -445,34 +502,56 @@ pub(crate) fn open_url(url: String) -> CommandResult<()> {
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::{CommandError, k8s_hidden_mut, open_url, validate_new_server};
-    use crate::config::{AppConfig, K8sTarget, ServerConfig, SshTarget, WorkloadRef};
+    use super::{CommandError, hidden_mut, open_url, unwatch, validate_new_server};
+    use crate::config::{
+        AppConfig, K8sTarget, ServerConfig, SshTarget, WatchedNamespace, WorkloadRef,
+    };
+
+    fn cluster(name: &str, context: &str, namespaces: &[&str]) -> ServerConfig {
+        ServerConfig::K8s(K8sTarget {
+            name: name.into(),
+            kubeconfig: None,
+            context: context.to_string(),
+            namespaces: namespaces
+                .iter()
+                .map(|ns| WatchedNamespace {
+                    name: (*ns).to_string(),
+                    hidden: BTreeSet::new(),
+                })
+                .collect(),
+        })
+    }
+
+    fn bastion() -> ServerConfig {
+        ServerConfig::Ssh(SshTarget {
+            name: "bastion".into(),
+            host: "10.0.1.50".to_string(),
+            port: 22,
+            user: "admin".to_string(),
+            key_path: PathBuf::from("/k"),
+        })
+    }
+
+    fn watched(config: &AppConfig, server: &str) -> Vec<String> {
+        match config.server(server) {
+            Some(ServerConfig::K8s(target)) => {
+                target.namespaces.iter().map(|ns| ns.name.clone()).collect()
+            }
+            other => panic!("no cluster {server}: {other:?}"),
+        }
+    }
 
     #[test]
-    fn hidden_workloads_are_edited_on_the_named_cluster_only() {
+    fn hidden_workloads_are_edited_on_the_named_namespace_only() {
         let mut config = AppConfig {
-            servers: vec![
-                ServerConfig::K8s(K8sTarget {
-                    name: "prod".into(),
-                    kubeconfig: None,
-                    context: "prod".to_string(),
-                    namespace: "default".to_string(),
-                    hidden: BTreeSet::new(),
-                }),
-                ServerConfig::Ssh(SshTarget {
-                    name: "bastion".into(),
-                    host: "10.0.1.50".to_string(),
-                    port: 22,
-                    user: "admin".to_string(),
-                    key_path: PathBuf::from("/k"),
-                }),
-            ],
+            servers: vec![cluster("prod", "prod", &["default", "s3"]), bastion()],
             ..AppConfig::default()
         };
         let api = WorkloadRef {
@@ -480,21 +559,46 @@ mod tests {
             name: "api".to_string(),
         };
 
-        k8s_hidden_mut(&mut config, "prod".to_string())
-            .expect("k8s server")
+        hidden_mut(&mut config, "prod".to_string(), "s3")
+            .expect("watched namespace")
             .insert(api.clone());
 
         let Some(ServerConfig::K8s(prod)) = config.servers.first() else {
             unreachable!("fixture order");
         };
-        assert!(prod.hidden.contains(&api));
+        assert!(prod.namespaces[0].hidden.is_empty());
+        assert!(prod.namespaces[1].hidden.contains(&api));
         assert!(matches!(
-            k8s_hidden_mut(&mut config, "bastion".to_string()),
+            hidden_mut(&mut config, "prod".to_string(), "kube-system"),
+            Err(CommandError::UnknownNamespace { .. })
+        ));
+        assert!(matches!(
+            hidden_mut(&mut config, "bastion".to_string(), "s3"),
             Err(CommandError::WrongServerKind { .. })
         ));
         assert!(matches!(
-            k8s_hidden_mut(&mut config, "nope".to_string()),
+            hidden_mut(&mut config, "nope".to_string(), "s3"),
             Err(CommandError::UnknownServer(_))
+        ));
+    }
+
+    #[test]
+    fn unwatching_keeps_at_least_one_namespace() {
+        let mut config = AppConfig {
+            servers: vec![cluster("prod", "prod", &["default", "s3"])],
+            ..AppConfig::default()
+        };
+
+        unwatch(&mut config, "prod".to_string(), "default").expect("two watched");
+
+        assert_eq!(watched(&config, "prod"), ["s3"]);
+        assert!(matches!(
+            unwatch(&mut config, "prod".to_string(), "s3"),
+            Err(CommandError::LastNamespace(_))
+        ));
+        assert!(matches!(
+            unwatch(&mut config, "prod".to_string(), "default"),
+            Err(CommandError::UnknownNamespace { .. })
         ));
     }
 
@@ -502,13 +606,10 @@ mod tests {
     async fn new_k8s_server_with_missing_kubeconfig_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("hippius1-oct.yaml");
-        let server = ServerConfig::K8s(K8sTarget {
-            name: "hippius".into(),
-            kubeconfig: Some(missing.clone()),
-            context: "hippius".to_string(),
-            namespace: "default".to_string(),
-            hidden: BTreeSet::new(),
-        });
+        let mut server = cluster("hippius", "hippius", &["default"]);
+        if let ServerConfig::K8s(target) = &mut server {
+            target.kubeconfig = Some(missing.clone());
+        }
 
         let err = validate_new_server(&server)
             .await

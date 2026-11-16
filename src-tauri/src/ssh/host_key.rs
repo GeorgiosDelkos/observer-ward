@@ -212,7 +212,8 @@ impl client::Handler for SshHandler {
     /// Security note: the first key seen for a host is trusted without
     /// out-of-band verification, so a man-in-the-middle present at the
     /// very first connection would be learned as legitimate. Every
-    /// subsequent key change for that host is rejected.
+    /// subsequent key change for that host is rejected. A host certificate
+    /// is refused; `@cert-authority` is not supported.
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "russh Handler requires async fn; known_hosts lookup is synchronous"

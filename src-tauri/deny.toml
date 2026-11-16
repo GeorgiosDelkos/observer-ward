@@ -9,12 +9,12 @@ version = 2
 # this macOS-targeted app; we cannot upgrade them independently.
 unmaintained = "workspace"
 ignore = [
-    # rsa "Marvin" timing side-channel. No fixed release exists in the
-    # ecosystem yet; rsa is pulled transitively by russh for RSA SSH key
-    # support. Impact requires a network-adjacent timing attacker against
-    # RSA host-key/auth. Re-evaluate (and remove this ignore) once the
-    # rsa crate ships a mitigated release.
-    "RUSTSEC-2023-0071",
+    # rsa "Marvin" timing side-channel, fixed in rsa 0.10.0. rsa is pulled
+    # transitively by russh for RSA SSH key support, and russh 0.65.1 pins
+    # rsa = "=0.10.0-rc.18", so the lock cannot move until russh releases
+    # against 0.10.0. Impact requires a network-adjacent timing attacker
+    # against RSA host-key/auth. Remove this ignore once russh does.
+    { id = "RUSTSEC-2023-0071", reason = "blocked by russh's exact pin on rsa 0.10.0-rc.18" },
 ]
 
 [licenses]

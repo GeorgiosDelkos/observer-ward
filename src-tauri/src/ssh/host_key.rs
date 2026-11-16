@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use russh::client;
-use russh::keys::PublicKey;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
+use russh::keys::{PublicKey, PublicKeyOrCertificate};
 
 pub(super) struct SshHandler {
     host: String,
@@ -219,9 +219,22 @@ impl client::Handler for SshHandler {
     )]
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let (host, port) = (self.host.as_str(), self.port);
+        // `client::Config::default()` offers no certificate host-key
+        // algorithms, so a server has no way to send one. Refuse it anyway:
+        // trusting a certificate needs a `@cert-authority` line, which this
+        // handler does not support, and accepting the key inside it would
+        // skip the CA check entirely.
+        let PublicKeyOrCertificate::PublicKey {
+            key: server_public_key,
+            ..
+        } = server_key
+        else {
+            tracing::warn!("{host}:{port} sent a host certificate, which is not supported");
+            return Ok(false);
+        };
         let Some(path) = self.known_hosts.as_deref() else {
             tracing::warn!("no home directory, cannot verify host key for {host}:{port}");
             return Ok(false);
@@ -276,6 +289,8 @@ fn log_rejection(check: HostKeyCheck, host: &str, port: u16) {
     reason = "panicking on failure is standard in tests"
 )]
 mod tests {
+    use russh::client::Handler;
+
     use super::*;
 
     const ED_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIDycHHcyGYpjMSjryJMZnj8VW3vMaGXrJhpx2LI77tJk";
@@ -468,6 +483,67 @@ mod tests {
         assert!(glob_match(b"[box]:2222", b"[box]:2222"));
         assert!(!names_host("!box", "box"));
         assert_eq!(known_hosts_pattern("box", 2222), "[box]:2222");
+    }
+
+    fn handler(path: PathBuf) -> SshHandler {
+        SshHandler {
+            host: "box".to_string(),
+            port: 22,
+            known_hosts: Some(path),
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_accepts_recorded_key() {
+        let (_dir, path) = known_hosts(&format!("box ssh-ed25519 {ED_A}\n"));
+        let accepted = handler(path)
+            .check_server_key(&key(ED_A).into())
+            .await
+            .expect("check runs");
+
+        assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_changed_key() {
+        let (_dir, path) = known_hosts(&format!("box ssh-ed25519 {ED_A}\n"));
+        let accepted = handler(path)
+            .check_server_key(&key(ED_B).into())
+            .await
+            .expect("check runs");
+
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_certificate_even_for_recorded_key() {
+        // Host certificate for CERT_KEY, made with
+        // `ssh-keygen -s ca -I test-host -h -n example.com -V always:forever`.
+        const CERT_KEY: &str =
+            "AAAAC3NzaC1lZDI1NTE5AAAAIK1PKLoQ/TRXU4RhvSSE8eLAMVlnv3Ksh4eCQsPZtr2A";
+        const CERT: &str = concat!(
+            "ssh-ed25519-cert-v01@openssh.com ",
+            "AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIGeCepWU94FNznI5XtrUhXwIKO5e",
+            "PVZFqK95YCTPO1RgAAAAIK1PKLoQ/TRXU4RhvSSE8eLAMVlnv3Ksh4eCQsPZtr2AAAAAAAAAAAAAAAAC",
+            "AAAACXRlc3QtaG9zdAAAAA8AAAALZXhhbXBsZS5jb20AAAAAAAAAAP//////////AAAAAAAAAAAAAAAA",
+            "AAAAMwAAAAtzc2gtZWQyNTUxOQAAACAtKEbCTErZ1ndXpvmwK3N2PZyTCQnx6uYo92UMa8kOXgAAAFMA",
+            "AAALc3NoLWVkMjU1MTkAAABAO3ZmboofDrPM/He+itUFbl8u+6BFBCC70zPMbyJEkjZnbK/136tLcY8d",
+            "ih1Wal+uk1BJH3v8cJH0PRuuIVrzAQ==",
+        );
+        let cert = russh::keys::Certificate::from_openssh(CERT).expect("test certificate parses");
+        let contents = format!("box ssh-ed25519 {CERT_KEY}\n");
+        let (_dir, path) = known_hosts(&contents);
+
+        let accepted = handler(path.clone())
+            .check_server_key(&cert.into())
+            .await
+            .expect("check runs");
+
+        assert!(!accepted);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read known_hosts"),
+            contents
+        );
     }
 
     #[test]

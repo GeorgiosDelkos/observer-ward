@@ -516,6 +516,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_learns_unknown_host() {
+        let (_dir, path) = known_hosts("");
+        let accepted = handler(path.clone())
+            .check_server_key(&key(ED_A).into())
+            .await
+            .expect("check runs");
+
+        assert!(accepted);
+        assert_eq!(
+            check_known_hosts(&path, "box", 22, &key(ED_A)),
+            HostKeyCheck::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_without_known_hosts_path() {
+        let mut handler = SshHandler {
+            host: "box".to_string(),
+            port: 22,
+            known_hosts: None,
+        };
+        let accepted = handler
+            .check_server_key(&key(ED_A).into())
+            .await
+            .expect("check runs");
+
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
     async fn handler_rejects_certificate_even_for_recorded_key() {
         // Host certificate for CERT_KEY, made with
         // `ssh-keygen -s ca -I test-host -h -n example.com -V always:forever`.

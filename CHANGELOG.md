@@ -45,6 +45,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Pods with only some containers capped showed inflated CPU/memory percentages
 - An unparseable config file could be overwritten by defaults on the next save
 
+### Security
+
+- russh 0.65.1 (was 0.60.3): fixes RUSTSEC-2026-0492 to -0495 and the moderate and low russh advisories, including GHSA-9264-jvgf-6w2f (key-exchange callback ran before the host key was checked). Host keys are checked against `known_hosts` as before; a host certificate is refused
+- crypto-bigint 0.7.11 fixes RUSTSEC-2026-0387 (secret-dependent timing in RSA and ECDSA arithmetic)
+
 ## [0.1.0] - 2026-09-18
 
 First tagged shape of the app: a macOS menu-bar dashboard for Kubernetes, SSH hosts, and Grafana alerts.

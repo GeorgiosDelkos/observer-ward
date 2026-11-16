@@ -44,7 +44,7 @@ fn classify_load_error(source: KubeconfigError, path: &str) -> K8sError {
             path: file.display().to_string(),
             source: io,
         },
-        KubeconfigError::Parse(yaml) | KubeconfigError::InvalidStructure(yaml) => {
+        KubeconfigError::Parse(yaml) => {
             let position = yaml.location().map_or_else(String::new, |at| {
                 format!(
                     " (YAML error at line {}, column {})",

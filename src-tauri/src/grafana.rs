@@ -247,7 +247,7 @@ impl GrafanaBackend {
         let client = reqwest::Client::builder()
             // verify_tls == false opts out of certificate validation for a
             // trusted self-signed instance; default config keeps it on.
-            .danger_accept_invalid_certs(!config.verify_tls)
+            .tls_danger_accept_invalid_certs(!config.verify_tls)
             .connect_timeout(Duration::from_secs(10))
             // Covers the whole exchange, body included.
             .timeout(Duration::from_secs(20))

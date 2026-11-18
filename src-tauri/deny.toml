@@ -3,19 +3,14 @@
 
 [advisories]
 version = 2
-# Only flag UNMAINTAINED crates we depend on directly. The unmaintained
-# warnings in this tree (gtk3 bindings, glib, unic-*, proc-macro-error)
-# are transitive deps of Tauri's Linux backend and are not compiled on
-# this macOS-targeted app; we cannot upgrade them independently.
+# Only flag UNMAINTAINED crates we depend on directly. The transitive ones
+# (checked 2026-11-18 with unmaintained = "all") cannot be replaced from here:
+# - proc-macro-error (via glib) and zvariant, zvariant_derive, zbus_names (via
+#   zbus 5, from keyring's Secret Service store and tauri-plugin-notification)
+#   build only for Linux, which this macOS app does not ship;
+# - chrono (RUSTSEC-2026-0543) is a wasm32-only dependency of russh-util, so
+#   it is not built here either.
 unmaintained = "workspace"
-ignore = [
-    # rsa "Marvin" timing side-channel. No fixed release exists in the
-    # ecosystem yet; rsa is pulled transitively by russh for RSA SSH key
-    # support. Impact requires a network-adjacent timing attacker against
-    # RSA host-key/auth. Re-evaluate (and remove this ignore) once the
-    # rsa crate ships a mitigated release.
-    "RUSTSEC-2023-0071",
-]
 
 [licenses]
 version = 2
@@ -44,6 +39,12 @@ confidence-threshold = 0.9
 # Build-time dependency of the GTK system-deps chain (Linux backend).
 [[licenses.exceptions]]
 crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
+# Build-time dependency of psm (stack growth for pest, via kube's
+# jsonpath-rust). It writes archives during the build and is not linked in.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 
 [bans]

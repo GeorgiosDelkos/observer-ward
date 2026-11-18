@@ -27,8 +27,7 @@ const EVENT_BUDGET: Duration = Duration::from_secs(10);
 fn event_list_params(continue_token: Option<&str>) -> ListParams {
     let params = ListParams::default()
         .fields("involvedObject.kind=Pod")
-        .limit(EVENT_PAGE_SIZE)
-        .timeout(15);
+        .limit(EVENT_PAGE_SIZE);
     match continue_token {
         Some(token) => params.continue_token(token),
         None => params,

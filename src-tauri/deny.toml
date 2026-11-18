@@ -3,19 +3,14 @@
 
 [advisories]
 version = 2
-# Only flag UNMAINTAINED crates we depend on directly. The unmaintained
-# warnings in this tree (gtk3 bindings, glib, unic-*, proc-macro-error)
-# are transitive deps of Tauri's Linux backend and are not compiled on
-# this macOS-targeted app; we cannot upgrade them independently.
+# Only flag UNMAINTAINED crates we depend on directly. The transitive ones
+# (checked 2026-11-18 with unmaintained = "all") cannot be replaced from here:
+# - proc-macro-error (via glib) and zvariant, zvariant_derive, zbus_names (via
+#   zbus in keyring's Secret Service store) build only for Linux, which this
+#   macOS app does not ship;
+# - chrono (RUSTSEC-2026-0543) comes in through russh-util and is compiled
+#   here; it goes when russh moves off it.
 unmaintained = "workspace"
-ignore = [
-    # rsa "Marvin" timing side-channel, fixed in rsa 0.10.0. rsa is pulled
-    # transitively by russh for RSA SSH key support, and russh 0.65.1 pins
-    # rsa = "=0.10.0-rc.18", so the lock cannot move until russh releases
-    # against 0.10.0. Impact requires a network-adjacent timing attacker
-    # against RSA host-key/auth. Remove this ignore once russh does.
-    { id = "RUSTSEC-2023-0071", reason = "blocked by russh's exact pin on rsa 0.10.0-rc.18" },
-]
 
 [licenses]
 version = 2
@@ -44,6 +39,12 @@ confidence-threshold = 0.9
 # Build-time dependency of the GTK system-deps chain (Linux backend).
 [[licenses.exceptions]]
 crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
+# Build-time dependency of psm (stack growth for pest, via kube's
+# jsonpath-rust). It writes archives during the build and is not linked in.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 
 [bans]

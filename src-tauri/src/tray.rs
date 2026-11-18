@@ -124,7 +124,7 @@ struct PopoverSize {
 
 /// Read the status-item rectangle from a tray click.
 ///
-/// tray-icon 0.24 reports a physical rectangle, and Tauri stores it as
+/// tray-icon 0.25 reports a physical rectangle, and Tauri stores it as
 /// `Position::Physical` / `Size::Physical`. A logical rectangle is not
 /// produced on this path. Returning `None` skips placement instead of
 /// guessing a scale factor.

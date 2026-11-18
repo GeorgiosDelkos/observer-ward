@@ -6,10 +6,10 @@ version = 2
 # Only flag UNMAINTAINED crates we depend on directly. The transitive ones
 # (checked 2026-11-18 with unmaintained = "all") cannot be replaced from here:
 # - proc-macro-error (via glib) and zvariant, zvariant_derive, zbus_names (via
-#   zbus in keyring's Secret Service store) build only for Linux, which this
-#   macOS app does not ship;
-# - chrono (RUSTSEC-2026-0543) comes in through russh-util and is compiled
-#   here; it goes when russh moves off it.
+#   zbus 5, from keyring's Secret Service store and tauri-plugin-notification)
+#   build only for Linux, which this macOS app does not ship;
+# - chrono (RUSTSEC-2026-0543) is a wasm32-only dependency of russh-util, so
+#   it is not built here either.
 unmaintained = "workspace"
 
 [licenses]

@@ -31,8 +31,13 @@ dirs = "7.0"
 # (tauri, kube) pull in their own tokio features via Cargo feature unification.
 tokio = { version = "1.54", features = ["rt", "macros", "time", "sync"] }
 russh = "0.65.2"
-# default-features = false drops kube's `ring` default: aws-lc-rs is the
-# rustls provider russh and reqwest already link, so the build carries one.
+# `aws-lc-rs` makes kube install aws-lc-rs as rustls' process default before
+# it builds a TLS config. Without it, kube's default `ring` and reqwest's
+# aws-lc-rs leave rustls with two providers and no default, and
+# `ClientConfig::builder()` panics on every connect; nothing fails at build
+# time (`k8s::tests::client_builds_with_one_crypto_provider` does).
+# default-features = false drops `ring`, so aws-lc-rs is the only provider
+# built.
 kube = { version = "5.1", default-features = false, features = [
     "client",
     "config",
@@ -41,8 +46,8 @@ kube = { version = "5.1", default-features = false, features = [
 ] }
 k8s-openapi = { version = "0.29", features = ["v1_34"] }
 http = "1"
-tauri-plugin-clipboard-manager = "2"
-tauri-plugin-notification = "2"
+tauri-plugin-clipboard-manager = "2.5"
+tauri-plugin-notification = "2.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "2"

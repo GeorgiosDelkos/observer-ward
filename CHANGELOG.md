@@ -33,7 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - kube 5.1 (was 3.0), k8s-openapi 0.29 (was 0.27) and dirs 7 (was 6). kube parses kubeconfig files with serde_saphyr instead of the deprecated serde_yaml
 - Tauri 2.12 (was 2.11), which brings tray-icon 0.25.1 and the dialog, notification, clipboard and autostart plugins up to date
 - Grafana requests use reqwest 0.13 (was 0.12), the version Tauri already links, and verify certificates against the macOS trust store instead of the bundled webpki roots, so a CA trusted in Keychain Access now works
-- rustls uses one crypto provider (aws-lc-rs) instead of ring and aws-lc-rs side by side
+- TLS (kube, Grafana) uses aws-lc-rs, which russh already links, instead of ring, so the build carries one crypto library
 - Rust toolchain pinned to 1.99.1 (was 1.98.0), which picks up the 1.98.1 fix for a vtable miscompile that crashed boxed async trait objects on aarch64-apple-darwin, and the 1.99.1 fix for x86_64 `extern "C"` functions returning `bool`
 
 ### Fixed

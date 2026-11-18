@@ -528,6 +528,10 @@ async fn fetch_node_usage(client: &Client) -> Result<HashMap<String, CpuMem>, K8
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use std::time::Duration;
 
@@ -548,6 +552,39 @@ mod tests {
         let outputs = join_ordered(futures, |index, _| Err(index)).await;
 
         assert_eq!(outputs, [Ok(0), Err(1), Ok(2)]);
+    }
+
+    /// kube builds its rustls config with `ClientConfig::builder()`, which
+    /// panics when no process default provider is installed and rustls is
+    /// built with two (kube without its `aws-lc-rs` feature keeps `ring` next
+    /// to reqwest's aws-lc-rs). Nothing fails at build time, so this builds a
+    /// real client. `Client::try_from` creates the TLS config without
+    /// connecting, so no server is needed.
+    #[tokio::test]
+    async fn client_builds_with_one_crypto_provider() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kubeconfig.yaml");
+        let kubeconfig = r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: "local"
+  cluster:
+    server: "https://127.0.0.1:1"
+users:
+- name: "local"
+  user:
+    token: "test"
+contexts:
+- name: "local"
+  context:
+    user: "local"
+    cluster: "local"
+current-context: "local"
+"#;
+        std::fs::write(&path, kubeconfig).expect("write test kubeconfig");
+
+        connect(Some(path), "local").await.expect("client builds");
     }
 
     fn backend() -> K8sBackend {

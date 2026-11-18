@@ -30,7 +30,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Grafana URLs must be https (http only for loopback), so the token never crosses the network in cleartext
 - A host key that cannot be written to `known_hosts` is refused instead of accepted unrecorded
 - CI runs the full `cargo deny check` (licenses, bans, sources, advisories)
-- kube 4.2 (was 3.0), k8s-openapi 0.28 (was 0.27) and dirs 7 (was 6). kube 4 parses kubeconfig files with serde_saphyr instead of serde_yaml
+- kube 5.1 (was 3.0), k8s-openapi 0.29 (was 0.27) and dirs 7 (was 6). kube parses kubeconfig files with serde_saphyr instead of the deprecated serde_yaml
+- Tauri 2.12 (was 2.11), which brings tray-icon 0.25.1 and the dialog, notification, clipboard and autostart plugins up to date
+- Grafana requests use reqwest 0.13 (was 0.12), the version Tauri already links, and verify certificates against the macOS trust store instead of the bundled webpki roots, so a CA trusted in Keychain Access now works
+- rustls uses one crypto provider (aws-lc-rs) instead of ring and aws-lc-rs side by side
 - Rust toolchain pinned to 1.99.1 (was 1.98.0), which picks up the 1.98.1 fix for a vtable miscompile that crashed boxed async trait objects on aarch64-apple-darwin, and the 1.99.1 fix for x86_64 `extern "C"` functions returning `bool`
 
 ### Fixed
@@ -48,8 +51,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
-- russh 0.65.1 (was 0.60.3): fixes RUSTSEC-2026-0492 to -0495 and the moderate and low russh advisories, including GHSA-9264-jvgf-6w2f (key-exchange callback ran before the host key was checked). Host keys are checked against `known_hosts` as before; a host certificate is refused
+- russh 0.65.2 (was 0.60.3): fixes RUSTSEC-2026-0492 to -0495 and the moderate and low russh advisories, including GHSA-9264-jvgf-6w2f (key-exchange callback ran before the host key was checked). Host keys are checked against `known_hosts` as before; a host certificate is refused
 - crypto-bigint 0.7.11 fixes RUSTSEC-2026-0387 (secret-dependent timing in RSA and ECDSA arithmetic)
+- rsa 0.10.0 (via russh) fixes RUSTSEC-2023-0071 (Marvin timing side-channel); its `deny.toml` ignore is gone
+- tokio 1.54 (was 1.52) fixes RUSTSEC-2026-0386 (`AsyncFd::new` violated I/O safety)
+- async-executor 1.14.1 replaces the yanked 1.14.0
 
 ## [0.1.0] - 2026-09-18
 

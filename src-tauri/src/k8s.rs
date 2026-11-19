@@ -1198,6 +1198,22 @@ current-context: "local"
         let back = backend.collect().await.expect("kubelet poll");
 
         assert_eq!(net(back), None, "one kubelet sample has no rate yet");
+
+        // Pod counters go too, not only the cluster's.
+        let start = Instant::now();
+        let sample = NetSample {
+            rx_bytes: 1,
+            tx_bytes: 1,
+            at: start,
+        };
+        let state = backend.namespaces.entry("default".to_string()).or_default();
+        state.prev_pod_net.insert("web".to_string(), sample);
+        let reading = prometheus::Reading {
+            figures: HostFigures::default(),
+            failure: None,
+        };
+        backend.host_figures(HostSource::Prometheus(reading), &["default".to_string()]);
+        assert!(backend.namespaces["default"].prev_pod_net.is_empty());
     }
 
     #[tokio::test]

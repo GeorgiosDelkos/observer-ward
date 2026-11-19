@@ -316,19 +316,17 @@ mod tests {
 
     /// The stub servers answer by metric name and never parse a query, so
     /// only a real Prometheus catches a query it would reject (a string
-    /// escape it does not accept, an operator in the wrong place). Skipped
-    /// unless [`REAL_PROMETHEUS`] is set: CI has no cluster.
+    /// escape it does not accept, an operator in the wrong place) or one
+    /// that matches nothing (a misspelled metric or label). Ignored by
+    /// default, since CI has no cluster: set [`REAL_PROMETHEUS`] and run
+    /// with `--ignored`.
     #[tokio::test]
+    #[ignore = "needs a cluster with Prometheus: set OBSERVER_WARD_TEST_PROMETHEUS"]
     async fn every_query_runs_on_a_real_prometheus() {
-        let Ok(target) = std::env::var(REAL_PROMETHEUS) else {
-            return;
-        };
-        let mut parts = target.splitn(3, '|');
-        let (Some(kubeconfig), Some(context), Some(service)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            unreachable!("{REAL_PROMETHEUS} must be <kubeconfig>|<context>|<service>");
-        };
+        let usage = "OBSERVER_WARD_TEST_PROMETHEUS is <kubeconfig>|<context>|<service>";
+        let target = std::env::var(REAL_PROMETHEUS).expect(usage);
+        let (kubeconfig, rest) = target.split_once('|').expect(usage);
+        let (context, service) = rest.split_once('|').expect(usage);
         let client = crate::k8s::connect(Some(kubeconfig.into()), context)
             .await
             .expect("client builds");
@@ -349,11 +347,16 @@ mod tests {
         for promql in queries {
             let promql = promql.replace("{namespaces}", &regex);
             let result = query_if(true, &client, &service, &promql).await;
-            assert!(
-                result.is_ok(),
-                "{promql}: {}",
-                result.map_or_else(|e| crate::error::error_chain(&e), |_| String::new())
-            );
+            let samples = result
+                .map_err(|e| format!("{promql}: {}", crate::error::error_chain(&e)))
+                .expect("Prometheus runs the query");
+            // Every cluster has nodes; watched namespaces may have no pods.
+            if [DISK_SIZE, DISK_USED, NODE_RX, NODE_TX].contains(&promql.as_str()) {
+                assert!(
+                    samples.iter().any(|s| s.label("node").is_some()),
+                    "{promql} matched no node series"
+                );
+            }
         }
     }
 

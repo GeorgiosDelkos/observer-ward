@@ -358,6 +358,19 @@ mod tests {
     }
 
     #[test]
+    fn only_finite_non_negative_values_are_bytes() {
+        let sample = |value: &str| super::Sample {
+            metric: std::collections::HashMap::new(),
+            value: (0.0, value.to_string()),
+        };
+
+        assert_eq!(sample("1.6").bytes(), Some(2));
+        for empty in ["-5", "+Inf", "NaN", "not a number"] {
+            assert_eq!(sample(empty).bytes(), None, "{empty}");
+        }
+    }
+
+    #[test]
     fn namespace_regex_escapes_for_a_raw_promql_string() {
         let names = ["default", "app.prod", "we`ird"].map(String::from);
 

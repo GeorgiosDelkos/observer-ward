@@ -1096,6 +1096,10 @@ current-context: "local"
 
         let capacity = metrics.capacity.expect("nodes are listed");
         assert_eq!(capacity.disk.capacity_bytes, 100, "only listed nodes count");
+        assert!(
+            (capacity.usage.usage.disk_percent - 60.0).abs() < 1e-9,
+            "the disk ring"
+        );
         assert_eq!(capacity.nodes[0].disk.map(|d| d.used_bytes), Some(60));
         assert_eq!(capacity.net.map(|n| n.tx_bytes_per_sec), Some(2000));
         // The claim reaches the pod through its spec.
@@ -1174,7 +1178,17 @@ current-context: "local"
         let net = |metrics: ClusterMetrics| metrics.capacity.and_then(|c| c.net);
 
         let kubelet = backend.target().clone();
-        backend.collect().await.expect("kubelet poll");
+        assert_eq!(
+            net(backend.collect().await.expect("kubelet poll")),
+            None,
+            "one sample"
+        );
+        let steady = backend.collect().await.expect("kubelet poll");
+        assert_eq!(
+            net(steady).map(|n| n.rx_bytes_per_sec),
+            Some(0),
+            "a second kubelet sample gives a rate"
+        );
         let mut prometheus = kubelet.clone();
         prometheus.prometheus = Some(prometheus_service());
         backend.set_target(prometheus);
@@ -1184,6 +1198,22 @@ current-context: "local"
         let back = backend.collect().await.expect("kubelet poll");
 
         assert_eq!(net(back), None, "one kubelet sample has no rate yet");
+    }
+
+    #[tokio::test]
+    async fn no_nodes_is_no_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, _) = serve(|_| list(""));
+        let client = connect(Some(token_kubeconfig(&dir, &url)), "ctx")
+            .await
+            .expect("client builds");
+
+        let stats = fetch_all_node_stats(&client, &[]).await;
+
+        assert!(
+            matches!(stats, StatsList::Summaries(ref s) if s.is_empty()),
+            "{stats:?}"
+        );
     }
 
     #[tokio::test]

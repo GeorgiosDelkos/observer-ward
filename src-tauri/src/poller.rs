@@ -895,6 +895,7 @@ mod tests {
     /// A cluster watching `default`, with `hidden` hidden there.
     fn k8s_server(name: &str, hidden: impl IntoIterator<Item = WorkloadRef>) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
+            prometheus: None,
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),

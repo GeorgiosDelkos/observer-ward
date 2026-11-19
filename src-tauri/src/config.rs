@@ -127,6 +127,9 @@ impl AppConfig {
                 for namespace in target.namespaces {
                     existing.watch(namespace);
                 }
+                if existing.prometheus.is_none() {
+                    existing.prometheus = target.prometheus;
+                }
             }
             None => self.servers.push(ServerConfig::K8s(target)),
         }
@@ -317,6 +320,78 @@ pub struct K8sTarget {
     pub context: String,
     /// In display order. A write keeps at least one, with unique names.
     pub namespaces: Vec<WatchedNamespace>,
+    /// Where node disk, network and PVC figures come from when set, in
+    /// place of kubelet stats (which need `nodes/proxy`). Omitted from the
+    /// file when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prometheus: Option<PrometheusService>,
+}
+
+/// A Prometheus server inside the cluster, queried through the Kubernetes
+/// API's service proxy, so it needs `get` on `services/proxy` in its
+/// namespace and nothing else. Written `namespace/service:port`, as in
+/// `monitoring/prometheus-server:80`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PrometheusService {
+    pub namespace: String,
+    pub service: String,
+    pub port: u16,
+}
+
+impl std::str::FromStr for PrometheusService {
+    type Err = ConfigError;
+
+    fn from_str(text: &str) -> Result<Self, ConfigError> {
+        let malformed = || {
+            invalid(format!(
+                "Prometheus service '{text}' must be written namespace/service:port"
+            ))
+        };
+        let (namespace, rest) = text.trim().split_once('/').ok_or_else(malformed)?;
+        let (service, port) = rest.split_once(':').ok_or_else(malformed)?;
+        // Both end up in a URL path; Kubernetes names are DNS labels.
+        let label = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 63
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        };
+        if !label(namespace) || !label(service) {
+            return Err(malformed());
+        }
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(malformed)?;
+        Ok(Self {
+            namespace: namespace.to_string(),
+            service: service.to_string(),
+            port,
+        })
+    }
+}
+
+impl TryFrom<String> for PrometheusService {
+    type Error = ConfigError;
+
+    fn try_from(text: String) -> Result<Self, ConfigError> {
+        text.parse()
+    }
+}
+
+impl From<PrometheusService> for String {
+    fn from(service: PrometheusService) -> Self {
+        service.to_string()
+    }
+}
+
+impl fmt::Display for PrometheusService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}:{}", self.namespace, self.service, self.port)
+    }
 }
 
 impl K8sTarget {
@@ -332,6 +407,8 @@ impl K8sTarget {
             kubeconfig: _,
             context: _,
             namespaces: _,
+            // Read per poll from the target, over the same connection.
+            prometheus: _,
         } = self;
         *name == other.name && self.same_cluster(other)
     }
@@ -420,6 +497,8 @@ struct K8sTargetFile {
     namespace: Option<String>,
     #[serde(default)]
     hidden: BTreeSet<WorkloadRef>,
+    #[serde(default)]
+    prometheus: Option<PrometheusService>,
 }
 
 impl From<K8sTargetFile> for K8sTarget {
@@ -429,6 +508,7 @@ impl From<K8sTargetFile> for K8sTarget {
             kubeconfig: file.kubeconfig,
             context: file.context,
             namespaces: Vec::new(),
+            prometheus: file.prometheus,
         };
         let legacy = file.namespace.map(|name| WatchedNamespace {
             name,
@@ -779,6 +859,7 @@ mod tests {
 
     fn k8s(name: &str) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
+            prometheus: None,
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),
@@ -863,7 +944,7 @@ mod tests {
               "hidden": [{ "kind": "Deployment", "name": "api" }] },
             { "type": "ssh", "name": "bastion", "host": "h", "user": "u", "key_path": "/k" },
             { "type": "k8s", "name": "S3", "kubeconfig": null, "context": "hp",
-              "namespace": "s3" },
+              "namespace": "s3", "prometheus": "monitoring/prometheus-server:80" },
             { "type": "k8s", "name": "other", "kubeconfig": null, "context": "elsewhere",
               "namespace": "s3" }
         ] }"#;
@@ -882,6 +963,61 @@ mod tests {
         assert_eq!(namespaces, ["hippius", "s3"]);
         assert!(hippius.namespaces[0].hidden.contains(&deployment("api")));
         assert!(hippius.namespaces[1].hidden.is_empty());
+        assert_eq!(
+            hippius
+                .prometheus
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("monitoring/prometheus-server:80"),
+            "the first entry had none, so the merged one keeps the other's"
+        );
+    }
+
+    #[test]
+    fn prometheus_service_parses_round_trips_and_rejects_bad_input() {
+        let service: PrometheusService = " monitoring/prometheus-server:9090 "
+            .parse()
+            .expect("valid");
+        assert_eq!(
+            (
+                service.namespace.as_str(),
+                service.service.as_str(),
+                service.port
+            ),
+            ("monitoring", "prometheus-server", 9090)
+        );
+
+        let mut server = k8s("prod");
+        target(&mut server).prometheus = Some(service);
+        let json = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(json["prometheus"], "monitoring/prometheus-server:9090");
+        let back: ServerConfig = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, server);
+        let unset = serde_json::to_value(k8s("prod")).expect("serialize");
+        assert!(
+            unset.get("prometheus").is_none(),
+            "omitted when unset: {unset}"
+        );
+
+        for bad in [
+            "",
+            "prometheus-server:80",
+            "monitoring/prometheus-server",
+            "monitoring/prometheus-server:0",
+            "monitoring/prometheus-server:http",
+            "Monitoring/prometheus-server:80",
+            "monitoring/prom/server:80",
+            "monitoring/:80",
+        ] {
+            assert!(
+                bad.parse::<PrometheusService>().is_err(),
+                "{bad:?} accepted"
+            );
+        }
+        let in_file = r#"{"type":"k8s","name":"p","kubeconfig":null,"context":"c",
+            "namespaces":[{"name":"default"}],"prometheus":"nope"}"#;
+        assert!(serde_json::from_str::<ServerConfig>(in_file).is_err());
     }
 
     #[test]

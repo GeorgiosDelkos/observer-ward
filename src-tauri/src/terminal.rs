@@ -222,6 +222,7 @@ mod tests {
 
     fn k8s_target(kubeconfig: Option<&str>) -> K8sTarget {
         K8sTarget {
+            prometheus: None,
             name: "prod".into(),
             kubeconfig: kubeconfig.map(PathBuf::from),
             context: "prod-ctx".to_string(),

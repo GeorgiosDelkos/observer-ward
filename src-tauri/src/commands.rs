@@ -235,6 +235,30 @@ pub(crate) async fn show_workload(
     Ok(next)
 }
 
+/// Read cluster `server`'s disk, network and PVC figures from the
+/// Prometheus `service` (`namespace/service:port`), or from kubelet stats
+/// again when `service` is `None` or blank.
+#[tauri::command]
+pub(crate) async fn set_prometheus(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    server: String,
+    service: Option<String>,
+) -> CommandResult<AppConfig> {
+    let service = service
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| text.parse::<config::PrometheusService>())
+        .transpose()?;
+    let next = store
+        .update(|config| {
+            k8s_target_mut(config, &server)?.prometheus = service;
+            Ok::<_, CommandError>(())
+        })
+        .await?;
+    wake.0.notify_one();
+    Ok(next)
+}
+
 /// The hidden workloads of `namespace` in cluster `server`.
 fn hidden_mut<'a>(
     config: &'a mut AppConfig,
@@ -551,6 +575,7 @@ mod tests {
 
     fn cluster(name: &str, context: &str, namespaces: &[&str]) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
+            prometheus: None,
             name: name.into(),
             kubeconfig: None,
             context: context.to_string(),

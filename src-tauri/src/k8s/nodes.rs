@@ -56,7 +56,7 @@ pub(super) fn node_totals(nodes: &[NodeMetrics]) -> NodeTotals {
 pub(super) fn node_metrics(
     nodes: &[Node],
     usage: &HashMap<String, CpuMem>,
-    disks: &HashMap<&str, Capacity>,
+    disks: &HashMap<String, Capacity>,
 ) -> Vec<NodeMetrics> {
     let mut reports: Vec<NodeMetrics> = nodes
         .iter()
@@ -238,7 +238,7 @@ mod tests {
             },
         )]);
         let disks = HashMap::from([(
-            "b",
+            "b".to_string(),
             Capacity {
                 used_bytes: 88,
                 capacity_bytes: 100,

@@ -3,8 +3,8 @@
 //!
 //! Prometheus is reached through the API server's service proxy with the
 //! cluster's own client, so it needs `get` on `services/proxy` in
-//! Prometheus's namespace and no token of its own. Each poll runs a fixed
-//! set of instant queries concurrently; Prometheus computes the rates, over
+//! Prometheus's namespace and no token of its own. Each poll runs up to
+//! eight instant queries concurrently; Prometheus computes the rates, over
 //! a 5-minute window so they span several scrapes at the common 1-minute
 //! interval.
 //!
@@ -12,9 +12,17 @@
 //! with the Kubernetes `node` name, cAdvisor's `container_network_*` with
 //! `namespace` and `pod`, and the kubelet's `kubelet_volume_stats_*` with
 //! `namespace` and `persistentvolumeclaim`. A series without those labels
-//! (a host outside the cluster) is skipped.
+//! (a host outside the cluster), or for a node the API did not list (one
+//! deleted within Prometheus's staleness window), is skipped. Each
+//! aggregation takes the `max` of duplicate series first, so a target
+//! scraped by two jobs is not counted twice.
+//!
+//! Figures follow the kubelet's definitions where they differ from the
+//! obvious query: disk used is size minus free (root-reserved blocks are
+//! not used), and pod network is the pod's `eth0`, as in the kubelet's
+//! stats summary. A host-network pod therefore has no network figure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kube::Client;
 use serde::Deserialize;
@@ -25,96 +33,130 @@ use crate::metrics::{Capacity, NetRate};
 use super::K8sError;
 use super::figures::{HostFigures, NamespaceFigures, PvcUsage};
 
-/// Root filesystems only: container overlays and tmpfs are not the disk.
+/// The root filesystem: `rootfs` is a second, initramfs entry for `/` that
+/// node-exporter can report beside the real one; overlays and tmpfs are
+/// not the disk. Size and used are computed per series before the `max`,
+/// so both come from the same filesystem.
 const DISK_SIZE: &str =
-    r#"max by (node) (node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"})"#;
-const DISK_AVAIL: &str =
-    r#"max by (node) (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"})"#;
+    r#"max by (node) (node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"})"#;
+const DISK_USED: &str = r#"max by (node) (node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"} - node_filesystem_free_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"})"#;
 
 /// Node throughput over the physical uplinks. A bond already carries its
-/// member NICs' traffic, so a node with a bond counts only its bonds (`or`
-/// keeps the left side per node); other nodes count their `en*`/`eth*`
-/// NICs. A NIC outside the bond on a bonded node is not counted.
-const NODE_RX: &str = r#"sum by (node) (rate(node_network_receive_bytes_total{device=~"bond.+"}[5m])) or sum by (node) (rate(node_network_receive_bytes_total{device=~"en.+|eth.+"}[5m]))"#;
-const NODE_TX: &str = r#"sum by (node) (rate(node_network_transmit_bytes_total{device=~"bond.+"}[5m])) or sum by (node) (rate(node_network_transmit_bytes_total{device=~"en.+|eth.+"}[5m]))"#;
+/// member NICs' traffic, so a node whose bonds carry traffic counts only
+/// those (`or` keeps the left side per node; `> 0` lets an idle leftover
+/// bond fall through to the NICs). Other nodes count their `en*`/`eth*`
+/// NICs. VLAN sub-interfaces (`bond0.100`) are excluded: their traffic is
+/// already on the parent. A NIC outside the bond on a bonded node is not
+/// counted.
+const NODE_RX: &str = r#"(sum by (node) (max by (node, device) (rate(node_network_receive_bytes_total{device=~"bond[0-9]+"}[5m]))) > 0) or sum by (node) (max by (node, device) (rate(node_network_receive_bytes_total{device=~"(en|eth)[^.]+"}[5m])))"#;
+const NODE_TX: &str = r#"(sum by (node) (max by (node, device) (rate(node_network_transmit_bytes_total{device=~"bond[0-9]+"}[5m]))) > 0) or sum by (node) (max by (node, device) (rate(node_network_transmit_bytes_total{device=~"(en|eth)[^.]+"}[5m])))"#;
 
-/// Per-namespace queries; `{namespaces}` is replaced by an anchored regex
-/// alternation of the watched namespaces.
-const POD_RX: &str = r#"sum by (namespace, pod) (rate(container_network_receive_bytes_total{namespace=~"{namespaces}"}[5m]))"#;
-const POD_TX: &str = r#"sum by (namespace, pod) (rate(container_network_transmit_bytes_total{namespace=~"{namespaces}"}[5m]))"#;
-const PVC_USED: &str = r#"max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace=~"{namespaces}"})"#;
-const PVC_CAPACITY: &str = r#"max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{namespace=~"{namespaces}"})"#;
+/// Per-namespace queries; `{namespaces}` is replaced by [`namespace_regex`]
+/// inside a raw (backtick) query string, where a backslash is a regex
+/// escape rather than a string escape.
+const POD_RX: &str = r#"max by (namespace, pod) (rate(container_network_receive_bytes_total{interface="eth0",namespace=~`{namespaces}`}[5m]))"#;
+const POD_TX: &str = r#"max by (namespace, pod) (rate(container_network_transmit_bytes_total{interface="eth0",namespace=~`{namespaces}`}[5m]))"#;
+const PVC_USED: &str = r"max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_used_bytes{namespace=~`{namespaces}`})";
+const PVC_CAPACITY: &str = r"max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{namespace=~`{namespaces}`})";
 
-/// Disk, network and PVC figures for the nodes and the watched
-/// `namespaces`, from the Prometheus at `service`. Runs eight instant
-/// queries concurrently over the cluster connection.
+/// What one poll read from Prometheus: the figures of every query that
+/// answered, and the first failure if any did not. A failed query leaves
+/// only its own figures out.
+#[derive(Debug)]
+pub(super) struct Reading {
+    pub(super) figures: HostFigures,
+    pub(super) failure: Option<K8sError>,
+}
+
+/// Disk and network figures of `nodes` and pod figures of the watched
+/// `namespaces`, from the Prometheus at `service`. Runs the node queries
+/// only when there are nodes and the namespace queries only when there are
+/// namespaces, concurrently over the cluster connection.
 ///
-/// # Errors
-///
-/// [`K8sError::QueryPrometheus`] when a query cannot be sent or Prometheus
-/// rejects it (no `services/proxy` permission, no such service).
+/// A query fails with [`K8sError::QueryPrometheus`] when it cannot be sent
+/// or Prometheus answers with an error (no `services/proxy` permission, no
+/// such service, a query it cannot parse), and with
+/// [`K8sError::BuildPrometheusRequest`] when the request cannot be built.
 pub(super) async fn host_figures(
     client: &Client,
     service: &PrometheusService,
+    nodes: &[String],
     namespaces: &[String],
-) -> Result<HostFigures, K8sError> {
+) -> Reading {
     let watched = namespace_regex(namespaces);
     let per_namespace = |query: &str| query.replace("{namespaces}", &watched);
     let (pod_rx, pod_tx) = (per_namespace(POD_RX), per_namespace(POD_TX));
     let (pvc_used, pvc_capacity) = (per_namespace(PVC_USED), per_namespace(PVC_CAPACITY));
+    let node_query = |promql| query_if(!nodes.is_empty(), client, service, promql);
+    let namespace_query = |promql| query_if(!watched.is_empty(), client, service, promql);
 
-    let (disk_size, disk_avail, node_rx, node_tx, pod_rx, pod_tx, pvc_used, pvc_capacity) = tokio::join!(
-        query(client, service, DISK_SIZE),
-        query(client, service, DISK_AVAIL),
-        query(client, service, NODE_RX),
-        query(client, service, NODE_TX),
-        query(client, service, &pod_rx),
-        query(client, service, &pod_tx),
-        query(client, service, &pvc_used),
-        query(client, service, &pvc_capacity),
+    let (disk_size, disk_used, node_rx, node_tx, pod_rx, pod_tx, pvc_used, pvc_capacity) = tokio::join!(
+        node_query(DISK_SIZE),
+        node_query(DISK_USED),
+        node_query(NODE_RX),
+        node_query(NODE_TX),
+        namespace_query(&pod_rx),
+        namespace_query(&pod_tx),
+        namespace_query(&pvc_used),
+        namespace_query(&pvc_capacity),
     );
 
+    let mut failure = None;
+    let mut answered = |result: Result<Vec<Sample>, K8sError>| {
+        result.unwrap_or_else(|e| {
+            failure.get_or_insert(e);
+            Vec::new()
+        })
+    };
+    let listed: HashSet<&str> = nodes.iter().map(String::as_str).collect();
+    let per_node = |samples: &[Sample]| {
+        let listed_samples = samples
+            .iter()
+            .filter(|s| s.label("node").is_some_and(|node| listed.contains(node)));
+        by_label(listed_samples, "node")
+    };
+    let node_disks = capacities(
+        &per_node(&answered(disk_used)),
+        &per_node(&answered(disk_size)),
+    );
+    let node_net = rates(&per_node(&answered(node_rx)), &per_node(&answered(node_tx)));
+    let (pod_rx, pod_tx) = (answered(pod_rx), answered(pod_tx));
+    let (pvc_used, pvc_capacity) = (answered(pvc_used), answered(pvc_capacity));
+
     let mut figures = HostFigures {
-        node_disks: disks(
-            &by_label(&disk_size?, "node"),
-            &by_label(&disk_avail?, "node"),
-        ),
-        cluster_net: cluster_net(&node_rx?, &node_tx?),
+        node_disks,
+        cluster_net: total(&node_net),
         namespaces: HashMap::new(),
     };
-    let (pod_rx, pod_tx) = (pod_rx?, pod_tx?);
-    let (pvc_used, pvc_capacity) = (pvc_used?, pvc_capacity?);
     for namespace in namespaces {
         let in_namespace = |samples: &[Sample], key: &str| {
-            let samples: Vec<&Sample> = samples
+            let here = samples
                 .iter()
-                .filter(|s| s.label("namespace") == Some(namespace.as_str()))
-                .collect();
-            by_label_refs(&samples, key)
+                .filter(|s| s.label("namespace") == Some(namespace.as_str()));
+            by_label(here, key)
         };
-        let rx = in_namespace(&pod_rx, "pod");
-        let tx = in_namespace(&pod_tx, "pod");
-        let used = in_namespace(&pvc_used, "persistentvolumeclaim");
-        let capacity = in_namespace(&pvc_capacity, "persistentvolumeclaim");
+        let pod_net = rates(&in_namespace(&pod_rx, "pod"), &in_namespace(&pod_tx, "pod"));
+        let claims = capacities(
+            &in_namespace(&pvc_used, "persistentvolumeclaim"),
+            &in_namespace(&pvc_capacity, "persistentvolumeclaim"),
+        );
         figures.namespaces.insert(
             namespace.clone(),
             NamespaceFigures {
-                pod_net: rates(&rx, &tx),
-                pvc: PvcUsage::ByClaim(claims(&used, &capacity)),
+                pod_net,
+                pvc: PvcUsage::ByClaim(claims),
             },
         );
     }
-    Ok(figures)
+    Reading { figures, failure }
 }
 
-/// An instant query's result: one value per series.
+/// An instant query's result: one value per series. Prometheus reports a
+/// failed query with an error status, which kube turns into an error before
+/// this is parsed.
 #[derive(Debug, Deserialize)]
 struct QueryResponse {
-    status: String,
-    #[serde(default)]
-    data: Option<QueryData>,
-    #[serde(default)]
-    error: Option<String>,
+    data: QueryData,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,12 +191,16 @@ impl Sample {
     }
 }
 
-/// Run one instant query through the service proxy.
-async fn query(
+/// Run `promql` when `wanted`; otherwise answer with no series.
+async fn query_if(
+    wanted: bool,
     client: &Client,
     service: &PrometheusService,
     promql: &str,
 ) -> Result<Vec<Sample>, K8sError> {
+    if !wanted {
+        return Ok(Vec::new());
+    }
     let encoded: String = url::form_urlencoded::byte_serialize(promql.as_bytes()).collect();
     let path = format!(
         "/api/v1/namespaces/{}/services/{}:{}/proxy/api/v1/query?query={encoded}",
@@ -171,21 +217,18 @@ async fn query(
                 service: service.to_string(),
                 source: Box::new(source),
             })?;
-    if response.status != "success" {
-        return Err(K8sError::PrometheusRejected {
-            service: service.to_string(),
-            message: response.error.unwrap_or(response.status),
-        });
-    }
-    Ok(response.data.map(|data| data.result).unwrap_or_default())
+    Ok(response.data.result)
 }
 
-/// `a|b` alternation of `namespaces` for a regex label matcher (`=~`),
-/// with regex metacharacters escaped. Prometheus anchors such matchers
-/// itself.
+/// `a|b` alternation of `namespaces` for a regex label matcher inside a raw
+/// (backtick) query string, with regex metacharacters backslash-escaped.
+/// Prometheus anchors such matchers itself. A name containing a backtick
+/// cannot be written in a raw string and is left out; Kubernetes names
+/// never contain one.
 fn namespace_regex(namespaces: &[String]) -> String {
     let escaped: Vec<String> = namespaces
         .iter()
+        .filter(|namespace| !namespace.contains('`'))
         .map(|namespace| {
             namespace
                 .chars()
@@ -199,48 +242,26 @@ fn namespace_regex(namespaces: &[String]) -> String {
     escaped.join("|")
 }
 
-fn by_label(samples: &[Sample], key: &str) -> HashMap<String, u64> {
-    let refs: Vec<&Sample> = samples.iter().collect();
-    by_label_refs(&refs, key)
-}
-
 /// Each sample's value keyed by its `key` label; samples without the label
 /// or with no usable value are skipped.
-fn by_label_refs(samples: &[&Sample], key: &str) -> HashMap<String, u64> {
+fn by_label<'s>(samples: impl Iterator<Item = &'s Sample>, key: &str) -> HashMap<String, u64> {
     samples
-        .iter()
         .filter_map(|sample| Some((sample.label(key)?.to_string(), sample.bytes()?)))
         .collect()
 }
 
-/// Capacity per key from sizes and available bytes; a key needs both.
-fn disks(size: &HashMap<String, u64>, avail: &HashMap<String, u64>) -> HashMap<String, Capacity> {
-    size.iter()
-        .filter_map(|(key, &capacity_bytes)| {
-            let avail = *avail.get(key)?;
-            Some((
-                key.clone(),
-                Capacity {
-                    used_bytes: capacity_bytes.saturating_sub(avail),
-                    capacity_bytes,
-                },
-            ))
-        })
-        .collect()
-}
-
-/// Capacity per claim from used and capacity bytes; a claim needs both.
-fn claims(
+/// Capacity per key from used and capacity bytes; a key needs both.
+fn capacities(
     used: &HashMap<String, u64>,
     capacity: &HashMap<String, u64>,
 ) -> HashMap<String, Capacity> {
     used.iter()
-        .filter_map(|(claim, &used_bytes)| {
+        .filter_map(|(key, &used_bytes)| {
             Some((
-                claim.clone(),
+                key.clone(),
                 Capacity {
                     used_bytes,
-                    capacity_bytes: *capacity.get(claim)?,
+                    capacity_bytes: *capacity.get(key)?,
                 },
             ))
         })
@@ -262,9 +283,9 @@ fn rates(rx: &HashMap<String, u64>, tx: &HashMap<String, u64>) -> HashMap<String
         .collect()
 }
 
-/// All nodes' throughput together, or `None` when no node reported both.
-fn cluster_net(rx: &[Sample], tx: &[Sample]) -> Option<NetRate> {
-    let per_node = rates(&by_label(rx, "node"), &by_label(tx, "node"));
+/// All nodes' throughput together, or `None` when no node reported both
+/// directions.
+fn total(per_node: &HashMap<String, NetRate>) -> Option<NetRate> {
     (!per_node.is_empty()).then(|| {
         per_node
             .values()
@@ -273,4 +294,21 @@ fn cluster_net(rx: &[Sample], tx: &[Sample]) -> Option<NetRate> {
                 tx_bytes_per_sec: total.tx_bytes_per_sec.saturating_add(node.tx_bytes_per_sec),
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::namespace_regex;
+
+    #[test]
+    fn namespace_regex_escapes_for_a_raw_promql_string() {
+        let names = ["default", "app.prod", "we`ird"].map(String::from);
+
+        assert_eq!(namespace_regex(&names), r"default|app\.prod");
+        assert_eq!(
+            namespace_regex(&[]),
+            "",
+            "no namespaces, no namespace queries"
+        );
+    }
 }

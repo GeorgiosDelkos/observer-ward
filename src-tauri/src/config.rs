@@ -330,13 +330,15 @@ pub struct K8sTarget {
 /// A Prometheus server inside the cluster, queried through the Kubernetes
 /// API's service proxy, so it needs `get` on `services/proxy` in its
 /// namespace and nothing else. Written `namespace/service:port`, as in
-/// `monitoring/prometheus-server:80`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+/// `monitoring/prometheus-server:80`; the port may be a number or the
+/// service's port name (`monitoring/prometheus-k8s:web`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "String")]
 pub struct PrometheusService {
     pub namespace: String,
     pub service: String,
-    pub port: u16,
+    /// A number from 1 to 65535, or a port name.
+    pub port: String,
 }
 
 impl std::str::FromStr for PrometheusService {
@@ -345,40 +347,31 @@ impl std::str::FromStr for PrometheusService {
     fn from_str(text: &str) -> Result<Self, ConfigError> {
         let malformed = || {
             invalid(format!(
-                "Prometheus service '{text}' must be written namespace/service:port"
+                "Prometheus service '{text}' must be namespace/service:port, with \
+                 lowercase names of letters, digits and '-', and a port number or name"
             ))
         };
         let (namespace, rest) = text.trim().split_once('/').ok_or_else(malformed)?;
         let (service, port) = rest.split_once(':').ok_or_else(malformed)?;
-        // Both end up in a URL path; Kubernetes names are DNS labels.
-        let label = |name: &str| {
-            !name.is_empty()
-                && name.len() <= 63
+        // All three end up in a URL path. Kubernetes names are DNS labels
+        // of at most 63 characters; a port name is at most 15 and has a
+        // letter, so it is never mistaken for a number.
+        let label = |name: &str, max: usize| {
+            (1..=max).contains(&name.len())
                 && name
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         };
-        if !label(namespace) || !label(service) {
+        let numbered = port.parse::<u16>().is_ok_and(|number| number > 0);
+        let named = label(port, 15) && port.bytes().any(|b| b.is_ascii_lowercase());
+        if !label(namespace, 63) || !label(service, 63) || !(numbered || named) {
             return Err(malformed());
         }
-        let port = port
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port > 0)
-            .ok_or_else(malformed)?;
         Ok(Self {
             namespace: namespace.to_string(),
             service: service.to_string(),
-            port,
+            port: port.to_string(),
         })
-    }
-}
-
-impl TryFrom<String> for PrometheusService {
-    type Error = ConfigError;
-
-    fn try_from(text: String) -> Result<Self, ConfigError> {
-        text.parse()
     }
 }
 
@@ -497,8 +490,10 @@ struct K8sTargetFile {
     namespace: Option<String>,
     #[serde(default)]
     hidden: BTreeSet<WorkloadRef>,
+    /// Parsed in `From<K8sTargetFile>`, where a bad value is dropped
+    /// rather than failing the file.
     #[serde(default)]
-    prometheus: Option<PrometheusService>,
+    prometheus: Option<String>,
 }
 
 impl From<K8sTargetFile> for K8sTarget {
@@ -508,8 +503,17 @@ impl From<K8sTargetFile> for K8sTarget {
             kubeconfig: file.kubeconfig,
             context: file.context,
             namespaces: Vec::new(),
-            prometheus: file.prometheus,
+            prometheus: None,
         };
+        // A hand-edited typo in this optional field must not cost the whole
+        // config: a file that fails to parse is set aside for defaults.
+        target.prometheus = file.prometheus.and_then(|text| {
+            text.parse()
+                .inspect_err(|e| {
+                    tracing::warn!("ignoring the Prometheus service of {}: {e}", target.name);
+                })
+                .ok()
+        });
         let legacy = file.namespace.map(|name| WatchedNamespace {
             name,
             hidden: file.hidden,
@@ -983,10 +987,12 @@ mod tests {
             (
                 service.namespace.as_str(),
                 service.service.as_str(),
-                service.port
+                service.port.as_str()
             ),
-            ("monitoring", "prometheus-server", 9090)
+            ("monitoring", "prometheus-server", "9090")
         );
+        let named: PrometheusService = "monitoring/prometheus-k8s:web".parse().expect("named port");
+        assert_eq!(named.port, "web");
 
         let mut server = k8s("prod");
         target(&mut server).prometheus = Some(service);
@@ -1005,7 +1011,9 @@ mod tests {
             "prometheus-server:80",
             "monitoring/prometheus-server",
             "monitoring/prometheus-server:0",
-            "monitoring/prometheus-server:http",
+            "monitoring/prometheus-server:65536",
+            "monitoring/prometheus-server:HTTP",
+            "monitoring/prometheus-server:a-port-name-too-long",
             "Monitoring/prometheus-server:80",
             "monitoring/prom/server:80",
             "monitoring/:80",
@@ -1015,9 +1023,11 @@ mod tests {
                 "{bad:?} accepted"
             );
         }
+        // A typo in the file drops the field, not the config.
         let in_file = r#"{"type":"k8s","name":"p","kubeconfig":null,"context":"c",
             "namespaces":[{"name":"default"}],"prometheus":"nope"}"#;
-        assert!(serde_json::from_str::<ServerConfig>(in_file).is_err());
+        let server: ServerConfig = serde_json::from_str(in_file).expect("server kept");
+        assert_eq!(target(&mut server.clone()).prometheus, None);
     }
 
     #[test]

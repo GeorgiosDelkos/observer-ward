@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- A cluster can read node disk, node and pod network, and PVC usage from a Prometheus inside it (`prometheus: "namespace/service:port"` on the cluster, set from the cluster menu with "Prometheus…" or the `set_prometheus` command), through the API server's service proxy. It needs `services/proxy` in that namespace instead of `nodes/proxy`
+- A cluster can read node disk, node and pod network, and PVC usage from a Prometheus inside it (`prometheus: "namespace/service:port"` on the cluster, the port a number or a name, set from the cluster menu with "Prometheus…" or the `set_prometheus` command), through the API server's service proxy. It needs `services/proxy` in that namespace instead of `nodes/proxy`. A malformed value in the file is ignored with a warning, not a reason to set the config aside
 - Night Glass popover: overview (attention list, cluster rings with requested capacity, node matrix, namespace rows, hosts), cluster page (sparkline history, nodes with conditions and their pods, namespaces), and namespace page (pods grouped by workload with a ready count); native macOS blur behind the window, bundled Geist fonts
 - Add form picks namespaces from the cluster (`list_namespaces` command) and can watch another namespace of an existing cluster
 - UI unit tests for the model and formatting, run in CI with `node --test`

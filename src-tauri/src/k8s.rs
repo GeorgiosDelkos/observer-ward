@@ -138,7 +138,7 @@ struct NamespaceState {
 /// Where a poll's disk, network and PVC figures came from, before they are
 /// turned into [`HostFigures`].
 enum HostSource {
-    Prometheus(Result<HostFigures, K8sError>),
+    Prometheus(prometheus::Reading),
     Kubelet(StatsList),
     /// No Prometheus is set and kubelet stats are refused or have no nodes.
     Unavailable,
@@ -166,9 +166,15 @@ impl K8sBackend {
     }
 
     /// Take an edited target for the same cluster (see
-    /// [`K8sTarget::same_connection`]): watched namespaces and hidden
-    /// workloads may change without a new connection.
+    /// [`K8sTarget::same_connection`]): watched namespaces, hidden
+    /// workloads and the Prometheus service may change without a new
+    /// connection. A new Prometheus service starts afresh: its failures are
+    /// logged again, and kubelet stats are tried again when it is cleared.
     pub(crate) fn set_target(&mut self, target: K8sTarget) {
+        if target.prometheus != self.target.prometheus {
+            self.prometheus_failing = false;
+            self.refused.stats = false;
+        }
         self.target = target;
     }
 
@@ -273,9 +279,12 @@ impl K8sBackend {
     /// those were refused before.
     async fn fetch_host(&self, client: &Client, nodes: &[Node], watched: &[String]) -> HostSource {
         if let Some(service) = &self.target.prometheus {
-            return HostSource::Prometheus(
-                prometheus::host_figures(client, service, watched).await,
-            );
+            let names: Vec<String> = nodes
+                .iter()
+                .filter_map(|n| n.metadata.name.clone())
+                .collect();
+            let reading = prometheus::host_figures(client, service, &names, watched).await;
+            return HostSource::Prometheus(reading);
         }
         if self.refused.stats || nodes.is_empty() {
             return HostSource::Unavailable;
@@ -285,23 +294,30 @@ impl K8sBackend {
 
     /// Turn what [`Self::fetch_host`] read into this poll's figures: rates
     /// from kubelet counters against the last poll's, and a refusal or a
-    /// Prometheus failure logged once and treated as no figures.
+    /// Prometheus failure logged once. Kubelet counters are dropped on any
+    /// other source, so a later kubelet poll does not average over the gap.
     fn host_figures(&mut self, source: HostSource, watched: &[String]) -> HostFigures {
-        match source {
-            HostSource::Prometheus(Ok(figures)) => {
-                self.prometheus_failing = false;
-                figures
+        if !matches!(source, HostSource::Kubelet(StatsList::Summaries(_))) {
+            self.prev_net = None;
+            for state in self.namespaces.values_mut() {
+                state.prev_pod_net.clear();
             }
-            HostSource::Prometheus(Err(e)) => {
-                if !self.prometheus_failing {
-                    tracing::warn!(
-                        "no disk or network figures for {}: {}",
-                        self.target.name,
-                        crate::error::error_chain(&e)
-                    );
-                    self.prometheus_failing = true;
+        }
+        match source {
+            HostSource::Prometheus(prometheus::Reading { figures, failure }) => {
+                match failure {
+                    None => self.prometheus_failing = false,
+                    Some(e) if !self.prometheus_failing => {
+                        tracing::warn!(
+                            "missing disk or network figures for {}: {}",
+                            self.target.name,
+                            crate::error::error_chain(&e)
+                        );
+                        self.prometheus_failing = true;
+                    }
+                    Some(_) => {}
                 }
-                HostFigures::default()
+                figures
             }
             HostSource::Kubelet(StatsList::Summaries(stats)) => {
                 self.kubelet_figures(&stats, watched)
@@ -897,14 +913,23 @@ current-context: "local"
 
     /// Answers for a Prometheus with node `n1` and pod `default/web`
     /// mounting claim `data`, plus series that must be ignored: a host
-    /// outside the cluster and a pod in an unwatched namespace.
+    /// outside the cluster, a deleted node and a pod in an unwatched
+    /// namespace. Matched by the first metric name a query contains, so the
+    /// disk-used query (size minus free) is matched by `free` first.
     fn prometheus_route(request: &str) -> (String, String) {
         let answers: [(&str, &[(&str, &str)]); 8] = [
             (
-                "node_filesystem_size_bytes",
-                &[(r#""node":"n1""#, "100"), ("", "5")],
+                "node_filesystem_free_bytes",
+                &[(r#""node":"n1""#, "60"), (r#""node":"old-worker""#, "1")],
             ),
-            ("node_filesystem_avail_bytes", &[(r#""node":"n1""#, "40")]),
+            (
+                "node_filesystem_size_bytes",
+                &[
+                    (r#""node":"n1""#, "100"),
+                    (r#""node":"old-worker""#, "500"),
+                    ("", "5"),
+                ],
+            ),
             ("node_network_receive", &[(r#""node":"n1""#, "1000.4")]),
             ("node_network_transmit", &[(r#""node":"n1""#, "2000")]),
             (
@@ -953,10 +978,16 @@ current-context: "local"
             .await
             .expect("client builds");
 
-        let figures =
-            prometheus::host_figures(&client, &prometheus_service(), &["default".to_string()])
-                .await
-                .expect("figures");
+        let reading = prometheus::host_figures(
+            &client,
+            &prometheus_service(),
+            &["n1".to_string()],
+            &["default".to_string()],
+        )
+        .await;
+
+        assert!(reading.failure.is_none(), "{:?}", reading.failure);
+        let figures = reading.figures;
 
         let disk = Capacity {
             used_bytes: 60,
@@ -991,23 +1022,53 @@ current-context: "local"
                 .all(|r| r.contains("/namespaces/monitoring/services/prometheus-server:80/proxy/")),
             "{seen:?}"
         );
+        // The pod and PVC queries name the watched namespace, URL-encoded
+        // as `namespace=~` followed by a backtick-quoted `default`.
+        let matcher = "namespace%3D%7E%60default%60";
+        let scoped = seen.iter().filter(|r| r.contains(matcher)).count();
+        assert_eq!(scoped, 4, "{seen:?}");
     }
 
     #[tokio::test]
-    async fn a_rejected_prometheus_query_is_an_error() {
+    async fn a_rejected_query_loses_only_its_own_figures() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (url, _) = serve(|_| {
-            let body = r#"{"status":"error","errorType":"bad_data","error":"parse error"}"#;
-            ("400 Bad Request".to_string(), body.to_string())
+        let (url, _) = serve(|request| {
+            if request.contains("kubelet_volume_stats") {
+                let body = r#"{"status":"error","errorType":"bad_data","error":"parse error"}"#;
+                ("400 Bad Request".to_string(), body.to_string())
+            } else {
+                prometheus_route(request)
+            }
         });
         let client = connect(Some(token_kubeconfig(&dir, &url)), "ctx")
             .await
             .expect("client builds");
 
-        let result = prometheus::host_figures(&client, &prometheus_service(), &[]).await;
+        let reading = prometheus::host_figures(
+            &client,
+            &prometheus_service(),
+            &["n1".to_string()],
+            &["default".to_string()],
+        )
+        .await;
 
-        assert!(result.is_err(), "a 400 with an error body is not figures");
+        assert!(
+            matches!(&reading.failure, Some(K8sError::QueryPrometheus { service, .. })
+                if service == "monitoring/prometheus-server:80"),
+            "{:?}",
+            reading.failure
+        );
+        assert_eq!(reading.figures.node_disks.len(), 1, "node disks still read");
+        let default = &reading.figures.namespaces["default"];
+        assert_eq!(default.pod_net.len(), 1, "pod network still read");
+        assert!(matches!(&default.pvc, PvcUsage::ByClaim(claims) if claims.is_empty()));
     }
+
+    /// Pod `web` in `default`, mounting claim `data`.
+    const WEB_POD: &str = r#"{"metadata":{"name":"web","namespace":"default"},
+        "spec":{"containers":[{"name":"c"}],
+            "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"data"}}]},
+        "status":{"phase":"Running"}}"#;
 
     /// One node, `n1`, with allocatable capacity.
     const NODE_LIST: &str =
@@ -1021,6 +1082,8 @@ current-context: "local"
                 prometheus_route(request)
             } else if request.contains(" /api/v1/nodes") {
                 list(NODE_LIST)
+            } else if request.contains(" /api/v1/namespaces/default/pods") {
+                list(WEB_POD)
             } else {
                 list("")
             }
@@ -1032,9 +1095,13 @@ current-context: "local"
         let metrics = backend.collect().await.expect("collects");
 
         let capacity = metrics.capacity.expect("nodes are listed");
-        assert_eq!(capacity.disk.capacity_bytes, 100);
+        assert_eq!(capacity.disk.capacity_bytes, 100, "only listed nodes count");
         assert_eq!(capacity.nodes[0].disk.map(|d| d.used_bytes), Some(60));
         assert_eq!(capacity.net.map(|n| n.tx_bytes_per_sec), Some(2000));
+        // The claim reaches the pod through its spec.
+        let pods = metrics.namespaces[0].pods.as_deref().expect("pods listed");
+        assert_eq!(pods[0].pvc.map(|c| c.capacity_bytes), Some(30));
+        assert_eq!(pods[0].net.map(|n| n.rx_bytes_per_sec), Some(10));
         let seen = seen.lock().expect("stub log lock");
         assert!(
             !seen.iter().any(|r| r.contains("/stats/summary")),
@@ -1066,9 +1133,48 @@ current-context: "local"
             );
         }
 
+        let stats_requests = || {
+            let seen = seen.lock().expect("stub log lock");
+            seen.iter().filter(|r| r.contains("/stats/summary")).count()
+        };
+        assert_eq!(stats_requests(), 1);
+
+        // Setting Prometheus and clearing it again, as after `nodes/proxy`
+        // was granted, tries kubelet stats again without a reconnect.
+        let mut with_prometheus = backend.target().clone();
+        with_prometheus.prometheus = Some(prometheus_service());
+        backend.set_target(with_prometheus);
+        let mut cleared = backend.target().clone();
+        cleared.prometheus = None;
+        backend.set_target(cleared);
+        backend.collect().await.expect("collects");
+        assert_eq!(stats_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn stats_are_retried_when_a_refusal_comes_with_other_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, seen) = serve(|request| {
+            if request.contains("/nodes/n1/proxy/stats/summary") {
+                failure("403 Forbidden")
+            } else if request.contains("/stats/summary") {
+                failure("500 Internal Server Error")
+            } else if request.contains(" /api/v1/nodes") {
+                list(&format!("{NODE_LIST},{}", NODE_LIST.replace("n1", "n2")))
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+
+        for _ in 0..2 {
+            backend.collect().await.expect("collects without stats");
+        }
+
         let seen = seen.lock().expect("stub log lock");
         let stats_requests = seen.iter().filter(|r| r.contains("/stats/summary")).count();
-        assert_eq!(stats_requests, 1, "{seen:?}");
+        assert_eq!(stats_requests, 4, "a down node is not a refusal: {seen:?}");
     }
 
     #[tokio::test]

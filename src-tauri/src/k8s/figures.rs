@@ -57,8 +57,8 @@ impl Default for PvcUsage {
 }
 
 /// Throughput per key between two sets of cumulative counters. A key
-/// missing from `prev`, or whose counters went backwards (a restart), has
-/// no rate.
+/// missing from `prev` has no rate; one whose counters went backwards (a
+/// restart) reads 0 for that poll, as `NetSample::rate_since` gives.
 pub(super) fn rates_since(
     now: &HashMap<String, NetSample>,
     prev: &HashMap<String, NetSample>,

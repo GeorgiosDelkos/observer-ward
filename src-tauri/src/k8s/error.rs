@@ -48,8 +48,6 @@ pub(crate) enum K8sError {
         #[source]
         source: Box<kube::Error>,
     },
-    #[error("Prometheus {service} rejected a query: {message}")]
-    PrometheusRejected { service: String, message: String },
     /// The kubeconfig's exec credential plugin ran and failed, with what it printed to
     /// stderr. Stands in for kube's error, whose message dumps the command's environment.
     #[error("credential plugin failed: {detail}")]

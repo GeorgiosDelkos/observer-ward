@@ -254,7 +254,8 @@ pub(super) async fn fetch_node_stats(
 /// Kubelet stats of a poll's nodes.
 #[derive(Debug)]
 pub(super) enum StatsList {
-    /// The nodes that answered; one that failed is logged and left out.
+    /// The nodes that answered. One that refused is left out silently,
+    /// one that failed otherwise is logged and left out.
     Summaries(Vec<StatsSummary>),
     /// Every node refused (no `nodes/proxy` permission); nothing logged.
     Forbidden,
@@ -264,8 +265,9 @@ pub(super) enum StatsList {
 ///
 /// Nodes are fetched concurrently. Individual node failures are logged and
 /// skipped rather than aborting the entire operation, except refusals: when
-/// no node answers and some refused, the result is [`StatsList::Forbidden`]
-/// for the caller to report once.
+/// every node refused, the result is [`StatsList::Forbidden`] for the
+/// caller to report once. Refusals mixed with other failures (nodes that
+/// are down) are not a verdict, so the next poll tries again.
 pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> StatsList {
     let mut tasks = JoinSet::new();
 
@@ -284,14 +286,15 @@ pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Sta
         });
     }
 
+    let tasks_spawned = tasks.len();
     let mut summaries = Vec::with_capacity(nodes.len());
-    let mut refused = false;
+    let mut refused = 0_usize;
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok(Ok(summary)) => summaries.push(summary),
             Ok(Err(K8sError::FetchNodeStats { source, .. })) if matches!(&*source, kube::Error::Api(status) if status.is_forbidden()) =>
             {
-                refused = true;
+                refused += 1;
             }
             Ok(Err(e)) => {
                 tracing::warn!("skipping node stats: {}", crate::error::error_chain(&e));
@@ -302,7 +305,7 @@ pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Sta
         }
     }
 
-    if summaries.is_empty() && refused {
+    if refused > 0 && refused == tasks_spawned {
         return StatsList::Forbidden;
     }
     StatsList::Summaries(summaries)

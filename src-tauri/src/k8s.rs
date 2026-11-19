@@ -1152,6 +1152,41 @@ current-context: "local"
     }
 
     #[tokio::test]
+    async fn kubelet_rates_restart_after_a_spell_on_prometheus() {
+        // The first kubelet poll after Prometheus must not compute a rate
+        // against counters from before it, which would average over the
+        // whole Prometheus period.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, _) = serve(|request| {
+            if request.contains("/stats/summary") {
+                let body = r#"{"node":{"nodeName":"n1","network":{"rxBytes":100,"txBytes":100}}}"#;
+                ("200 OK".to_string(), body.to_string())
+            } else if request.contains("/proxy/api/v1/query") {
+                prometheus_route(request)
+            } else if request.contains(" /api/v1/nodes") {
+                list(NODE_LIST)
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+        let net = |metrics: ClusterMetrics| metrics.capacity.and_then(|c| c.net);
+
+        let kubelet = backend.target().clone();
+        backend.collect().await.expect("kubelet poll");
+        let mut prometheus = kubelet.clone();
+        prometheus.prometheus = Some(prometheus_service());
+        backend.set_target(prometheus);
+        let on_prometheus = backend.collect().await.expect("Prometheus poll");
+        assert!(net(on_prometheus).is_some(), "Prometheus has rates at once");
+        backend.set_target(kubelet);
+        let back = backend.collect().await.expect("kubelet poll");
+
+        assert_eq!(net(back), None, "one kubelet sample has no rate yet");
+    }
+
+    #[tokio::test]
     async fn stats_are_retried_when_a_refusal_comes_with_other_failures() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (url, seen) = serve(|request| {

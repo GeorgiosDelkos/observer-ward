@@ -498,22 +498,22 @@ struct K8sTargetFile {
 
 impl From<K8sTargetFile> for K8sTarget {
     fn from(file: K8sTargetFile) -> Self {
+        // A hand-edited typo in this optional field must not cost the whole
+        // config: a file that fails to parse is set aside for defaults.
+        let prometheus = file.prometheus.and_then(|text| {
+            text.parse()
+                .inspect_err(|e| {
+                    tracing::warn!("ignoring the Prometheus service of {}: {e}", file.name);
+                })
+                .ok()
+        });
         let mut target = Self {
             name: file.name,
             kubeconfig: file.kubeconfig,
             context: file.context,
             namespaces: Vec::new(),
-            prometheus: None,
+            prometheus,
         };
-        // A hand-edited typo in this optional field must not cost the whole
-        // config: a file that fails to parse is set aside for defaults.
-        target.prometheus = file.prometheus.and_then(|text| {
-            text.parse()
-                .inspect_err(|e| {
-                    tracing::warn!("ignoring the Prometheus service of {}: {e}", target.name);
-                })
-                .ok()
-        });
         let legacy = file.namespace.map(|name| WatchedNamespace {
             name,
             hidden: file.hidden,
@@ -1026,8 +1026,8 @@ mod tests {
         // A typo in the file drops the field, not the config.
         let in_file = r#"{"type":"k8s","name":"p","kubeconfig":null,"context":"c",
             "namespaces":[{"name":"default"}],"prometheus":"nope"}"#;
-        let server: ServerConfig = serde_json::from_str(in_file).expect("server kept");
-        assert_eq!(target(&mut server.clone()).prometheus, None);
+        let mut server: ServerConfig = serde_json::from_str(in_file).expect("server kept");
+        assert_eq!(target(&mut server).prometheus, None);
     }
 
     #[test]

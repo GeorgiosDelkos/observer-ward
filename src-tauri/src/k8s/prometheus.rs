@@ -20,7 +20,10 @@
 //! Figures follow the kubelet's definitions where they differ from the
 //! obvious query: disk used is size minus free (root-reserved blocks are
 //! not used), and pod network is the pod's `eth0`, as in the kubelet's
-//! stats summary. A host-network pod therefore has no network figure.
+//! stats summary. cAdvisor reports a host-network pod with the host's
+//! interfaces, so such a pod has no network figure on a node whose
+//! interfaces are named otherwise, and the node's own on one whose uplink
+//! is `eth0`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,8 +38,8 @@ use super::figures::{HostFigures, NamespaceFigures, PvcUsage};
 
 /// The root filesystem: `rootfs` is a second, initramfs entry for `/` that
 /// node-exporter can report beside the real one; overlays and tmpfs are
-/// not the disk. Size and used are computed per series before the `max`,
-/// so both come from the same filesystem.
+/// not the disk. Used is size minus free of the same series, so it never
+/// mixes two filesystems' figures.
 const DISK_SIZE: &str =
     r#"max by (node) (node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"})"#;
 const DISK_USED: &str = r#"max by (node) (node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"} - node_filesystem_free_bytes{mountpoint="/",fstype!~"tmpfs|overlay|rootfs"})"#;
@@ -297,8 +300,62 @@ fn total(per_node: &HashMap<String, NetRate>) -> Option<NetRate> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
-    use super::namespace_regex;
+    use super::{
+        DISK_SIZE, DISK_USED, NODE_RX, NODE_TX, POD_RX, POD_TX, PVC_CAPACITY, PVC_USED,
+        namespace_regex, query_if,
+    };
+
+    /// `<kubeconfig>|<context>|<namespace/service:port>` of a cluster with a
+    /// Prometheus, for [`every_query_runs_on_a_real_prometheus`].
+    const REAL_PROMETHEUS: &str = "OBSERVER_WARD_TEST_PROMETHEUS";
+
+    /// The stub servers answer by metric name and never parse a query, so
+    /// only a real Prometheus catches a query it would reject (a string
+    /// escape it does not accept, an operator in the wrong place). Skipped
+    /// unless [`REAL_PROMETHEUS`] is set: CI has no cluster.
+    #[tokio::test]
+    async fn every_query_runs_on_a_real_prometheus() {
+        let Ok(target) = std::env::var(REAL_PROMETHEUS) else {
+            return;
+        };
+        let mut parts = target.splitn(3, '|');
+        let (Some(kubeconfig), Some(context), Some(service)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            unreachable!("{REAL_PROMETHEUS} must be <kubeconfig>|<context>|<service>");
+        };
+        let client = crate::k8s::connect(Some(kubeconfig.into()), context)
+            .await
+            .expect("client builds");
+        let service = service.parse().expect("a valid service");
+        // Includes a name the escaping has to handle.
+        let regex = namespace_regex(&["default".to_string(), "app.prod".to_string()]);
+
+        let queries = [
+            DISK_SIZE,
+            DISK_USED,
+            NODE_RX,
+            NODE_TX,
+            POD_RX,
+            POD_TX,
+            PVC_USED,
+            PVC_CAPACITY,
+        ];
+        for promql in queries {
+            let promql = promql.replace("{namespaces}", &regex);
+            let result = query_if(true, &client, &service, &promql).await;
+            assert!(
+                result.is_ok(),
+                "{promql}: {}",
+                result.map_or_else(|e| crate::error::error_chain(&e), |_| String::new())
+            );
+        }
+    }
 
     #[test]
     fn namespace_regex_escapes_for_a_raw_promql_string() {

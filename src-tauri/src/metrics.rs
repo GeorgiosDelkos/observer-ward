@@ -56,6 +56,9 @@ pub enum Health<T> {
     /// Why the last poll failed, rendered with its cause chain.
     Offline {
         error: String,
+        /// A cluster's credential plugin failed, so signing in again (the
+        /// `k8s_login` command) may bring it back. Always false for hosts.
+        needs_login: bool,
     },
 }
 
@@ -149,10 +152,23 @@ pub struct HostMetrics {
     pub net: Option<NetRate>,
 }
 
-/// One cluster: totals over all its nodes, each node, and the pods of each
-/// watched namespace.
+/// One cluster: its nodes and their totals, and the pods of each watched
+/// namespace.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClusterMetrics {
+    /// `None` when the credentials may not list nodes (a namespace-scoped
+    /// account): every total is a share of node capacity, so none can be
+    /// shown. Flattened, so JSON has the totals and `nodes` beside
+    /// `namespaces`, or neither.
+    #[serde(flatten)]
+    pub capacity: Option<ClusterCapacity>,
+    /// In the order the cluster's config lists them.
+    pub namespaces: Vec<NamespaceMetrics>,
+}
+
+/// What a cluster's nodes report: totals and each node.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClusterCapacity {
     // Totals over the nodes with a metrics-server sample, against their
     // allocatable capacity.
     #[serde(flatten)]
@@ -165,8 +181,6 @@ pub struct ClusterMetrics {
 
     /// Sorted by name.
     pub nodes: Vec<NodeMetrics>,
-    /// In the order the cluster's config lists them.
-    pub namespaces: Vec<NamespaceMetrics>,
 }
 
 impl ClusterMetrics {
@@ -444,17 +458,19 @@ pub fn online_usage(reports: &[ServerReport]) -> impl Iterator<Item = (String, U
                 name,
                 health: Health::Online { metrics },
             } => {
-                entries.push((name.to_string(), metrics.usage.usage));
-                // A one-node cluster's total is that node: one problem, one
-                // notification.
-                let nodes = if metrics.nodes.len() > 1 {
-                    metrics.nodes.as_slice()
-                } else {
-                    &[]
-                };
-                for node in nodes {
-                    if let Some(usage) = node.usage {
-                        entries.push((format!("{name} node {}", node.name), usage.usage));
+                if let Some(capacity) = &metrics.capacity {
+                    entries.push((name.to_string(), capacity.usage.usage));
+                    // A one-node cluster's total is that node: one problem,
+                    // one notification.
+                    let nodes = if capacity.nodes.len() > 1 {
+                        capacity.nodes.as_slice()
+                    } else {
+                        &[]
+                    };
+                    for node in nodes {
+                        if let Some(usage) = node.usage {
+                            entries.push((format!("{name} node {}", node.name), usage.usage));
+                        }
                     }
                 }
                 for (namespace, pod) in metrics.pods() {
@@ -641,6 +657,7 @@ pub(crate) mod tests {
             name: name.into(),
             health: Health::Offline {
                 error: "connection refused".to_string(),
+                needs_login: false,
             },
         }
     }
@@ -704,11 +721,13 @@ pub(crate) mod tests {
             name: name.into(),
             health: Health::Online {
                 metrics: ClusterMetrics {
-                    usage: sampled(usage),
-                    net: None,
-                    disk: Capacity::default(),
-                    requested: None,
-                    nodes: Vec::new(),
+                    capacity: Some(ClusterCapacity {
+                        usage: sampled(usage),
+                        net: None,
+                        disk: Capacity::default(),
+                        requested: None,
+                        nodes: Vec::new(),
+                    }),
                     namespaces: vec![NamespaceMetrics {
                         name: "default".to_string(),
                         pods,
@@ -728,6 +747,11 @@ pub(crate) mod tests {
                 panic!("not an online cluster")
             }
         }
+    }
+
+    fn nodes_mut(report: &mut ServerReport) -> &mut Vec<NodeMetrics> {
+        let capacity = metrics_mut(report).capacity.as_mut();
+        &mut capacity.expect("cluster() reports capacity").nodes
     }
 
     #[test]
@@ -826,6 +850,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cluster_without_node_access_reports_pods_but_no_totals() {
+        // A namespace-scoped account: the UI tells "no node access" apart
+        // from "zero nodes" by the missing keys, and the notifier must not
+        // see a 0% total for the cluster.
+        let hot_pod = pod("web", 0, Some(usage(95.0, 0.0, 0.0)));
+        let mut report = cluster("prod", Usage::default(), Some(vec![hot_pod]));
+        metrics_mut(&mut report).capacity = None;
+
+        let json = serde_json::to_value(&report).expect("json");
+        assert!(json["metrics"].get("nodes").is_none());
+        assert!(json["metrics"].get("cpu_percent").is_none());
+        assert!(json["metrics"].get("disk").is_none());
+        assert_eq!(json["metrics"]["namespaces"][0]["pods"][0]["name"], "web");
+
+        let reports = [report];
+        let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
+        assert_eq!(labels, ["prod/default/web"]);
+    }
+
+    #[test]
     fn node_serializes_flat_usage_and_kubernetes_problem_names() {
         let mut node = node("hp-07", usage(12.0, 39.0, 88.0));
         node.problems = vec![NodeProblem::DiskPressure, NodeProblem::PidPressure];
@@ -890,11 +934,11 @@ pub(crate) mod tests {
                 pod("idle", 0, None),
             ]),
         );
-        let metrics = metrics_mut(&mut report);
-        metrics.nodes = vec![node("n1", usage(1.0, 1.0, 95.0))];
+        let nodes = nodes_mut(&mut report);
+        *nodes = vec![node("n1", usage(1.0, 1.0, 95.0))];
         let mut unsampled = node("n2", Usage::default());
         unsampled.usage = None;
-        metrics.nodes.push(unsampled);
+        nodes.push(unsampled);
         let reports = [report];
 
         let labels: Vec<String> = online_usage(&reports).map(|(label, _)| label).collect();
@@ -903,7 +947,7 @@ pub(crate) mod tests {
         assert_eq!(worst_level(&reports), MetricLevel::Crit, "a full node disk");
 
         let [mut single] = reports;
-        metrics_mut(&mut single).nodes.truncate(1);
+        nodes_mut(&mut single).truncate(1);
         let labels: Vec<String> = online_usage(std::slice::from_ref(&single))
             .map(|(label, _)| label)
             .collect();

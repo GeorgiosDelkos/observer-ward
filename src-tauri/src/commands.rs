@@ -21,11 +21,13 @@ use crate::error::error_chain;
 use crate::grafana::{self, GrafanaError, TokenEpoch};
 use crate::k8s::{self, K8sError};
 use crate::metrics::{AlertsUpdate, MetricsUpdate};
+use crate::poller::RetryNow;
 use crate::terminal::{self, TerminalError};
 use crate::tray::NativeDialogGuard;
 
 pub(crate) struct WakeState(pub(crate) Arc<Notify>);
 pub(crate) struct TokenEpochState(pub(crate) Arc<TokenEpoch>);
+pub(crate) struct RetryState(pub(crate) Arc<RetryNow>);
 pub(crate) struct LatestMetrics(pub(crate) Arc<Mutex<Option<MetricsUpdate>>>);
 pub(crate) struct LatestAlerts(pub(crate) Arc<Mutex<Option<AlertsUpdate>>>);
 
@@ -398,6 +400,29 @@ pub(crate) async fn open_pod_logs(
         return Err(unknown_namespace(server, &namespace));
     }
     terminal::run_in_terminal(&terminal::pod_logs_command(target, &namespace, &pod)?)?;
+    Ok(())
+}
+
+/// Sign in to the saved cluster `server` through its kubeconfig's
+/// credential plugin, which may open the browser (an `OpenBao` or OIDC
+/// login), then poll the cluster at once, past any backoff. Returns when the
+/// plugin finishes, at most a few minutes later.
+#[tauri::command]
+pub(crate) async fn k8s_login(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    retry: State<'_, RetryState>,
+    server: String,
+) -> CommandResult<()> {
+    let config = store.snapshot().await;
+    let target = match config.server(&server) {
+        Some(ServerConfig::K8s(target)) => target,
+        Some(ServerConfig::Ssh(_)) => return Err(wrong_kind(server, "a Kubernetes")),
+        None => return Err(CommandError::UnknownServer(server)),
+    };
+    k8s::login(target.kubeconfig.clone(), target.context.clone()).await?;
+    retry.0.request(target.name.clone());
+    wake.0.notify_one();
     Ok(())
 }
 

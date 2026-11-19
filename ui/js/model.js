@@ -34,6 +34,8 @@ export const state = {
   restarts: new Map(),
   updatedAt: 0,
   syncing: false,
+  /** Clusters whose credential-plugin login is running. */
+  loggingIn: new Set(),
 };
 
 export function setConfig(config) {
@@ -74,6 +76,12 @@ export function errorOf(name) {
   return report?.status === "offline" ? report.error ?? "offline" : null;
 }
 
+/** Whether cluster `name` is offline because its credential plugin failed, so a login may help. */
+export function needsLogin(name) {
+  const report = state.reports.get(name);
+  return report?.status === "offline" && report.needs_login === true;
+}
+
 export function hiddenOf(cluster, namespace) {
   const server = serverConfig(cluster);
   return server?.namespaces?.find((ns) => ns.name === namespace)?.hidden ?? [];
@@ -106,7 +114,9 @@ export function ingestMetrics(update) {
       continue;
     }
     // Only cluster totals are drawn as history.
-    record(report.name, next.metrics);
+    if (hasCapacity(next.metrics)) {
+      record(report.name, next.metrics);
+    }
     for (const ns of next.metrics.namespaces ?? []) {
       for (const pod of ns.pods ?? []) {
         const key = podKey(report.name, ns.name, pod.name);
@@ -211,6 +221,14 @@ export function isAnomaly(series) {
 
 // ── Health ──────────────────────────────────────
 
+/**
+ * Whether a cluster report carries node totals and nodes. Credentials that may not list
+ * nodes get only namespaces: the totals and `nodes` keys are then absent, not zero.
+ */
+export function hasCapacity(metrics) {
+  return Array.isArray(metrics.nodes);
+}
+
 function usageLevel(usage) {
   if (!usage) {
     return "ok";
@@ -258,8 +276,8 @@ export function clusterLevel(name) {
     return "idle";
   }
   // Cluster totals are flattened into the metrics object, like a host's.
-  let result = usageLevel(metrics);
-  for (const node of metrics.nodes) {
+  let result = hasCapacity(metrics) ? usageLevel(metrics) : "ok";
+  for (const node of metrics.nodes ?? []) {
     result = worse(result, nodeLevel(node));
   }
   for (const ns of metrics.namespaces) {
@@ -332,7 +350,7 @@ function clusterAttention(cluster) {
     return [];
   }
   const items = [];
-  for (const node of metrics.nodes) {
+  for (const node of metrics.nodes ?? []) {
     const go = { page: "cluster", cluster, tab: "nodes", open: node.name };
     if (!node.ready) {
       items.push({ level: "crit", icon: "!", title: `${node.name} is not ready`, detail: cluster, go });

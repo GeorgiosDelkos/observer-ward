@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `unwatch_namespace` command
 - The pod sheet shows what each usage bar is measured against, for example `1.6c of 16.0c · node` (pod `usage.ceiling.cpu` and `.memory`, each `{ amount, source }` with source `limit`, `node` or `cluster`)
 - Pod-level resources (`spec.resources`, Kubernetes 1.34) count as the pod's limits and requests
+- Kubeconfig exec credential plugins (kubectl-bao for OpenBao, aws, gke-gcloud-auth-plugin) work when the app starts from Finder or at login: they get the login shell's PATH, unless the kubeconfig sets one
+- `k8s_login` command and a Log in button on a cluster whose credential plugin failed: it runs the plugin interactively (an OpenBao or OIDC sign-in in the browser), then polls the cluster at once, past any backoff. An offline report carries `needs_login`
+- A cluster whose credentials may not list nodes (a namespace-scoped account) shows its watched namespaces instead of going offline; its `metrics-update` payload then has no totals, `disk`, `net`, `requested` or `nodes`
 
 ### Changed
 
@@ -27,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `save_config_cmd` is replaced by `save_settings`, which never touches the server list; terminal commands take a server name instead of connection details
 - Config changes are validated (new names unique and without `/`, changed poll intervals in range); the `poll_interval_secs` alias is gone
 - Grafana token is cached and re-read only after a change or a 401/403
+- Polls run exec credential plugins non-interactively (`interactiveMode: Never`), so a background poll never opens a browser to sign in, and a failed plugin reports what it printed instead of kube's dump of its command and environment
 - Grafana URLs must be https (http only for loopback), so the token never crosses the network in cleartext
 - A host key that cannot be written to `known_hosts` is refused instead of accepted unrecorded
 - CI runs the full `cargo deny check` (licenses, bans, sources, advisories)

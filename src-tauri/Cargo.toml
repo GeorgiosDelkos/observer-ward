@@ -29,7 +29,8 @@ dirs = "7.0"
 # Only the features this crate uses directly: Notify (sync), JoinSet (rt),
 # sleep/timeout/Instant (time), select!/join! (macros). Transitive crates
 # (tauri, kube) pull in their own tokio features via Cargo feature unification.
-tokio = { version = "1.54", features = ["rt", "macros", "time", "sync"] }
+# process: exec credential plugins and the login shell (k8s/exec_auth.rs).
+tokio = { version = "1.54", features = ["rt", "macros", "time", "sync", "process"] }
 russh = "0.65.2"
 # `aws-lc-rs` makes kube install aws-lc-rs as rustls' process default before
 # it builds a TLS config. Without it, kube's default `ring` and reqwest's

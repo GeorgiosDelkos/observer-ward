@@ -72,24 +72,43 @@ struct FailureState {
     server: ServerConfig,
     count: u32,
     last_attempt: Instant,
-    /// Kept so servers held in backoff still report why they are offline.
-    last_error: String,
+    /// The last offline report, so servers held in backoff still report
+    /// why they are offline and whether a login may help.
+    last_report: ServerReport,
 }
 
 impl FailureState {
-    fn new(server: ServerConfig) -> Self {
+    fn new(server: ServerConfig, report: ServerReport) -> Self {
         Self {
             server,
-            count: 0,
+            count: 1,
             last_attempt: Instant::now(),
-            last_error: String::new(),
+            last_report: report,
         }
     }
 
-    fn record(&mut self, error: String) {
+    fn record(&mut self, report: ServerReport) {
         self.count = self.count.saturating_add(1);
         self.last_attempt = Instant::now();
-        self.last_error = error;
+        self.last_report = report;
+    }
+}
+
+/// Servers to contact on the next poll even when held in backoff, because
+/// a login just renewed their credentials. Shared by the login command,
+/// which adds, and the poller, which drains.
+#[derive(Debug, Default)]
+pub(crate) struct RetryNow(Mutex<HashSet<ServerName>>);
+
+impl RetryNow {
+    pub(crate) fn request(&self, name: ServerName) {
+        // The set stays valid whatever panicked while it was held.
+        let mut names = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        names.insert(name);
+    }
+
+    fn take(&self) -> HashSet<ServerName> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -132,36 +151,46 @@ impl Backend {
         match self {
             Backend::Ssh(backend) => ServerReport::Ssh {
                 name,
-                health: health(backend.collect().await),
+                health: match backend.collect().await {
+                    Ok(metrics) => Health::Online { metrics },
+                    Err(e) => Health::Offline {
+                        error: error_chain(&e),
+                        needs_login: false,
+                    },
+                },
             },
             Backend::K8s(backend) => ServerReport::K8s {
                 name,
-                health: health(backend.collect().await),
+                health: match backend.collect().await {
+                    Ok(metrics) => Health::Online { metrics },
+                    Err(e) => Health::Offline {
+                        error: error_chain(&e),
+                        needs_login: e.needs_login(),
+                    },
+                },
             },
         }
     }
 }
 
-fn health<T, E: std::error::Error>(result: Result<T, E>) -> Health<T> {
-    match result {
-        Ok(metrics) => Health::Online { metrics },
-        Err(e) => Health::Offline {
-            error: error_chain(&e),
-        },
-    }
-}
-
-/// An offline report of the right kind for `server`.
+/// An offline report of the right kind for `server`, for a failure no
+/// login can fix (a timeout, a panicked task).
 fn offline_report(server: &ServerConfig, error: String) -> ServerReport {
     let name = server.name().clone();
     match server {
         ServerConfig::Ssh(_) => ServerReport::Ssh {
             name,
-            health: Health::Offline { error },
+            health: Health::Offline {
+                error,
+                needs_login: false,
+            },
         },
         ServerConfig::K8s(_) => ServerReport::K8s {
             name,
-            health: Health::Offline { error },
+            health: Health::Offline {
+                error,
+                needs_login: false,
+            },
         },
     }
 }
@@ -169,11 +198,11 @@ fn offline_report(server: &ServerConfig, error: String) -> ServerReport {
 fn offline_error(report: &ServerReport) -> Option<&str> {
     match report {
         ServerReport::Ssh {
-            health: Health::Offline { error },
+            health: Health::Offline { error, .. },
             ..
         }
         | ServerReport::K8s {
-            health: Health::Offline { error },
+            health: Health::Offline { error, .. },
             ..
         } => Some(error),
         ServerReport::Ssh {
@@ -216,8 +245,8 @@ impl ServerPool {
         let mut task_servers: HashMap<Id, &ServerConfig> = HashMap::new();
 
         for server in servers {
-            if let Some(last_error) = self.backoff_error(server) {
-                reports.push(offline_report(server, last_error));
+            if let Some(last_report) = self.backoff_report(server) {
+                reports.push(last_report);
                 continue;
             }
             let backend = self.take_backend(server);
@@ -254,11 +283,18 @@ impl ServerPool {
         reports
     }
 
-    /// The last error if `server` is in backoff. An expired backoff resets
-    /// the counter for a fresh set of attempts, and so does any change to
-    /// the server's connection: a corrected entry (removed and re-added
-    /// under the same name) must be contacted right away.
-    fn backoff_error(&mut self, server: &ServerConfig) -> Option<String> {
+    /// Contact every server `retry` names on this poll, past any backoff.
+    fn retry_now(&mut self, retry: &RetryNow) {
+        for name in retry.take() {
+            self.failures.remove(&name);
+        }
+    }
+
+    /// The last offline report if `server` is in backoff. An expired
+    /// backoff resets the counter for a fresh set of attempts, and so does
+    /// any change to the server's connection: a corrected entry (removed
+    /// and re-added under the same name) must be contacted right away.
+    fn backoff_report(&mut self, server: &ServerConfig) -> Option<ServerReport> {
         let state = self.failures.get_mut(server.name())?;
         if !state.server.same_connection(server) {
             self.failures.remove(server.name());
@@ -266,7 +302,7 @@ impl ServerPool {
         }
         match backoff_decision(state.count, state.last_attempt.elapsed()) {
             BackoffDecision::Ready => None,
-            BackoffDecision::Hold => Some(state.last_error.clone()),
+            BackoffDecision::Hold => Some(state.last_report.clone()),
             BackoffDecision::Expired => {
                 state.count = 0;
                 None
@@ -294,10 +330,12 @@ impl ServerPool {
             }
             Some(error) => {
                 tracing::warn!("failed to collect metrics for {}: {error}", server.name());
-                self.failures
-                    .entry(server.name().clone())
-                    .or_insert_with(|| FailureState::new(server.clone()))
-                    .record(error.to_string());
+                if let Some(state) = self.failures.get_mut(server.name()) {
+                    state.record(report.clone());
+                } else {
+                    let state = FailureState::new(server.clone(), report.clone());
+                    self.failures.insert(server.name().clone(), state);
+                }
             }
         }
     }
@@ -453,6 +491,7 @@ pub(crate) struct PollerHandles {
     pub(crate) is_visible: Arc<AtomicBool>,
     pub(crate) wake: Arc<Notify>,
     pub(crate) token_epoch: Arc<TokenEpoch>,
+    pub(crate) retry: Arc<RetryNow>,
     pub(crate) latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
     pub(crate) latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
 }
@@ -462,6 +501,7 @@ pub(crate) struct Poller {
     config: Arc<ConfigStore>,
     is_visible: Arc<AtomicBool>,
     wake: Arc<Notify>,
+    retry: Arc<RetryNow>,
     servers: ServerPool,
     alerts: AlertSource,
     notifier: Notifier,
@@ -478,6 +518,7 @@ impl Poller {
             config: handles.config,
             is_visible: handles.is_visible,
             wake: handles.wake,
+            retry: handles.retry,
             servers: ServerPool::default(),
             alerts: AlertSource::new(handles.token_epoch),
             notifier: Notifier::default(),
@@ -502,6 +543,7 @@ impl Poller {
     async fn cycle(&mut self) -> Duration {
         let config = self.config.snapshot().await;
         self.servers.retain(&config.servers);
+        self.servers.retry_now(&self.retry);
         self.emit("poll-start", ());
 
         let (mut reports, alerts) = tokio::join!(
@@ -693,14 +735,57 @@ mod tests {
     }
 
     #[test]
-    fn failure_state_keeps_the_latest_error_for_backoff_rows() {
-        let mut state = FailureState::new(ssh_server("bastion", "h"));
+    fn failure_state_keeps_the_latest_report_for_backoff_rows() {
+        let server = ssh_server("bastion", "h");
+        let mut state = FailureState::new(server.clone(), offline("bastion"));
 
-        state.record("connection refused".to_string());
-        state.record("timed out collecting metrics for bastion".to_string());
+        let timeout = "timed out collecting metrics for bastion".to_string();
+        state.record(offline_report(&server, timeout));
 
         assert_eq!(state.count, 2);
-        assert_eq!(state.last_error, "timed out collecting metrics for bastion");
+        assert_eq!(
+            offline_error(&state.last_report),
+            Some("timed out collecting metrics for bastion")
+        );
+    }
+
+    #[test]
+    fn backoff_keeps_a_cluster_offering_login_and_a_retry_lifts_it() {
+        let mut pool = ServerPool::default();
+        let server = k8s_server("prod", []);
+        let expired = ServerReport::K8s {
+            name: "prod".into(),
+            health: Health::Offline {
+                error: "credential plugin failed: session expired".to_string(),
+                needs_login: true,
+            },
+        };
+        for _ in 0..BACKOFF_THRESHOLD {
+            pool.record(&server, &expired);
+        }
+
+        assert!(matches!(
+            pool.backoff_report(&server),
+            Some(ServerReport::K8s {
+                health: Health::Offline {
+                    needs_login: true,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let retry = RetryNow::default();
+        retry.request("other".into());
+        pool.retry_now(&retry);
+        assert!(
+            pool.backoff_report(&server).is_some(),
+            "only the named server"
+        );
+
+        retry.request("prod".into());
+        pool.retry_now(&retry);
+        assert!(pool.backoff_report(&server).is_none());
     }
 
     fn ssh_server(name: &str, host: &str) -> ServerConfig {
@@ -721,13 +806,14 @@ mod tests {
         for _ in 0..BACKOFF_THRESHOLD {
             pool.record(&server, &offline("bastion"));
         }
+        let held = pool.backoff_report(&server);
         assert_eq!(
-            pool.backoff_error(&server).as_deref(),
+            held.as_ref().and_then(offline_error),
             Some("connection refused")
         );
 
         pool.record(&server, &host("bastion", usage(1.0, 1.0, 1.0)));
-        assert!(pool.backoff_error(&server).is_none());
+        assert!(pool.backoff_report(&server).is_none());
     }
 
     #[test]
@@ -740,8 +826,8 @@ mod tests {
 
         let fixed = ssh_server("bastion", "10.0.0.2");
 
-        assert!(pool.backoff_error(&fixed).is_none());
-        assert!(pool.backoff_error(&broken).is_none(), "state was reset");
+        assert!(pool.backoff_report(&fixed).is_none());
+        assert!(pool.backoff_report(&broken).is_none(), "state was reset");
     }
 
     /// A cluster watching `default`, with `hidden` hidden there.
@@ -775,7 +861,7 @@ mod tests {
 
         let hiding = k8s_server("prod", [pod_workload("api-1")]);
 
-        assert!(pool.backoff_error(&hiding).is_some());
+        assert!(pool.backoff_report(&hiding).is_some());
 
         let hidden_of = |backend: &Backend| match backend {
             Backend::K8s(k8s) => k8s.target().namespaces[0].hidden.clone(),
@@ -836,7 +922,7 @@ mod tests {
         assert!(matches!(
             report,
             ServerReport::Ssh {
-                health: Health::Offline { ref error },
+                health: Health::Offline { ref error, needs_login: false },
                 ..
             } if error == "boom"
         ));

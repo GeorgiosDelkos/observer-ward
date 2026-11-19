@@ -25,11 +25,13 @@ use crate::metrics::{
 mod error;
 mod events;
 mod exec_auth;
+mod figures;
 mod jobs;
 mod kubeconfig;
 mod metrics_api;
 mod nodes;
 mod pods;
+mod prometheus;
 mod quantity;
 mod requests;
 mod stats;
@@ -39,14 +41,16 @@ pub(crate) use exec_auth::{login, stderr_summary};
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
+use figures::{HostFigures, NamespaceFigures, PvcUsage, rates_since};
 use jobs::{JobList, JobOwners, list_job_owners};
 use metrics_api::{NodeMetrics as NodeMetricsSample, PodMetrics as PodMetricsSample};
 use nodes::{node_metrics, node_totals};
+use pods::pvc_by_pod;
 use pods::{PodContext, assemble_pods, jobs_of};
 use quantity::{parse_cpu_quantity, parse_memory_quantity};
 use requests::{RequestList, list_requests};
 use stats::{
-    ClusterTotals, StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc,
+    ClusterTotals, StatsList, StatsSummary, cluster_totals, extract_pod_network, extract_pod_pvc,
     fetch_all_node_stats, node_disks,
 };
 
@@ -94,18 +98,31 @@ pub(crate) struct K8sBackend {
     prev_net: Option<NetSample>,
     /// Keyed by namespace name; only watched namespaces are kept.
     namespaces: HashMap<String, NamespaceState>,
-    /// Listing pods in all namespaces was refused; not retried until the
-    /// client is rebuilt (new credentials may allow it).
-    requests_forbidden: bool,
-    /// Listing nodes was refused and that was logged. Unlike the flags
-    /// above, the node list is still requested every poll: with nothing
-    /// else required, it is what notices expired credentials or an
-    /// unreachable cluster, since failed namespace listings only degrade.
-    nodes_forbidden: bool,
+    /// What the current client was refused; cleared when the client is
+    /// rebuilt, since new credentials may be allowed more.
+    refused: Refusals,
+    /// The last Prometheus query failed and that was logged; cleared by the
+    /// next success, so a lasting failure is logged once.
+    prometheus_failing: bool,
     /// The context's user runs a kubeconfig exec credential plugin. Set
     /// when connecting, before the plugin first runs, so a poll that times
     /// out while the plugin waits can still be told apart.
     credential_plugin: bool,
+}
+
+/// Cluster-wide reads the current client was refused.
+#[derive(Debug, Default)]
+struct Refusals {
+    /// Listing pods in all namespaces; not retried until reconnect.
+    requests: bool,
+    /// Listing nodes, which was logged. Unlike the others the node list is
+    /// still requested every poll: with nothing else required, it is what
+    /// notices expired credentials or an unreachable cluster, since failed
+    /// namespace listings only degrade.
+    nodes: bool,
+    /// Kubelet stats on every node (no `nodes/proxy`); not retried until
+    /// reconnect.
+    stats: bool,
 }
 
 /// What a backend remembers about one watched namespace between polls.
@@ -116,6 +133,15 @@ struct NamespaceState {
     job_owners: JobOwners,
     /// Reading Jobs was refused; not retried until the client is rebuilt.
     jobs_forbidden: bool,
+}
+
+/// Where a poll's disk, network and PVC figures came from, before they are
+/// turned into [`HostFigures`].
+enum HostSource {
+    Prometheus(prometheus::Reading),
+    Kubelet(StatsList),
+    /// No Prometheus is set and kubelet stats are refused or have no nodes.
+    Unavailable,
 }
 
 /// One namespace's pod listing and events, read concurrently with the
@@ -133,16 +159,22 @@ impl K8sBackend {
             client: None,
             prev_net: None,
             namespaces: HashMap::new(),
-            requests_forbidden: false,
-            nodes_forbidden: false,
+            refused: Refusals::default(),
+            prometheus_failing: false,
             credential_plugin: false,
         }
     }
 
     /// Take an edited target for the same cluster (see
-    /// [`K8sTarget::same_connection`]): watched namespaces and hidden
-    /// workloads may change without a new connection.
+    /// [`K8sTarget::same_connection`]): watched namespaces, hidden
+    /// workloads and the Prometheus service may change without a new
+    /// connection. A new Prometheus service starts afresh: its failures are
+    /// logged again, and kubelet stats are tried again when it is cleared.
     pub(crate) fn set_target(&mut self, target: K8sTarget) {
+        if target.prometheus != self.target.prometheus {
+            self.prometheus_failing = false;
+            self.refused.stats = false;
+        }
         self.target = target;
     }
 
@@ -170,8 +202,7 @@ impl K8sBackend {
             client.clone()
         } else {
             // New credentials may be allowed what the old ones were not.
-            self.requests_forbidden = false;
-            self.nodes_forbidden = false;
+            self.refused = Refusals::default();
             for state in self.namespaces.values_mut() {
                 state.jobs_forbidden = false;
             }
@@ -196,37 +227,44 @@ impl K8sBackend {
             .collect();
 
         let Some(nodes) = self.read_nodes(client).await? else {
-            let listings = fetch_namespaces(client, &watched).await;
-            let namespaces = self.namespace_reports(client, listings, &[], &[]).await;
+            let (listings, source) = tokio::join!(
+                fetch_namespaces(client, &watched),
+                self.fetch_host(client, &[], &watched),
+            );
+            let figures = self.host_figures(source, &watched);
+            let namespaces = self
+                .namespace_reports(client, listings, &figures, &[])
+                .await;
             return Ok(ClusterMetrics {
                 capacity: None,
                 namespaces,
             });
         };
 
-        let (stats, node_usage, requests, listings) = tokio::join!(
-            fetch_all_node_stats(client, &nodes),
+        let (source, node_usage, requests, listings) = tokio::join!(
+            self.fetch_host(client, &nodes, &watched),
             fetch_node_usage(client),
             self.read_requests(client),
             fetch_namespaces(client, &watched),
         );
-        let nodes = node_metrics(&nodes, &node_usage?, &node_disks(&stats));
+        let figures = self.host_figures(source, &watched);
+        let nodes = node_metrics(&nodes, &node_usage?, &figures.node_disks);
         let totals = node_totals(&nodes);
         let namespaces = self
-            .namespace_reports(client, listings, &stats, &nodes)
+            .namespace_reports(client, listings, &figures, &nodes)
             .await;
 
-        let fs_net = cluster_totals(&stats);
+        let disk = figures.cluster_disk();
         let capacity = ClusterCapacity {
             usage: ResourceUsage {
                 usage: Usage {
-                    disk_percent: fs_net.disk.percent(),
+                    disk_percent: disk.percent(),
                     ..totals.usage
                 },
                 used: totals.used,
             },
-            net: self.net_rate(&fs_net),
-            disk: fs_net.disk,
+            net: figures.cluster_net,
+            disk,
             requested: self.requested(requests, &totals.allocatable),
             nodes,
         };
@@ -236,6 +274,92 @@ impl K8sBackend {
         })
     }
 
+    /// Read disk, network and PVC figures from where the target says:
+    /// Prometheus when configured, else kubelet stats of `nodes` unless
+    /// those were refused before.
+    async fn fetch_host(&self, client: &Client, nodes: &[Node], watched: &[String]) -> HostSource {
+        if let Some(service) = &self.target.prometheus {
+            let names: Vec<String> = nodes
+                .iter()
+                .filter_map(|n| n.metadata.name.clone())
+                .collect();
+            let reading = prometheus::host_figures(client, service, &names, watched).await;
+            return HostSource::Prometheus(reading);
+        }
+        if self.refused.stats || nodes.is_empty() {
+            return HostSource::Unavailable;
+        }
+        HostSource::Kubelet(fetch_all_node_stats(client, nodes).await)
+    }
+
+    /// Turn what [`Self::fetch_host`] read into this poll's figures: rates
+    /// from kubelet counters against the last poll's, and a refusal or a
+    /// Prometheus failure logged once. Kubelet counters are dropped on any
+    /// other source, so a later kubelet poll does not average over the gap.
+    fn host_figures(&mut self, source: HostSource, watched: &[String]) -> HostFigures {
+        if !matches!(source, HostSource::Kubelet(StatsList::Summaries(_))) {
+            self.prev_net = None;
+            for state in self.namespaces.values_mut() {
+                state.prev_pod_net.clear();
+            }
+        }
+        match source {
+            HostSource::Prometheus(prometheus::Reading { figures, failure }) => {
+                match failure {
+                    None => self.prometheus_failing = false,
+                    Some(e) if !self.prometheus_failing => {
+                        tracing::warn!(
+                            "missing disk or network figures for {}: {}",
+                            self.target.name,
+                            crate::error::error_chain(&e)
+                        );
+                        self.prometheus_failing = true;
+                    }
+                    Some(_) => {}
+                }
+                figures
+            }
+            HostSource::Kubelet(StatsList::Summaries(stats)) => {
+                self.kubelet_figures(&stats, watched)
+            }
+            HostSource::Kubelet(StatsList::Forbidden) => {
+                tracing::warn!(
+                    "no permission to read kubelet stats of {} (nodes/proxy): disk and network \
+                     figures need a Prometheus service set for the cluster",
+                    self.target.name
+                );
+                self.refused.stats = true;
+                HostFigures::default()
+            }
+            HostSource::Unavailable => HostFigures::default(),
+        }
+    }
+
+    /// Figures from kubelet stats. Network counters become rates against
+    /// the previous poll's counters, which are kept for the next one.
+    fn kubelet_figures(&mut self, stats: &[StatsSummary], watched: &[String]) -> HostFigures {
+        let mut figures = HostFigures {
+            node_disks: node_disks(stats),
+            cluster_net: self.net_rate(&cluster_totals(stats)),
+            namespaces: HashMap::new(),
+        };
+        let now = Instant::now();
+        for namespace in watched {
+            let samples = extract_pod_network(stats, namespace, now);
+            let state = self.namespaces.entry(namespace.clone()).or_default();
+            let pod_net = rates_since(&samples, &state.prev_pod_net);
+            state.prev_pod_net = samples;
+            figures.namespaces.insert(
+                namespace.clone(),
+                NamespaceFigures {
+                    pod_net,
+                    pvc: PvcUsage::ByPod(extract_pod_pvc(stats, namespace)),
+                },
+            );
+        }
+        figures
+    }
+
     /// The cluster's nodes, or `None` when listing them is refused. A
     /// refusal is logged once per client.
     async fn read_nodes(&mut self, client: &Client) -> Result<Option<Vec<Node>>, K8sError> {
@@ -243,12 +367,12 @@ impl K8sBackend {
         match nodes_api.list(&ListParams::default()).await {
             Ok(nodes) => Ok(Some(nodes.items)),
             Err(kube::Error::Api(status)) if status.is_forbidden() => {
-                if !self.nodes_forbidden {
+                if !self.refused.nodes {
                     tracing::warn!(
                         "no permission to list nodes of {}: showing its namespaces only",
                         self.target.name
                     );
-                    self.nodes_forbidden = true;
+                    self.refused.nodes = true;
                 }
                 Ok(None)
             }
@@ -263,7 +387,7 @@ impl K8sBackend {
         &mut self,
         client: &Client,
         listings: Vec<NamespaceListing>,
-        stats: &[StatsSummary],
+        figures: &HostFigures,
         nodes: &[NodeMetrics],
     ) -> Vec<NamespaceMetrics> {
         self.namespaces
@@ -271,13 +395,13 @@ impl K8sBackend {
         self.resolve_jobs(client, &listings).await;
         listings
             .into_iter()
-            .map(|listing| self.namespace_metrics(listing, stats, nodes))
+            .map(|listing| self.namespace_metrics(listing, figures, nodes))
             .collect()
     }
 
     /// Requests across the cluster, unless that was refused before.
     async fn read_requests(&self, client: &Client) -> RequestList {
-        if self.requests_forbidden {
+        if self.refused.requests {
             return RequestList::Forbidden;
         }
         list_requests(client).await
@@ -295,13 +419,13 @@ impl K8sBackend {
                 })
             }
             RequestList::Forbidden => {
-                if !self.requests_forbidden {
+                if !self.refused.requests {
                     tracing::warn!(
                         "no permission to list pods in all namespaces of {}: \
                          requested capacity is not shown",
                         self.target.name
                     );
-                    self.requests_forbidden = true;
+                    self.refused.requests = true;
                 }
                 None
             }
@@ -326,13 +450,14 @@ impl K8sBackend {
     fn namespace_metrics(
         &mut self,
         listing: NamespaceListing,
-        stats: &[StatsSummary],
+        figures: &HostFigures,
         nodes: &[NodeMetrics],
     ) -> NamespaceMetrics {
         let NamespaceListing { name, pods, events } = listing;
         let pods = match pods {
             Ok((samples, specs)) => {
-                Some(self.pod_cards(&name, &samples, &specs, stats, &events, nodes))
+                let figures = figures.namespaces.get(&name);
+                Some(self.pod_cards(&name, &samples, &specs, figures, &events, nodes))
             }
             Err(e) => {
                 tracing::warn!(
@@ -408,12 +533,20 @@ impl K8sBackend {
         namespace: &str,
         samples: &[PodMetricsSample],
         specs: &[Pod],
-        stats: &[StatsSummary],
+        figures: Option<&NamespaceFigures>,
         events: &HashMap<String, String>,
         nodes: &[NodeMetrics],
     ) -> Vec<PodMetrics> {
-        let pvc = extract_pod_pvc(stats, namespace);
-        let net = extract_pod_network(stats, namespace, Instant::now());
+        let none = NamespaceFigures::default();
+        let figures = figures.unwrap_or(&none);
+        let by_claim;
+        let pvc = match &figures.pvc {
+            PvcUsage::ByPod(pvc) => pvc,
+            PvcUsage::ByClaim(claims) => {
+                by_claim = pvc_by_pod(specs, claims);
+                &by_claim
+            }
+        };
         let unhidden = BTreeSet::new();
         let hidden = self
             .target
@@ -421,21 +554,18 @@ impl K8sBackend {
             .map_or(&unhidden, |ns| &ns.hidden);
         let state = self.namespaces.entry(namespace.to_string()).or_default();
 
-        let pods = assemble_pods(
+        assemble_pods(
             samples,
             specs,
             &PodContext {
                 nodes,
-                pvc: &pvc,
-                net: &net,
-                prev_net: &state.prev_pod_net,
+                pvc,
+                net: &figures.pod_net,
                 events,
                 hidden,
                 job_owners: &state.job_owners,
             },
-        );
-        state.prev_pod_net = net;
-        pods
+        )
     }
 }
 
@@ -642,7 +772,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::{K8sTarget, WatchedNamespace};
+    use crate::config::{K8sTarget, PrometheusService, WatchedNamespace};
+    use crate::metrics::Capacity;
 
     #[tokio::test]
     async fn join_ordered_keeps_input_order_and_reports_panics_in_place() {
@@ -693,14 +824,19 @@ current-context: "local"
         connect(Some(path), "local").await.expect("client builds");
     }
 
-    /// A plain-HTTP stand-in for an API server that answers the node list
-    /// with `nodes` (an HTTP status line), lists namespaces `b` and `a`, and
-    /// answers every other list with no items. Returns its URL.
-    fn serve_api(nodes: &'static str) -> String {
+    /// The request lines a stub API server has seen.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A plain-HTTP stand-in for an API server. `route` maps each request
+    /// line to a status line and a JSON body. Returns its URL and the
+    /// request lines it has seen.
+    fn serve(route: impl Fn(&str) -> (String, String) + Send + 'static) -> (String, Seen) {
         use std::io::{BufRead, BufReader, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub API");
         let url = format!("http://{}", listener.local_addr().expect("stub address"));
+        let seen = Seen::default();
+        let log = std::sync::Arc::clone(&seen);
         // Detached: it serves until the test process exits.
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -713,22 +849,10 @@ current-context: "local"
                 while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
                     header.clear();
                 }
-                // kube reads the failure's code from the body, not the status line.
-                let (status, body) = if request_line.contains(" /api/v1/nodes") {
-                    let code = &nodes[..3];
-                    let body = format!(
-                        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","code":{code},"message":"nodes refused"}}"#
-                    );
-                    (nodes, body)
-                } else if request_line.contains(" /api/v1/namespaces?")
-                    || request_line.contains(" /api/v1/namespaces ")
-                {
-                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[{"metadata":{"name":"b"}},{"metadata":{"name":"a"}}]}"#;
-                    ("200 OK", body.to_string())
-                } else {
-                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[]}"#;
-                    ("200 OK", body.to_string())
-                };
+                let (status, body) = route(&request_line);
+                log.lock()
+                    .expect("stub log lock")
+                    .push(request_line.trim_end().to_string());
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -737,7 +861,401 @@ current-context: "local"
                 let _ = (&stream).write_all(response.as_bytes());
             }
         });
+        (url, seen)
+    }
+
+    /// A failure as the API server sends it: kube reads the code from the
+    /// body, not the status line.
+    fn failure(status: &str) -> (String, String) {
+        let code = &status[..3];
+        let body = format!(
+            r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","code":{code},"message":"refused"}}"#
+        );
+        (status.to_string(), body)
+    }
+
+    fn list(items: &str) -> (String, String) {
+        let body =
+            format!(r#"{{"kind":"List","apiVersion":"v1","metadata":{{}},"items":[{items}]}}"#);
+        ("200 OK".to_string(), body)
+    }
+
+    /// A stub API server that answers the node list with `nodes` (an HTTP
+    /// status line), lists namespaces `b` and `a`, and answers every other
+    /// list with no items. Returns its URL.
+    fn serve_api(nodes: &'static str) -> String {
+        let (url, _) = serve(move |request| {
+            if request.contains(" /api/v1/nodes") {
+                failure(nodes)
+            } else if request.contains(" /api/v1/namespaces?")
+                || request.contains(" /api/v1/namespaces ")
+            {
+                list(r#"{"metadata":{"name":"b"}},{"metadata":{"name":"a"}}"#)
+            } else {
+                list("")
+            }
+        });
         url
+    }
+
+    /// A Prometheus answer: one series per `(labels, value)`.
+    fn vector(series: &[(&str, &str)]) -> (String, String) {
+        let result: Vec<String> = series
+            .iter()
+            .map(|(labels, value)| format!(r#"{{"metric":{{{labels}}},"value":[0,"{value}"]}}"#))
+            .collect();
+        let body = format!(
+            r#"{{"status":"success","data":{{"resultType":"vector","result":[{}]}}}}"#,
+            result.join(",")
+        );
+        ("200 OK".to_string(), body)
+    }
+
+    /// Answers for a Prometheus with node `n1` and pod `default/web`
+    /// mounting claim `data`, plus series that must be ignored: a host
+    /// outside the cluster, a deleted node and a pod in an unwatched
+    /// namespace. Matched by the first metric name a query contains, so the
+    /// disk-used query (size minus free) is matched by `free` first.
+    fn prometheus_route(request: &str) -> (String, String) {
+        let answers: [(&str, &[(&str, &str)]); 8] = [
+            (
+                "node_filesystem_free_bytes",
+                &[(r#""node":"n1""#, "60"), (r#""node":"old-worker""#, "1")],
+            ),
+            (
+                "node_filesystem_size_bytes",
+                &[
+                    (r#""node":"n1""#, "100"),
+                    (r#""node":"old-worker""#, "500"),
+                    ("", "5"),
+                ],
+            ),
+            ("node_network_receive", &[(r#""node":"n1""#, "1000.4")]),
+            ("node_network_transmit", &[(r#""node":"n1""#, "2000")]),
+            (
+                "container_network_receive",
+                &[
+                    (r#""namespace":"default","pod":"web""#, "10"),
+                    (r#""namespace":"other","pod":"x""#, "99"),
+                ],
+            ),
+            (
+                "container_network_transmit",
+                &[(r#""namespace":"default","pod":"web""#, "20")],
+            ),
+            (
+                "kubelet_volume_stats_used_bytes",
+                &[(
+                    r#""namespace":"default","persistentvolumeclaim":"data""#,
+                    "3",
+                )],
+            ),
+            (
+                "kubelet_volume_stats_capacity_bytes",
+                &[(
+                    r#""namespace":"default","persistentvolumeclaim":"data""#,
+                    "30",
+                )],
+            ),
+        ];
+        answers
+            .iter()
+            .find(|(metric, _)| request.contains(metric))
+            .map_or_else(|| vector(&[]), |(_, series)| vector(series))
+    }
+
+    fn prometheus_service() -> PrometheusService {
+        "monitoring/prometheus-server:80"
+            .parse()
+            .expect("valid service")
+    }
+
+    #[tokio::test]
+    async fn prometheus_figures_are_keyed_by_node_pod_and_claim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, seen) = serve(prometheus_route);
+        let client = connect(Some(token_kubeconfig(&dir, &url)), "ctx")
+            .await
+            .expect("client builds");
+
+        let reading = prometheus::host_figures(
+            &client,
+            &prometheus_service(),
+            &["n1".to_string()],
+            &["default".to_string()],
+        )
+        .await;
+
+        assert!(reading.failure.is_none(), "{:?}", reading.failure);
+        let figures = reading.figures;
+
+        let disk = Capacity {
+            used_bytes: 60,
+            capacity_bytes: 100,
+        };
+        assert_eq!(
+            figures.node_disks,
+            HashMap::from([("n1".to_string(), disk)])
+        );
+        assert_eq!(
+            figures.cluster_net,
+            Some(NetRate {
+                rx_bytes_per_sec: 1000,
+                tx_bytes_per_sec: 2000,
+            })
+        );
+        let default = &figures.namespaces["default"];
+        let web = default.pod_net.get("web").copied();
+        assert_eq!(
+            web.map(|n| (n.rx_bytes_per_sec, n.tx_bytes_per_sec)),
+            Some((10, 20))
+        );
+        assert_eq!(default.pod_net.len(), 1, "unwatched namespace left out");
+        let PvcUsage::ByClaim(claims) = &default.pvc else {
+            unreachable!("Prometheus reports usage per claim");
+        };
+        assert_eq!(claims["data"].capacity_bytes, 30);
+
+        let seen = seen.lock().expect("stub log lock");
+        assert!(
+            seen.iter()
+                .all(|r| r.contains("/namespaces/monitoring/services/prometheus-server:80/proxy/")),
+            "{seen:?}"
+        );
+        // The pod and PVC queries name the watched namespace, URL-encoded
+        // as `namespace=~` followed by a backtick-quoted `default`.
+        let matcher = "namespace%3D%7E%60default%60";
+        let scoped = seen.iter().filter(|r| r.contains(matcher)).count();
+        assert_eq!(scoped, 4, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_query_loses_only_its_own_figures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, _) = serve(|request| {
+            if request.contains("kubelet_volume_stats") {
+                let body = r#"{"status":"error","errorType":"bad_data","error":"parse error"}"#;
+                ("400 Bad Request".to_string(), body.to_string())
+            } else {
+                prometheus_route(request)
+            }
+        });
+        let client = connect(Some(token_kubeconfig(&dir, &url)), "ctx")
+            .await
+            .expect("client builds");
+
+        let reading = prometheus::host_figures(
+            &client,
+            &prometheus_service(),
+            &["n1".to_string()],
+            &["default".to_string()],
+        )
+        .await;
+
+        assert!(
+            matches!(&reading.failure, Some(K8sError::QueryPrometheus { service, .. })
+                if service == "monitoring/prometheus-server:80"),
+            "{:?}",
+            reading.failure
+        );
+        assert_eq!(reading.figures.node_disks.len(), 1, "node disks still read");
+        let default = &reading.figures.namespaces["default"];
+        assert_eq!(default.pod_net.len(), 1, "pod network still read");
+        assert!(matches!(&default.pvc, PvcUsage::ByClaim(claims) if claims.is_empty()));
+    }
+
+    /// Pod `web` in `default`, mounting claim `data`.
+    const WEB_POD: &str = r#"{"metadata":{"name":"web","namespace":"default"},
+        "spec":{"containers":[{"name":"c"}],
+            "volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"data"}}]},
+        "status":{"phase":"Running"}}"#;
+
+    /// One node, `n1`, with allocatable capacity.
+    const NODE_LIST: &str =
+        r#"{"metadata":{"name":"n1"},"status":{"allocatable":{"cpu":"4","memory":"8Gi"}}}"#;
+
+    #[tokio::test]
+    async fn a_cluster_with_prometheus_takes_disk_and_network_from_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, seen) = serve(|request| {
+            if request.contains("/proxy/api/v1/query") {
+                prometheus_route(request)
+            } else if request.contains(" /api/v1/nodes") {
+                list(NODE_LIST)
+            } else if request.contains(" /api/v1/namespaces/default/pods") {
+                list(WEB_POD)
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+        backend.target.prometheus = Some(prometheus_service());
+
+        let metrics = backend.collect().await.expect("collects");
+
+        let capacity = metrics.capacity.expect("nodes are listed");
+        assert_eq!(capacity.disk.capacity_bytes, 100, "only listed nodes count");
+        assert!(
+            (capacity.usage.usage.disk_percent - 60.0).abs() < 1e-9,
+            "the disk ring"
+        );
+        assert_eq!(capacity.nodes[0].disk.map(|d| d.used_bytes), Some(60));
+        assert_eq!(capacity.net.map(|n| n.tx_bytes_per_sec), Some(2000));
+        // The claim reaches the pod through its spec.
+        let pods = metrics.namespaces[0].pods.as_deref().expect("pods listed");
+        assert_eq!(pods[0].pvc.map(|c| c.capacity_bytes), Some(30));
+        assert_eq!(pods[0].net.map(|n| n.rx_bytes_per_sec), Some(10));
+        let seen = seen.lock().expect("stub log lock");
+        assert!(
+            !seen.iter().any(|r| r.contains("/stats/summary")),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_kubelet_stats_are_not_requested_again_until_reconnect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, seen) = serve(|request| {
+            if request.contains("/stats/summary") {
+                failure("403 Forbidden")
+            } else if request.contains(" /api/v1/nodes") {
+                list(NODE_LIST)
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+
+        for _ in 0..2 {
+            let metrics = backend.collect().await.expect("collects without stats");
+            assert!(
+                metrics
+                    .capacity
+                    .is_some_and(|c| c.disk == Capacity::default())
+            );
+        }
+
+        let stats_requests = || {
+            let seen = seen.lock().expect("stub log lock");
+            seen.iter().filter(|r| r.contains("/stats/summary")).count()
+        };
+        assert_eq!(stats_requests(), 1);
+
+        // Setting Prometheus and clearing it again, as after `nodes/proxy`
+        // was granted, tries kubelet stats again without a reconnect.
+        let mut with_prometheus = backend.target().clone();
+        with_prometheus.prometheus = Some(prometheus_service());
+        backend.set_target(with_prometheus);
+        let mut cleared = backend.target().clone();
+        cleared.prometheus = None;
+        backend.set_target(cleared);
+        backend.collect().await.expect("collects");
+        assert_eq!(stats_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn kubelet_rates_restart_after_a_spell_on_prometheus() {
+        // The first kubelet poll after Prometheus must not compute a rate
+        // against counters from before it, which would average over the
+        // whole Prometheus period.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, _) = serve(|request| {
+            if request.contains("/stats/summary") {
+                let body = r#"{"node":{"nodeName":"n1","network":{"rxBytes":100,"txBytes":100}}}"#;
+                ("200 OK".to_string(), body.to_string())
+            } else if request.contains("/proxy/api/v1/query") {
+                prometheus_route(request)
+            } else if request.contains(" /api/v1/nodes") {
+                list(NODE_LIST)
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+        let net = |metrics: ClusterMetrics| metrics.capacity.and_then(|c| c.net);
+
+        let kubelet = backend.target().clone();
+        assert_eq!(
+            net(backend.collect().await.expect("kubelet poll")),
+            None,
+            "one sample"
+        );
+        let steady = backend.collect().await.expect("kubelet poll");
+        assert_eq!(
+            net(steady).map(|n| n.rx_bytes_per_sec),
+            Some(0),
+            "a second kubelet sample gives a rate"
+        );
+        let mut prometheus = kubelet.clone();
+        prometheus.prometheus = Some(prometheus_service());
+        backend.set_target(prometheus);
+        let on_prometheus = backend.collect().await.expect("Prometheus poll");
+        assert!(net(on_prometheus).is_some(), "Prometheus has rates at once");
+        backend.set_target(kubelet);
+        let back = backend.collect().await.expect("kubelet poll");
+
+        assert_eq!(net(back), None, "one kubelet sample has no rate yet");
+
+        // Pod counters go too, not only the cluster's.
+        let start = Instant::now();
+        let sample = NetSample {
+            rx_bytes: 1,
+            tx_bytes: 1,
+            at: start,
+        };
+        let state = backend.namespaces.entry("default".to_string()).or_default();
+        state.prev_pod_net.insert("web".to_string(), sample);
+        let reading = prometheus::Reading {
+            figures: HostFigures::default(),
+            failure: None,
+        };
+        backend.host_figures(HostSource::Prometheus(reading), &["default".to_string()]);
+        assert!(backend.namespaces["default"].prev_pod_net.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_nodes_is_no_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, _) = serve(|_| list(""));
+        let client = connect(Some(token_kubeconfig(&dir, &url)), "ctx")
+            .await
+            .expect("client builds");
+
+        let stats = fetch_all_node_stats(&client, &[]).await;
+
+        assert!(
+            matches!(stats, StatsList::Summaries(ref s) if s.is_empty()),
+            "{stats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_are_retried_when_a_refusal_comes_with_other_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (url, seen) = serve(|request| {
+            if request.contains("/nodes/n1/proxy/stats/summary") {
+                failure("403 Forbidden")
+            } else if request.contains("/stats/summary") {
+                failure("500 Internal Server Error")
+            } else if request.contains(" /api/v1/nodes") {
+                list(&format!("{NODE_LIST},{}", NODE_LIST.replace("n1", "n2")))
+            } else {
+                list("")
+            }
+        });
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(&dir, &url));
+
+        for _ in 0..2 {
+            backend.collect().await.expect("collects without stats");
+        }
+
+        let seen = seen.lock().expect("stub log lock");
+        let stats_requests = seen.iter().filter(|r| r.contains("/stats/summary")).count();
+        assert_eq!(stats_requests, 4, "a down node is not a refusal: {seen:?}");
     }
 
     #[tokio::test]
@@ -844,7 +1362,7 @@ current-context: "local"
         };
 
         let reports = backend
-            .namespace_reports(&client, vec![listing], &[], &[])
+            .namespace_reports(&client, vec![listing], &HostFigures::default(), &[])
             .await;
 
         assert_eq!(reports.len(), 1);
@@ -855,6 +1373,7 @@ current-context: "local"
 
     fn backend() -> K8sBackend {
         K8sBackend::new(K8sTarget {
+            prometheus: None,
             name: "prod".into(),
             kubeconfig: None,
             context: "ctx".to_string(),
@@ -881,16 +1400,16 @@ current-context: "local"
                 memory_percent: 75.0,
             })
         );
-        assert!(!backend.requests_forbidden);
+        assert!(!backend.refused.requests);
 
         assert_eq!(backend.requested(RequestList::Failed, &allocatable), None);
-        assert!(!backend.requests_forbidden, "a failure is retried");
+        assert!(!backend.refused.requests, "a failure is retried");
 
         assert_eq!(
             backend.requested(RequestList::Forbidden, &allocatable),
             None
         );
-        assert!(backend.requests_forbidden, "a refusal is not");
+        assert!(backend.refused.requests, "a refusal is not");
     }
 
     /// A listing of `namespace` whose pods are each run by one Job.

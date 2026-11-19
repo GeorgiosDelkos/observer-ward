@@ -134,8 +134,8 @@ impl Backend {
     }
 
     /// Take `server` if this backend connects where it does, adopting its
-    /// watched namespaces and hidden workloads. Any other edit means a
-    /// fresh connection.
+    /// watched namespaces, hidden workloads and Prometheus service. Any
+    /// other edit means a fresh connection.
     fn adopt(&mut self, server: &ServerConfig) -> bool {
         match (self, server) {
             (Backend::Ssh(backend), ServerConfig::Ssh(target)) => backend.target() == target,
@@ -895,6 +895,7 @@ mod tests {
     /// A cluster watching `default`, with `hidden` hidden there.
     fn k8s_server(name: &str, hidden: impl IntoIterator<Item = WorkloadRef>) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
+            prometheus: None,
             name: name.into(),
             kubeconfig: None,
             context: "ctx".to_string(),

@@ -392,6 +392,7 @@ function clusterMenu(cluster) {
     { label: "Copy metrics", run: () => copy(metricsSummary(cluster)), hidden: !totals },
     { label: "Copy error", run: () => copy(error), hidden: !error },
     { label: "Watch another namespace", run: () => go({ page: "add", cluster, back: "cluster" }) },
+    { label: "Prometheus…", run: () => openPrometheusSheet(cluster) },
     { label: "Remove cluster…", danger: true, run: () => confirmRemove(cluster, "cluster") },
   ];
 }
@@ -519,6 +520,25 @@ function confirmUnwatch(cluster, namespace) {
   });
 }
 
+/** Where the cluster's disk and network figures come from: a Prometheus service, or kubelet stats. */
+function openPrometheusSheet(cluster) {
+  const current = serverConfig(cluster)?.prometheus ?? "";
+  sheetConfirm = async () => {
+    const service = els.sheet.querySelector("#sheet-prometheus").value.trim() || null;
+    setConfig(await invoke("set_prometheus", { server: cluster, service }));
+  };
+  openSheet(`<h2 id="sheet-title">Prometheus for ${escapeHtml(displayName(cluster))}</h2>
+    <p>Disk and network figures come from this Prometheus, through the cluster's service proxy, instead of kubelet stats. Leave it empty to use kubelet stats.</p>
+    <div class="field"><label for="sheet-prometheus">Service</label>
+      <input id="sheet-prometheus" type="text" placeholder="monitoring/prometheus-server:80" value="${escapeHtml(current)}"
+        spellcheck="false" autocomplete="off" data-autofocus></div>
+    <p class="form-error" id="sheet-error" hidden></p>
+    <div class="sheet-actions">
+      <button class="pill" data-sheet="cancel">Cancel</button>
+      <button class="pill primary" data-sheet="confirm">Save</button>
+    </div>`);
+}
+
 function openHiddenSheet(cluster, namespace) {
   sheetConfirm = null;
   const list = hiddenOf(cluster, namespace);
@@ -634,17 +654,23 @@ document.addEventListener("keydown", (e) => {
 
 // Keep focus inside an open sheet.
 els.overlay.addEventListener("keydown", (e) => {
+  // Enter in a sheet's field saves, like its confirm button.
+  if (e.key === "Enter" && e.target.matches("input")) {
+    e.preventDefault();
+    els.sheet.querySelector('[data-sheet="confirm"]:not([disabled])')?.click();
+    return;
+  }
   if (e.key !== "Tab") {
     return;
   }
-  const buttons = [...els.sheet.querySelectorAll("button:not([disabled])")];
-  if (buttons.length === 0) {
+  const controls = [...els.sheet.querySelectorAll("input, button:not([disabled])")];
+  if (controls.length === 0) {
     return;
   }
-  const index = buttons.indexOf(document.activeElement);
+  const index = controls.indexOf(document.activeElement);
   const step = e.shiftKey ? -1 : 1;
   e.preventDefault();
-  buttons[(index + step + buttons.length) % buttons.length].focus();
+  controls[(index + step + controls.length) % controls.length].focus();
 });
 
 // ── Init ────────────────────────────────────────

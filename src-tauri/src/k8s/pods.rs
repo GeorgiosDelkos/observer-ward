@@ -8,8 +8,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::config::WorkloadRef;
 use crate::metrics::{
-    Bound, Capacity, Ceiling, CeilingSource, NetSample, NodeMetrics, PodMetrics, PodStatus,
-    PodUsage, Resources, Usage,
+    Bound, Capacity, Ceiling, CeilingSource, NetRate, NodeMetrics, PodMetrics, PodStatus, PodUsage,
+    Resources, Usage,
 };
 
 use super::error::K8sError;
@@ -25,8 +25,8 @@ pub(super) struct PodContext<'a> {
     /// measured against.
     pub(super) nodes: &'a [NodeMetrics],
     pub(super) pvc: &'a HashMap<String, Capacity>,
-    pub(super) net: &'a HashMap<String, NetSample>,
-    pub(super) prev_net: &'a HashMap<String, NetSample>,
+    /// Throughput per pod name.
+    pub(super) net: &'a HashMap<String, NetRate>,
     pub(super) events: &'a HashMap<String, String>,
     /// Workloads whose pods get no card, and so no further work.
     pub(super) hidden: &'a BTreeSet<WorkloadRef>,
@@ -114,10 +114,7 @@ fn pod_card(
     usage: Option<PodUsage>,
     ctx: &PodContext<'_>,
 ) -> PodMetrics {
-    let net = match (ctx.net.get(name), ctx.prev_net.get(name)) {
-        (Some(now), Some(prev)) => now.rate_since(prev),
-        (Some(_) | None, None) | (None, Some(_)) => None,
-    };
+    let net = ctx.net.get(name).copied();
     PodMetrics {
         name: name.to_string(),
         workload,
@@ -213,6 +210,34 @@ fn node_allocatable(pod: &Pod, nodes: &[NodeMetrics]) -> Option<(Resources, Ceil
     }
     let cluster = node_totals(nodes).allocatable;
     (cluster != Resources::default()).then_some((cluster, CeilingSource::Cluster))
+}
+
+/// PVC usage per pod name, summed over the claims each pod in `specs`
+/// mounts, from usage keyed by claim. A pod without a known claim is absent.
+pub(super) fn pvc_by_pod(
+    specs: &[Pod],
+    by_claim: &HashMap<String, Capacity>,
+) -> HashMap<String, Capacity> {
+    specs
+        .iter()
+        .filter_map(|pod| {
+            let name = pod.metadata.name.clone()?;
+            let volumes = pod.spec.as_ref()?.volumes.as_ref()?;
+            let mut total: Option<Capacity> = None;
+            for volume in volumes {
+                let Some(claim) = &volume.persistent_volume_claim else {
+                    continue;
+                };
+                let Some(usage) = by_claim.get(&claim.claim_name) else {
+                    continue;
+                };
+                let sum = total.get_or_insert_with(Capacity::default);
+                sum.used_bytes = sum.used_bytes.saturating_add(usage.used_bytes);
+                sum.capacity_bytes = sum.capacity_bytes.saturating_add(usage.capacity_bytes);
+            }
+            Some((name, total?))
+        })
+        .collect()
 }
 
 /// Kind of a pod without a controller, which is its own workload.
@@ -479,7 +504,6 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
-    use std::time::Instant;
 
     use k8s_openapi::api::core::v1::{
         Container, ContainerState, ContainerStateTerminated, ContainerStateWaiting,
@@ -638,8 +662,7 @@ mod tests {
 
     struct Maps {
         pvc: HashMap<String, Capacity>,
-        net: HashMap<String, NetSample>,
-        prev_net: HashMap<String, NetSample>,
+        net: HashMap<String, NetRate>,
         events: HashMap<String, String>,
         hidden: BTreeSet<WorkloadRef>,
         job_owners: JobOwners,
@@ -651,7 +674,6 @@ mod tests {
             Self {
                 pvc: HashMap::new(),
                 net: HashMap::new(),
-                prev_net: HashMap::new(),
                 events: HashMap::new(),
                 hidden: BTreeSet::new(),
                 job_owners: JobOwners::new(),
@@ -664,7 +686,6 @@ mod tests {
                 nodes: &self.nodes,
                 pvc: &self.pvc,
                 net: &self.net,
-                prev_net: &self.prev_net,
                 events: &self.events,
                 hidden: &self.hidden,
                 job_owners: &self.job_owners,
@@ -1041,34 +1062,76 @@ mod tests {
     }
 
     #[test]
-    fn assemble_pods_rates_network_from_two_samples() {
-        let start = Instant::now();
+    fn assemble_pods_carries_each_pods_network_rate() {
         let mut maps = Maps::empty();
-        maps.prev_net.insert(
-            "web".to_string(),
-            NetSample {
-                rx_bytes: 0,
-                tx_bytes: 0,
-                at: start,
-            },
-        );
         maps.net.insert(
             "web".to_string(),
-            NetSample {
-                rx_bytes: 2_000,
-                tx_bytes: 1_000,
-                at: start + std::time::Duration::from_secs(1),
+            NetRate {
+                rx_bytes_per_sec: 2_000,
+                tx_bytes_per_sec: 1_000,
             },
         );
 
         let pods = assemble_pods(
-            &[sample("web", "1m", "1Mi")],
-            &[named_pod("web")],
+            &[sample("web", "1m", "1Mi"), sample("db", "1m", "1Mi")],
+            &[named_pod("web"), named_pod("db")],
             &maps.ctx(),
         );
 
-        let net = pods[0].net.expect("rate from two samples");
-        assert_eq!((net.rx_bytes_per_sec, net.tx_bytes_per_sec), (2_000, 1_000));
+        let net = pods.iter().find(|p| p.name == "web").and_then(|p| p.net);
+        assert_eq!(net.map(|n| n.rx_bytes_per_sec), Some(2_000));
+        assert_eq!(
+            pods.iter().find(|p| p.name == "db").and_then(|p| p.net),
+            None
+        );
+    }
+
+    #[test]
+    fn pvc_usage_by_claim_is_summed_per_pod() {
+        use k8s_openapi::api::core::v1::{PersistentVolumeClaimVolumeSource, PodSpec, Volume};
+
+        let claim = |name: &str| Volume {
+            name: name.to_string(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: name.to_string(),
+                ..PersistentVolumeClaimVolumeSource::default()
+            }),
+            ..Volume::default()
+        };
+        let mut db = named_pod("db-0");
+        db.spec = Some(PodSpec {
+            volumes: Some(vec![claim("data-db-0"), claim("wal-db-0"), claim("gone")]),
+            ..PodSpec::default()
+        });
+        let by_claim = HashMap::from([
+            (
+                "data-db-0".to_string(),
+                Capacity {
+                    used_bytes: 1,
+                    capacity_bytes: 10,
+                },
+            ),
+            (
+                "wal-db-0".to_string(),
+                Capacity {
+                    used_bytes: 2,
+                    capacity_bytes: 20,
+                },
+            ),
+        ]);
+
+        let by_pod = pvc_by_pod(&[db, named_pod("web")], &by_claim);
+
+        assert_eq!(
+            by_pod,
+            HashMap::from([(
+                "db-0".to_string(),
+                Capacity {
+                    used_bytes: 3,
+                    capacity_bytes: 30
+                }
+            )])
+        );
     }
 
     fn owned_pod(kind: &str, owner: &str, hash_label: Option<(&str, &str)>) -> Pod {

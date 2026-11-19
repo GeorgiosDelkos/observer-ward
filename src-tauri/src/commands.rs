@@ -235,6 +235,37 @@ pub(crate) async fn show_workload(
     Ok(next)
 }
 
+/// Read cluster `server`'s disk, network and PVC figures from the
+/// Prometheus `service` (`namespace/service:port`), or from kubelet stats
+/// again when `service` is `None` or blank.
+#[tauri::command]
+pub(crate) async fn set_prometheus(
+    store: State<'_, Arc<ConfigStore>>,
+    wake: State<'_, WakeState>,
+    server: String,
+    service: Option<String>,
+) -> CommandResult<AppConfig> {
+    let service = prometheus_field(service)?;
+    let next = store
+        .update(|config| {
+            k8s_target_mut(config, &server)?.prometheus = service;
+            Ok::<_, CommandError>(())
+        })
+        .await?;
+    wake.0.notify_one();
+    Ok(next)
+}
+
+/// The Prometheus service a form field names: `None` when blank.
+fn prometheus_field(
+    field: Option<String>,
+) -> Result<Option<config::PrometheusService>, ConfigError> {
+    field
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| text.parse())
+        .transpose()
+}
+
 /// The hidden workloads of `namespace` in cluster `server`.
 fn hidden_mut<'a>(
     config: &'a mut AppConfig,
@@ -544,13 +575,26 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::{CommandError, hidden_mut, open_url, unwatch, validate_new_server};
+    use super::{
+        CommandError, hidden_mut, open_url, prometheus_field, unwatch, validate_new_server,
+    };
     use crate::config::{
         AppConfig, K8sTarget, ServerConfig, SshTarget, WatchedNamespace, WorkloadRef,
     };
 
+    #[test]
+    fn a_blank_prometheus_field_means_kubelet_stats() {
+        for blank in [None, Some(String::new()), Some("   ".to_string())] {
+            assert!(matches!(prometheus_field(blank), Ok(None)));
+        }
+        let set = prometheus_field(Some(" monitoring/prometheus-server:80 ".to_string()));
+        assert!(matches!(set, Ok(Some(ref s)) if s.service == "prometheus-server"));
+        assert!(prometheus_field(Some("prometheus-server".to_string())).is_err());
+    }
+
     fn cluster(name: &str, context: &str, namespaces: &[&str]) -> ServerConfig {
         ServerConfig::K8s(K8sTarget {
+            prometheus: None,
             name: name.into(),
             kubeconfig: None,
             context: context.to_string(),

@@ -770,6 +770,7 @@ pub(crate) mod tests {
             .workload
             .clone();
         let target = K8sTarget {
+            prometheus: None,
             name: "prod".into(),
             kubeconfig: None,
             context: "ctx".to_string(),

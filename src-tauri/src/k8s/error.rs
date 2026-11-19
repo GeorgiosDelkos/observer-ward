@@ -37,6 +37,17 @@ pub(crate) enum K8sError {
     },
     #[error("failed to create kube client")]
     CreateClient(#[source] Box<kube::Error>),
+    #[error("failed to build Prometheus query request")]
+    BuildPrometheusRequest {
+        #[source]
+        source: http::Error,
+    },
+    #[error("failed to query Prometheus {service}")]
+    QueryPrometheus {
+        service: String,
+        #[source]
+        source: Box<kube::Error>,
+    },
     /// The kubeconfig's exec credential plugin ran and failed, with what it printed to
     /// stderr. Stands in for kube's error, whose message dumps the command's environment.
     #[error("credential plugin failed: {detail}")]

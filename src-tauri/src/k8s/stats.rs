@@ -126,32 +126,21 @@ pub(super) fn encode_path_segment(s: &str) -> String {
     out
 }
 
-/// Node filesystem and network totals across the cluster.
+/// Node network counters across the cluster. Disk totals come from
+/// [`node_disks`] through `HostFigures::cluster_disk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClusterTotals {
-    pub(super) disk: Capacity,
     pub(super) rx_bytes: u64,
     pub(super) tx_bytes: u64,
 }
 
 pub(super) fn cluster_totals(summaries: &[StatsSummary]) -> ClusterTotals {
     let mut totals = ClusterTotals {
-        disk: Capacity::default(),
         rx_bytes: 0,
         tx_bytes: 0,
     };
 
     for summary in summaries {
-        if let Some(fs) = &summary.node.fs {
-            totals.disk.used_bytes = totals
-                .disk
-                .used_bytes
-                .saturating_add(fs.used_bytes.unwrap_or(0));
-            totals.disk.capacity_bytes = totals
-                .disk
-                .capacity_bytes
-                .saturating_add(fs.capacity_bytes.unwrap_or(0));
-        }
         if let Some(net) = &summary.node.network {
             let (rx, tx) = net.effective_bytes();
             totals.rx_bytes = totals.rx_bytes.saturating_add(rx);
@@ -164,11 +153,11 @@ pub(super) fn cluster_totals(summaries: &[StatsSummary]) -> ClusterTotals {
 
 /// Each node's root filesystem, keyed by node name. A summary without a
 /// name or a filesystem is left out.
-pub(super) fn node_disks(summaries: &[StatsSummary]) -> HashMap<&str, Capacity> {
+pub(super) fn node_disks(summaries: &[StatsSummary]) -> HashMap<String, Capacity> {
     summaries
         .iter()
         .filter_map(|summary| {
-            let name = summary.node.node_name.as_deref()?;
+            let name = summary.node.node_name.clone()?;
             let fs = summary.node.fs.as_ref()?;
             let disk = Capacity {
                 used_bytes: fs.used_bytes.unwrap_or(0),
@@ -262,12 +251,24 @@ pub(super) async fn fetch_node_stats(
         })
 }
 
+/// Kubelet stats of a poll's nodes.
+#[derive(Debug)]
+pub(super) enum StatsList {
+    /// The nodes that answered. One that refused is left out silently,
+    /// one that failed otherwise is logged and left out.
+    Summaries(Vec<StatsSummary>),
+    /// Every node refused (no `nodes/proxy` permission); nothing logged.
+    Forbidden,
+}
+
 /// Fetch kubelet stats summaries from the given cluster nodes.
 ///
-/// Nodes are fetched concurrently. Individual node failures
-/// are logged and skipped rather than aborting the entire
-/// operation.
-pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Vec<StatsSummary> {
+/// Nodes are fetched concurrently. Individual node failures are logged and
+/// skipped rather than aborting the entire operation, except refusals: when
+/// every node refused, the result is [`StatsList::Forbidden`] for the
+/// caller to report once. Refusals mixed with other failures (nodes that
+/// are down) are not a verdict, so the next poll tries again.
+pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> StatsList {
     let mut tasks = JoinSet::new();
 
     for node in nodes {
@@ -285,10 +286,16 @@ pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Vec
         });
     }
 
+    let tasks_spawned = tasks.len();
     let mut summaries = Vec::with_capacity(nodes.len());
+    let mut refused = 0_usize;
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok(Ok(summary)) => summaries.push(summary),
+            Ok(Err(K8sError::FetchNodeStats { source, .. })) if matches!(&*source, kube::Error::Api(status) if status.is_forbidden()) =>
+            {
+                refused += 1;
+            }
             Ok(Err(e)) => {
                 tracing::warn!("skipping node stats: {}", crate::error::error_chain(&e));
             }
@@ -298,7 +305,10 @@ pub(super) async fn fetch_all_node_stats(client: &Client, nodes: &[Node]) -> Vec
         }
     }
 
-    summaries
+    if refused > 0 && refused == tasks_spawned {
+        return StatsList::Forbidden;
+    }
+    StatsList::Summaries(summaries)
 }
 
 #[cfg(test)]
@@ -318,23 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn cluster_totals_sum_nodes() {
-        let a = summary_json(
-            r#"{"node": {"fs": {"usedBytes": 10, "capacityBytes": 100},
-                         "network": {"rxBytes": 1, "txBytes": 2}}}"#,
-        );
-        let b = summary_json(r#"{"node": {"fs": {"usedBytes": 30, "capacityBytes": 100}}}"#);
+    fn cluster_totals_sum_node_networks() {
+        let a = summary_json(r#"{"node": {"network": {"rxBytes": 1, "txBytes": 2}}}"#);
+        let b = summary_json(r#"{"node": {"network": {"rxBytes": 10, "txBytes": 20}}}"#);
+        let no_network = summary_json(r#"{"node": {}}"#);
 
-        let totals = cluster_totals(&[a, b]);
+        let totals = cluster_totals(&[a, b, no_network]);
 
-        assert_eq!(
-            totals.disk,
-            Capacity {
-                used_bytes: 40,
-                capacity_bytes: 200
-            }
-        );
-        assert_eq!((totals.rx_bytes, totals.tx_bytes), (1, 2));
+        assert_eq!((totals.rx_bytes, totals.tx_bytes), (11, 22));
     }
 
     #[test]
@@ -351,7 +352,7 @@ mod tests {
         assert_eq!(
             disks,
             HashMap::from([(
-                "n1",
+                "n1".to_string(),
                 Capacity {
                     used_bytes: 10,
                     capacity_bytes: 100

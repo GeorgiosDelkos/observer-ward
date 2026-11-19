@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A cluster can read node disk, node and pod network, and PVC usage from a Prometheus inside it (`prometheus: "namespace/service:port"` on the cluster, the port a number or a name, set from the cluster menu with "Prometheus…" or the `set_prometheus` command), through the API server's service proxy. It needs `services/proxy` in that namespace instead of `nodes/proxy`. A malformed value in the file is ignored with a warning, not a reason to set the config aside
 - Night Glass popover: overview (attention list, cluster rings with requested capacity, node matrix, namespace rows, hosts), cluster page (sparkline history, nodes with conditions and their pods, namespaces), and namespace page (pods grouped by workload with a ready count); native macOS blur behind the window, bundled Geist fonts
 - Add form picks namespaces from the cluster (`list_namespaces` command) and can watch another namespace of an existing cluster
 - UI unit tests for the model and formatting, run in CI with `node --test`
@@ -30,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `save_config_cmd` is replaced by `save_settings`, which never touches the server list; terminal commands take a server name instead of connection details
 - Config changes are validated (new names unique and without `/`, changed poll intervals in range); the `poll_interval_secs` alias is gone
 - Grafana token is cached and re-read only after a change or a 401/403
+- Refused kubelet stats (`nodes/proxy`) are logged once and not requested again until the client reconnects, instead of one warning per node on every poll
 - Polls run exec credential plugins non-interactively (`interactiveMode: Never`), so a background poll never opens a browser to sign in, and a failed plugin reports what it printed instead of kube's dump of its command and environment
 - Grafana URLs must be https (http only for loopback), so the token never crosses the network in cleartext
 - A host key that cannot be written to `known_hosts` is refused instead of accepted unrecorded

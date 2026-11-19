@@ -1250,6 +1250,13 @@ button.a-row:hover {
   line-height: 1.5;
 }
 
+/* A sheet already sits on the text edge, and its paragraph colour would
+   otherwise win over the error colour. */
+.sheet .form-error {
+  padding: 0;
+  color: #ff9aa6;
+}
+
 .sheet-actions {
   display: flex;
   justify-content: flex-end;

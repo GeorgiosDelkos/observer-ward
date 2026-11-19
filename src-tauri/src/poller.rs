@@ -29,6 +29,13 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
 const BACKOFF_DURATION: Duration = Duration::from_mins(2);
 
+/// How long a cluster that needs a login is left alone unless a login
+/// lifts it. Arbitrary: long enough that an ignored expired session starts
+/// a browser sign-in only every so often, short enough that a transient
+/// failure (VPN down, a slow API server timing out a plugin cluster)
+/// recovers by itself.
+const LOGIN_HOLD: Duration = Duration::from_mins(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackoffDecision {
     Ready,
@@ -300,10 +307,10 @@ impl ServerPool {
             self.failures.remove(server.name());
             return None;
         }
-        // Only a login helps, and polling again would run the credential
-        // plugin again, which may start another browser sign-in. `k8s_login`
-        // lifts this through `retry_now`.
-        if needs_login(&state.last_report) {
+        // A login is the likely fix, and polling again would run the
+        // credential plugin again, which may start another browser sign-in.
+        // `k8s_login` lifts this early through `retry_now`.
+        if needs_login(&state.last_report) && state.last_attempt.elapsed() < LOGIN_HOLD {
             return Some(state.last_report.clone());
         }
         match backoff_decision(state.count, state.last_attempt.elapsed()) {
@@ -793,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_needing_login_is_held_until_a_retry_names_it() {
+    fn a_cluster_needing_login_is_held_until_a_retry_or_the_hold_ends() {
         let mut pool = ServerPool::default();
         let server = k8s_server("prod", []);
         let expired = ServerReport::K8s {
@@ -832,6 +839,14 @@ mod tests {
         retry.request("prod".into());
         pool.retry_now(&retry);
         assert!(pool.backoff_report(&server).is_none());
+
+        // Without a login, the hold ends by itself.
+        pool.record(&server, &expired);
+        let state = pool.failures.get_mut("prod").expect("recorded");
+        state.last_attempt = Instant::now()
+            .checked_sub(LOGIN_HOLD)
+            .expect("the clock is past one hold");
+        assert!(pool.backoff_report(&server).is_none(), "the hold expired");
     }
 
     fn ssh_server(name: &str, host: &str) -> ServerConfig {

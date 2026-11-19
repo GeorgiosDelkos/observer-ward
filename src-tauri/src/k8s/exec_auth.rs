@@ -16,7 +16,9 @@
 //! <https://github.com/thenervelab/ci-actions/blob/dc2cf234b1276c861c32c722e81f73a042699111/kubectl-bao/kubectl-bao>
 //! ignores it, so until it does, a poll whose session has expired starts a browser
 //! sign-in. kube runs the plugin on a blocking thread that the poll timeout does not
-//! cancel, so the next poll may start another while the first waits.
+//! cancel. The poller then holds the cluster for a while instead of polling it into
+//! another sign-in; a login during that time runs the plugin again while the first
+//! run may still be waiting, so two sign-ins can be open at once.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -95,16 +97,6 @@ async fn read_shell_path(shell: &Path) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let path = stdout.split(PATH_MARKER).nth(1)?;
     (!path.is_empty()).then(|| path.to_string())
-}
-
-/// Whether any user in `kubeconfig` runs an exec plugin.
-pub(super) fn has_plugins(kubeconfig: &Kubeconfig) -> bool {
-    kubeconfig.auth_infos.iter().any(|named| {
-        named
-            .auth_info
-            .as_ref()
-            .is_some_and(|auth| auth.exec.is_some())
-    })
 }
 
 /// Whether the user that `context` names runs an exec plugin.
@@ -560,19 +552,16 @@ contexts:
     }
 
     #[test]
-    fn plugins_are_found_per_kubeconfig_and_per_context() {
+    fn plugins_are_found_per_context() {
         let fixture = ok_plugin();
         let kubeconfig = crate::k8s::kubeconfig::load(Some(&fixture.kubeconfig)).expect("load");
 
-        assert!(super::has_plugins(&kubeconfig));
         assert!(super::uses_plugin(&kubeconfig, "ctx"));
         assert!(!super::uses_plugin(&kubeconfig, "plain"), "a static token");
-
-        let mut tokens_only = kubeconfig;
-        tokens_only
-            .auth_infos
-            .retain(|named| named.name == "static");
-        assert!(!super::has_plugins(&tokens_only));
+        assert!(
+            !super::uses_plugin(&kubeconfig, "nowhere"),
+            "an unknown context"
+        );
     }
 
     #[test]

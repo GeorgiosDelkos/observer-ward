@@ -20,48 +20,49 @@
 /// A failed kubeconfig credential plugin is rendered as what it printed to
 /// stderr: kube's own message for it is the `Debug` print of the command,
 /// with every environment variable set on it (credentials, for some
-/// plugins), and of the raw output bytes.
+/// plugins), and of the raw output bytes. kube wraps that failure in
+/// errors whose `Display` embeds it (`Error::Auth`, and `Error::Service`
+/// on a token refresh), so the rendering stops at the first link that
+/// contains its text.
 pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    if let Some(stderr) = plugin_stderr(err) {
-        return plugin_failure(stderr);
-    }
-    let mut rendered = err.to_string();
-    let mut cause = err.source();
-    while let Some(source) = cause {
-        if let Some(stderr) = plugin_stderr(source) {
-            rendered.push_str(": ");
-            rendered.push_str(&plugin_failure(stderr));
+    let links = || std::iter::successors(Some(err), |link| link.source());
+    let plugin = links().find_map(plugin_failure);
+
+    let mut rendered = String::new();
+    for link in links() {
+        let text = link.to_string();
+        if let Some((dump, stderr)) = &plugin
+            && text.contains(dump.as_str())
+        {
+            let failure = crate::k8s::K8sError::CredentialPlugin {
+                detail: crate::k8s::stderr_summary(stderr),
+            };
+            push_link(&mut rendered, &failure.to_string());
             break;
         }
-        let text = source.to_string();
         if !rendered.ends_with(&text) {
-            rendered.push_str(": ");
-            rendered.push_str(&text);
+            push_link(&mut rendered, &text);
         }
-        cause = source.source();
     }
     rendered
 }
 
-/// What a failed credential plugin printed to stderr, when `err` is that
-/// failure: kube's `AuthError::AuthExecRun`, or the `kube::Error::Auth`
-/// around it, whose `Display` embeds the same text.
-fn plugin_stderr<'e>(err: &'e (dyn std::error::Error + 'static)) -> Option<&'e [u8]> {
-    let auth = match err.downcast_ref::<kube::Error>() {
-        Some(kube::Error::Auth(auth)) => auth,
-        _ => err.downcast_ref::<kube::client::AuthError>()?,
-    };
-    match auth {
-        kube::client::AuthError::AuthExecRun { out, .. } => Some(&out.stderr),
-        _ => None,
+fn push_link(rendered: &mut String, text: &str) {
+    if !rendered.is_empty() {
+        rendered.push_str(": ");
     }
+    rendered.push_str(text);
 }
 
-fn plugin_failure(stderr: &[u8]) -> String {
-    format!(
-        "credential plugin failed: {}",
-        crate::k8s::stderr_summary(stderr)
-    )
+/// kube's message for a failed credential plugin run, and what the plugin
+/// printed to stderr, when `link` is that failure.
+fn plugin_failure<'e>(link: &'e (dyn std::error::Error + 'static)) -> Option<(String, &'e [u8])> {
+    match link.downcast_ref::<kube::client::AuthError>()? {
+        failure @ kube::client::AuthError::AuthExecRun { out, .. } => {
+            Some((failure.to_string(), &out.stderr))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +99,7 @@ mod tests {
         struct ListPods(#[source] kube::Error);
 
         // kube renders this as the Debug print of the command, env included.
-        let failed = kube::client::AuthError::AuthExecRun {
+        let failed = || kube::client::AuthError::AuthExecRun {
             cmd: "AWS_SECRET_ACCESS_KEY=\"hunter2\" \"aws-iam-authenticator\"".to_string(),
             out: Box::new(std::process::Output {
                 status: std::process::ExitStatus::from_raw(1 << 8),
@@ -107,8 +108,15 @@ mod tests {
             }),
         };
 
-        let rendered = error_chain(&ListPods(kube::Error::Auth(failed)));
+        let rendered = error_chain(&ListPods(kube::Error::Auth(failed())));
+        assert_eq!(
+            rendered,
+            "failed to list pods: credential plugin failed: session expired"
+        );
 
+        // A refresh on a cached client fails inside the HTTP service, which
+        // kube reports as `Error::Service` with the same text embedded.
+        let rendered = error_chain(&ListPods(kube::Error::Service(Box::new(failed()))));
         assert_eq!(
             rendered,
             "failed to list pods: credential plugin failed: session expired"

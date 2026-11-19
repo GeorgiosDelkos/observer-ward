@@ -466,9 +466,9 @@ async fn load_kubeconfig(path: Option<PathBuf>) -> Result<Kubeconfig, K8sError> 
 }
 
 /// Build a client for `context`. The login shell runs for PATH only when
-/// the kubeconfig has an exec plugin.
+/// the context's user has an exec plugin.
 async fn build_client(kubeconfig: Kubeconfig, context: &str) -> Result<Client, K8sError> {
-    let login_path = if exec_auth::has_plugins(&kubeconfig) {
+    let login_path = if exec_auth::uses_plugin(&kubeconfig, context) {
         exec_auth::login_path().await
     } else {
         None

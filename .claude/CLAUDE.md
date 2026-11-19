@@ -34,9 +34,9 @@ cargo tauri build                                   # production build
 - `terminal.rs` -- open ssh/kubectl in Warp or Terminal.app
 - `config.rs` -- `AppConfig`/`ServerConfig` models, `ConfigStore` (validated, serialized writes), JSON persistence
 - `error.rs` -- error-chain formatting at the Tauri command boundary
-- `metrics.rs` -- `ServerReport` (per-kind `Health<HostMetrics|ClusterMetrics>`, clusters hold `nodes` and `namespaces` with their pods), levels, alert types
-- `poller.rs` -- async poll loop with failure tracking and backoff
-- `k8s.rs` + `k8s/` -- one backend per cluster: Metrics API + kubelet stats, per-node reports (`k8s/nodes.rs`), cluster-wide requests (`k8s/requests.rs`), pods per watched namespace
+- `metrics.rs` -- `ServerReport` (per-kind `Health<HostMetrics|ClusterMetrics>`, clusters hold `namespaces` with their pods, and `capacity` (totals and `nodes`) unless nodes are forbidden; an offline report says whether a login may help), levels, alert types
+- `poller.rs` -- async poll loop with failure tracking and backoff; a cluster that needs a login is not polled again until `k8s_login` succeeds
+- `k8s.rs` + `k8s/` -- one backend per cluster: Metrics API + kubelet stats, per-node reports (`k8s/nodes.rs`), cluster-wide requests (`k8s/requests.rs`), pods per watched namespace; namespaces only when nodes are forbidden. `k8s/exec_auth.rs` runs exec credential plugins (kubectl-bao): login-shell PATH, non-interactive in polls, interactive in `k8s_login`
 - `ssh.rs` + `ssh/` -- SSH remote command parsing (top/free/df/proc)
 - `grafana.rs` -- Grafana Alertmanager firing alerts; token in Keychain
 

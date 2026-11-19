@@ -21,9 +21,11 @@ import {
   clusterLevel,
   clusters,
   errorOf,
+  hasCapacity,
   hiddenOf,
   hostLevel,
   hosts,
+  needsLogin,
   isAnomaly,
   metricsOf,
   namespaceLevel,
@@ -244,17 +246,28 @@ function clusterCard(server) {
     ${dot(lvl)}<b>${escapeHtml(displayName(name))}</b><span class="ctx">${escapeHtml(context)}</span>${ICONS.chev}</button>`;
   const error = errorOf(name);
   if (error) {
-    return `<div class="card">${head}<p class="err">${escapeHtml(error)}</p></div>`;
+    const login = needsLogin(name) ? `<div class="actions pad">${loginButton(name)}</div>` : "";
+    return `<div class="card">${head}<p class="err">${escapeHtml(error)}</p>${login}</div>`;
   }
   const metrics = metricsOf(name);
   if (!metrics) {
     return `<div class="card">${head}<p class="wait">Waiting for the first poll…</p></div>`;
   }
+  const nodeBlock = hasCapacity(metrics)
+    ? `<div class="gauges">${clusterRings(metrics)}</div>
+    ${nodeStrip(name, metrics.nodes)}`
+    : "";
   return `<div class="card">${head}
-    <div class="gauges">${clusterRings(metrics)}</div>
-    ${nodeStrip(name, metrics.nodes)}
+    ${nodeBlock}
     <div class="list">${nsColumns("Pods")}${metrics.namespaces.map((ns) => nsRow(name, ns, false)).join("")}</div>
   </div>`;
+}
+
+/** Runs the cluster's credential plugin, which may open the browser to sign in. */
+function loginButton(name) {
+  const busy = state.loggingIn.has(name);
+  const label = busy ? "Waiting for sign-in…" : "Log in";
+  return `<button class="pill primary" data-action="login" data-cluster="${escapeHtml(name)}"${busy ? " disabled" : ""}>${label}</button>`;
 }
 
 function clusterRings(metrics) {
@@ -352,7 +365,7 @@ function hostCard(server) {
 export function clusterTop(nav) {
   const server = serverConfig(nav.cluster);
   const metrics = metricsOf(nav.cluster);
-  const nodes = metrics ? ` · ${metrics.nodes.length} nodes` : "";
+  const nodes = metrics && hasCapacity(metrics) ? ` · ${metrics.nodes.length} nodes` : "";
   return subTop({
     title: displayName(nav.cluster),
     sub: `${server?.context ?? ""}${nodes}`,
@@ -366,11 +379,15 @@ export function clusterPage(nav) {
   const error = errorOf(name);
   if (error) {
     return `<div class="card"><p class="err big">${escapeHtml(error)}</p>
-      <div class="actions pad"><button class="pill" data-action="copy" data-text="${escapeHtml(error)}">Copy error</button></div></div>`;
+      <div class="actions pad">${needsLogin(name) ? loginButton(name) : ""}<button class="pill" data-action="copy" data-text="${escapeHtml(error)}">Copy error</button></div></div>`;
   }
   const metrics = metricsOf(name);
   if (!metrics) {
     return `<div class="card"><p class="wait">Waiting for the first poll…</p></div>`;
+  }
+  if (!hasCapacity(metrics)) {
+    return `<div class="card"><p class="wait">No access to nodes: showing namespaces only.</p></div>
+      ${namespaceList(name, metrics.namespaces)}`;
   }
   const nodesTab = nav.tab !== "namespaces";
   const seg = `<div class="seg" role="group" aria-label="Cluster view">
@@ -474,7 +491,8 @@ export function namespacePage(nav) {
   const ns = metrics?.namespaces.find((n) => n.name === nav.namespace);
   const error = errorOf(nav.cluster);
   if (error) {
-    return `<div class="card"><p class="err big">${escapeHtml(error)}</p></div>`;
+    const login = needsLogin(nav.cluster) ? `<div class="actions pad">${loginButton(nav.cluster)}</div>` : "";
+    return `<div class="card"><p class="err big">${escapeHtml(error)}</p>${login}</div>`;
   }
   if (!ns) {
     return `<div class="card"><p class="wait">Waiting for the first poll…</p></div>`;

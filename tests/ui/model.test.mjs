@@ -139,6 +139,20 @@ test("cluster health reads the flattened totals, nodes and pods", () => {
   assert.equal(clusterLevel("prod"), "warn", "a pending pod");
 });
 
+test("a cluster without node access is judged by its pods and records no history", () => {
+  // Credentials that may not list nodes: the backend sends namespaces only.
+  const report = { kind: "k8s", name: "prod", status: "online", metrics: { namespaces: [{ name: "s3", pods: [pod("gw-1")] }] } };
+  ingestMetrics({ servers: [report] });
+
+  assert.equal(clusterLevel("prod"), "ok", "missing totals are not NaN or zero-crit");
+  assert.equal(state.history.has("prod"), false);
+  assert.deepEqual(attention(), []);
+
+  const hot = { ...report, metrics: { namespaces: [{ name: "s3", pods: [pod("gw-1", { status: "CrashLoopBackOff" })] }] } };
+  ingestMetrics({ servers: [hot] });
+  assert.equal(clusterLevel("prod"), "crit", "pods still count");
+});
+
 test("attention lists critical items before warnings, each with a destination", () => {
   const namespaces = [{ name: "s3", pods: [pod("gw-1", { status: "Pending" }), pod("db-0", { status: "CrashLoopBackOff" })] }];
   const nodes = [node("n1", { ready: false })];

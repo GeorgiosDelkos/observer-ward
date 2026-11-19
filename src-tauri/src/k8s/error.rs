@@ -37,6 +37,18 @@ pub(crate) enum K8sError {
     },
     #[error("failed to create kube client")]
     CreateClient(#[source] Box<kube::Error>),
+    /// The kubeconfig's exec credential plugin ran and failed, with what it printed to
+    /// stderr. Stands in for kube's error, whose message dumps the command's environment.
+    #[error("credential plugin failed: {detail}")]
+    CredentialPlugin { detail: String },
+    #[error("context {context} has no credential plugin to log in with")]
+    NoCredentialPlugin { context: String },
+    #[error("credential plugin has no command")]
+    NoPluginCommand,
+    #[error("failed to start credential plugin")]
+    StartCredentialPlugin(#[source] std::io::Error),
+    #[error("login did not finish within {} minutes", limit.as_secs() / 60)]
+    LoginTimeout { limit: std::time::Duration },
     #[error("kubeconfig load task failed")]
     KubeconfigTask(#[source] tokio::task::JoinError),
     #[error("timed out fetching stats for node {node}")]
@@ -85,6 +97,13 @@ pub(crate) enum K8sError {
     },
     #[error(transparent)]
     Quantity(#[from] QuantityParseError),
+}
+
+impl K8sError {
+    /// Whether signing in again through the credential plugin may fix this.
+    pub(crate) fn needs_login(&self) -> bool {
+        matches!(self, Self::CredentialPlugin { .. })
+    }
 }
 
 /// Failure categories for parsing Kubernetes resource `Quantity` values.

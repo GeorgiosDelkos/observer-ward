@@ -3,7 +3,8 @@
 //! One backend per cluster. Nodes, node metrics and kubelet stats are read
 //! once per poll and reported both per node and as cluster totals; pods,
 //! events and Jobs are read for each watched namespace over the same
-//! connection.
+//! connection. Credentials that may not list nodes (a namespace-scoped
+//! account) get the namespaces alone.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,16 +13,18 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams};
+use kube::config::Kubeconfig;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::config::K8sTarget;
 use crate::metrics::{
-    ClusterMetrics, NamespaceMetrics, NetRate, NetSample, NodeMetrics, PodMetrics, Requested,
-    ResourceUsage, Resources, Usage,
+    ClusterCapacity, ClusterMetrics, NamespaceMetrics, NetRate, NetSample, NodeMetrics, PodMetrics,
+    Requested, ResourceUsage, Resources, Usage,
 };
 
 mod error;
 mod events;
+mod exec_auth;
 mod jobs;
 mod kubeconfig;
 mod metrics_api;
@@ -32,6 +35,7 @@ mod requests;
 mod stats;
 
 pub(crate) use error::K8sError;
+pub(crate) use exec_auth::{login, stderr_summary};
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
@@ -93,6 +97,15 @@ pub(crate) struct K8sBackend {
     /// Listing pods in all namespaces was refused; not retried until the
     /// client is rebuilt (new credentials may allow it).
     requests_forbidden: bool,
+    /// Listing nodes was refused and that was logged. Unlike the flags
+    /// above, the node list is still requested every poll: with nothing
+    /// else required, it is what notices expired credentials or an
+    /// unreachable cluster, since failed namespace listings only degrade.
+    nodes_forbidden: bool,
+    /// The context's user runs a kubeconfig exec credential plugin. Set
+    /// when connecting, before the plugin first runs, so a poll that times
+    /// out while the plugin waits can still be told apart.
+    credential_plugin: bool,
 }
 
 /// What a backend remembers about one watched namespace between polls.
@@ -121,6 +134,8 @@ impl K8sBackend {
             prev_net: None,
             namespaces: HashMap::new(),
             requests_forbidden: false,
+            nodes_forbidden: false,
+            credential_plugin: false,
         }
     }
 
@@ -135,39 +150,59 @@ impl K8sBackend {
         &self.target
     }
 
+    /// Whether the cluster's credentials come from an exec plugin, which may
+    /// be waiting for a sign-in when a poll times out.
+    pub(crate) fn uses_credential_plugin(&self) -> bool {
+        self.credential_plugin
+    }
+
     /// Collect node reports, cluster totals and pod cards. Any failure
     /// drops the client so the next poll rebuilds it from the kubeconfig
     /// (picking up refreshed credentials).
     ///
     /// # Errors
     ///
-    /// [`K8sError`] if the client cannot be built or a required API call
-    /// (nodes, node metrics) fails. Pod, event, Job and request listing
-    /// failures only degrade the result.
+    /// [`K8sError`] if the client cannot be built, listing nodes fails
+    /// other than by a refusal, or listing node metrics fails. Pod, event,
+    /// Job and request listing failures only degrade the result.
     pub(crate) async fn collect(&mut self) -> Result<ClusterMetrics, K8sError> {
         let client = if let Some(client) = &self.client {
             client.clone()
         } else {
             // New credentials may be allowed what the old ones were not.
             self.requests_forbidden = false;
+            self.nodes_forbidden = false;
             for state in self.namespaces.values_mut() {
                 state.jobs_forbidden = false;
             }
-            connect(self.target.kubeconfig.clone(), &self.target.context).await?
+            let kubeconfig = load_kubeconfig(self.target.kubeconfig.clone()).await?;
+            self.credential_plugin = exec_auth::uses_plugin(&kubeconfig, &self.target.context);
+            build_client(kubeconfig, &self.target.context).await?
         };
-        let result = self.collect_with(&client).await;
+        let result = self
+            .collect_with(&client)
+            .await
+            .map_err(exec_auth::plugin_failure);
         self.client = result.is_ok().then_some(client);
         result
     }
 
     async fn collect_with(&mut self, client: &Client) -> Result<ClusterMetrics, K8sError> {
-        let nodes = fetch_nodes(client).await?;
         let watched: Vec<String> = self
             .target
             .namespaces
             .iter()
             .map(|ns| ns.name.clone())
             .collect();
+
+        let Some(nodes) = self.read_nodes(client).await? else {
+            let listings = fetch_namespaces(client, &watched).await;
+            let namespaces = self.namespace_reports(client, listings, &[], &[]).await;
+            return Ok(ClusterMetrics {
+                capacity: None,
+                namespaces,
+            });
+        };
 
         let (stats, node_usage, requests, listings) = tokio::join!(
             fetch_all_node_stats(client, &nodes),
@@ -177,16 +212,12 @@ impl K8sBackend {
         );
         let nodes = node_metrics(&nodes, &node_usage?, &node_disks(&stats));
         let totals = node_totals(&nodes);
-
-        self.namespaces.retain(|name, _| watched.contains(name));
-        self.resolve_jobs(client, &listings).await;
-        let namespaces = listings
-            .into_iter()
-            .map(|listing| self.namespace_metrics(listing, &stats, &nodes))
-            .collect();
+        let namespaces = self
+            .namespace_reports(client, listings, &stats, &nodes)
+            .await;
 
         let fs_net = cluster_totals(&stats);
-        Ok(ClusterMetrics {
+        let capacity = ClusterCapacity {
             usage: ResourceUsage {
                 usage: Usage {
                     disk_percent: fs_net.disk.percent(),
@@ -198,8 +229,50 @@ impl K8sBackend {
             disk: fs_net.disk,
             requested: self.requested(requests, &totals.allocatable),
             nodes,
+        };
+        Ok(ClusterMetrics {
+            capacity: Some(capacity),
             namespaces,
         })
+    }
+
+    /// The cluster's nodes, or `None` when listing them is refused. A
+    /// refusal is logged once per client.
+    async fn read_nodes(&mut self, client: &Client) -> Result<Option<Vec<Node>>, K8sError> {
+        let nodes_api: Api<Node> = Api::all(client.clone());
+        match nodes_api.list(&ListParams::default()).await {
+            Ok(nodes) => Ok(Some(nodes.items)),
+            Err(kube::Error::Api(status)) if status.is_forbidden() => {
+                if !self.nodes_forbidden {
+                    tracing::warn!(
+                        "no permission to list nodes of {}: showing its namespaces only",
+                        self.target.name
+                    );
+                    self.nodes_forbidden = true;
+                }
+                Ok(None)
+            }
+            Err(source) => Err(K8sError::ListNodes(Box::new(source))),
+        }
+    }
+
+    /// One report per listing, in listing order. Forgets namespaces no
+    /// longer watched and refreshes Job owners first, so hidden cron job
+    /// runs are matched.
+    async fn namespace_reports(
+        &mut self,
+        client: &Client,
+        listings: Vec<NamespaceListing>,
+        stats: &[StatsSummary],
+        nodes: &[NodeMetrics],
+    ) -> Vec<NamespaceMetrics> {
+        self.namespaces
+            .retain(|name, _| listings.iter().any(|listing| listing.name == *name));
+        self.resolve_jobs(client, &listings).await;
+        listings
+            .into_iter()
+            .map(|listing| self.namespace_metrics(listing, stats, nodes))
+            .collect()
     }
 
     /// Requests across the cluster, unless that was refused before.
@@ -367,17 +440,59 @@ impl K8sBackend {
 }
 
 /// Build a `kube::Client` for `context` of the kubeconfig at `path` (the
-/// default one when `None`).
+/// default one when `None`). Exec credential plugins run non-interactively
+/// with the login-shell PATH (see `exec_auth`).
 async fn connect(path: Option<PathBuf>, context: &str) -> Result<Client, K8sError> {
-    let kubeconfig = tokio::task::spawn_blocking(move || kubeconfig::load(path.as_deref()))
-        .await
-        .map_err(K8sError::KubeconfigTask)??;
+    let kubeconfig = load_kubeconfig(path).await?;
+    build_client(kubeconfig, context).await
+}
 
+/// [`connect`], with `login_path` as the PATH of exec plugins.
+#[cfg(test)]
+async fn connect_with(
+    path: Option<PathBuf>,
+    context: &str,
+    login_path: Option<&str>,
+) -> Result<Client, K8sError> {
+    let kubeconfig = load_kubeconfig(path).await?;
+    build_client_with(kubeconfig, context, login_path).await
+}
+
+/// The kubeconfig at `path`, or the default one when `None`.
+async fn load_kubeconfig(path: Option<PathBuf>) -> Result<Kubeconfig, K8sError> {
+    tokio::task::spawn_blocking(move || kubeconfig::load(path.as_deref()))
+        .await
+        .map_err(K8sError::KubeconfigTask)?
+}
+
+/// Build a client for `context`. The login shell runs for PATH only when
+/// the context's user has an exec plugin.
+async fn build_client(kubeconfig: Kubeconfig, context: &str) -> Result<Client, K8sError> {
+    let login_path = if exec_auth::uses_plugin(&kubeconfig, context) {
+        exec_auth::login_path().await
+    } else {
+        None
+    };
+    build_client_with(kubeconfig, context, login_path).await
+}
+
+/// [`build_client`], with `login_path` as the PATH of exec plugins.
+async fn build_client_with(
+    mut kubeconfig: Kubeconfig,
+    context: &str,
+    login_path: Option<&str>,
+) -> Result<Client, K8sError> {
+    exec_auth::prepare_for_polling(&mut kubeconfig, login_path);
     let mut config = kubeconfig::build_config(kubeconfig, context).await?;
     config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
     config.read_timeout = Some(KUBE_READ_TIMEOUT);
 
-    Client::try_from(config).map_err(|source| K8sError::CreateClient(Box::new(source)))
+    // Building the client runs an exec plugin once, synchronously, so it
+    // goes to the blocking pool (kube runs later refreshes there itself).
+    tokio::task::spawn_blocking(move || Client::try_from(config))
+        .await
+        .map_err(K8sError::KubeconfigTask)?
+        .map_err(|source| exec_auth::plugin_failure(K8sError::CreateClient(Box::new(source))))
 }
 
 /// Names of the namespaces `context` can list, sorted, so the add form
@@ -396,7 +511,7 @@ pub(crate) async fn list_namespaces(
     let list = api
         .list_metadata(&ListParams::default())
         .await
-        .map_err(|source| K8sError::ListNamespaces(Box::new(source)))?;
+        .map_err(|source| exec_auth::plugin_failure(K8sError::ListNamespaces(Box::new(source))))?;
     let mut names: Vec<String> = list
         .items
         .into_iter()
@@ -495,15 +610,6 @@ async fn fetch_pod_lists(
     Ok((samples.items, specs.items))
 }
 
-async fn fetch_nodes(client: &Client) -> Result<Vec<Node>, K8sError> {
-    let nodes_api: Api<Node> = Api::all(client.clone());
-    let nodes = nodes_api
-        .list(&ListParams::default())
-        .await
-        .map_err(|source| K8sError::ListNodes(Box::new(source)))?;
-    Ok(nodes.items)
-}
-
 /// CPU and memory each node is using now, from the Metrics API, keyed by
 /// node name.
 async fn fetch_node_usage(client: &Client) -> Result<HashMap<String, CpuMem>, K8sError> {
@@ -585,6 +691,166 @@ current-context: "local"
         std::fs::write(&path, kubeconfig).expect("write test kubeconfig");
 
         connect(Some(path), "local").await.expect("client builds");
+    }
+
+    /// A plain-HTTP stand-in for an API server that answers the node list
+    /// with `nodes` (an HTTP status line), lists namespaces `b` and `a`, and
+    /// answers every other list with no items. Returns its URL.
+    fn serve_api(nodes: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub API");
+        let url = format!("http://{}", listener.local_addr().expect("stub address"));
+        // Detached: it serves until the test process exits.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    header.clear();
+                }
+                // kube reads the failure's code from the body, not the status line.
+                let (status, body) = if request_line.contains(" /api/v1/nodes") {
+                    let code = &nodes[..3];
+                    let body = format!(
+                        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","code":{code},"message":"nodes refused"}}"#
+                    );
+                    (nodes, body)
+                } else if request_line.contains(" /api/v1/namespaces?")
+                    || request_line.contains(" /api/v1/namespaces ")
+                {
+                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[{"metadata":{"name":"b"}},{"metadata":{"name":"a"}}]}"#;
+                    ("200 OK", body.to_string())
+                } else {
+                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[]}"#;
+                    ("200 OK", body.to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = (&stream).write_all(response.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_take_a_cluster_without_node_access_offline() {
+        // With nodes forbidden every other call only degrades, so caching
+        // the refusal would leave an expired session online with stale
+        // pods, never offering a login.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expired = dir.path().join("expired");
+        let plugin = dir.path().join("plugin");
+        // The token is already expired, so kube runs the plugin before
+        // every request.
+        let script = format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then echo 'session expired' >&2; exit 1; fi\n\
+             printf '%s' '{{\"apiVersion\":\"client.authentication.k8s.io/v1\",\
+             \"kind\":\"ExecCredential\",\"status\":{{\"token\":\"t\",\
+             \"expirationTimestamp\":\"2000-01-01T00:00:00Z\"}}}}'\n",
+            expired.display()
+        );
+        std::fs::write(&plugin, script).expect("write plugin");
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755))
+            .expect("make plugin executable");
+        let kubeconfig = dir.path().join("kubeconfig.yaml");
+        let yaml = format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    \
+             server: \"{}\"\nusers:\n- name: u\n  user:\n    exec:\n      \
+             apiVersion: client.authentication.k8s.io/v1\n      command: \"{}\"\n\
+             contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n",
+            serve_api("403 Forbidden"),
+            plugin.display()
+        );
+        std::fs::write(&kubeconfig, yaml).expect("write kubeconfig");
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(kubeconfig);
+
+        let metrics = backend.collect().await.expect("namespaces only");
+        assert!(backend.uses_credential_plugin());
+        assert!(metrics.capacity.is_none());
+        assert_eq!(metrics.namespaces[0].pods.as_deref(), Some(&[][..]));
+
+        std::fs::write(&expired, "").expect("expire the session");
+        let err = backend.collect().await.expect_err("credentials expired");
+        assert!(err.needs_login(), "{}", crate::error::error_chain(&err));
+    }
+
+    /// A kubeconfig in `dir` whose context `ctx` reaches `server` with a
+    /// static token.
+    fn token_kubeconfig(dir: &tempfile::TempDir, server: &str) -> PathBuf {
+        let path = dir.path().join("kubeconfig.yaml");
+        let yaml = format!(
+            "clusters:\n- name: c\n  cluster: {{server: \"{server}\"}}\n\
+             users:\n- name: u\n  user: {{token: t}}\n\
+             contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n"
+        );
+        std::fs::write(&path, yaml).expect("write kubeconfig");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_node_list_failure_other_than_a_refusal_takes_the_cluster_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(
+            &dir,
+            &serve_api("500 Internal Server Error"),
+        ));
+
+        let err = backend.collect().await.expect_err("nodes failed");
+
+        assert!(matches!(err, K8sError::ListNodes(_)), "{err:?}");
+        assert!(!backend.uses_credential_plugin());
+    }
+
+    #[tokio::test]
+    async fn namespaces_are_listed_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kubeconfig = token_kubeconfig(&dir, &serve_api("403 Forbidden"));
+
+        let names = list_namespaces(Some(kubeconfig), "ctx")
+            .await
+            .expect("namespaces");
+
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn namespace_reports_keep_the_state_of_watched_namespaces_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kubeconfig = token_kubeconfig(&dir, "https://127.0.0.1:1");
+        let client = connect(Some(kubeconfig), "ctx")
+            .await
+            .expect("client builds");
+        let mut backend = backend();
+        for name in ["default", "unwatched"] {
+            let state = backend.namespaces.entry(name.to_string()).or_default();
+            state.jobs_forbidden = true;
+        }
+        let listing = NamespaceListing {
+            name: "default".to_string(),
+            pods: Ok((Vec::new(), Vec::new())),
+            events: HashMap::new(),
+        };
+
+        let reports = backend
+            .namespace_reports(&client, vec![listing], &[], &[])
+            .await;
+
+        assert_eq!(reports.len(), 1);
+        let kept: Vec<&String> = backend.namespaces.keys().collect();
+        assert_eq!(kept, ["default"]);
+        assert!(backend.namespaces["default"].jobs_forbidden, "state kept");
     }
 
     fn backend() -> K8sBackend {

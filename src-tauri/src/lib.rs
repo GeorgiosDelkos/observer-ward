@@ -18,15 +18,16 @@ use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
 use commands::{
-    LatestAlerts, LatestMetrics, TokenEpochState, WakeState, add_server, copy_to_clipboard,
-    delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics, has_grafana_token,
-    hide_workload, inspect_kubeconfig, list_namespaces, open_pod_logs, open_ssh_terminal, open_url,
-    pick_kubeconfig, pick_ssh_key, quit_app, remove_server, resize_window, save_settings,
-    set_grafana_token, show_workload, unwatch_namespace,
+    LatestAlerts, LatestMetrics, RetryState, TokenEpochState, WakeState, add_server,
+    copy_to_clipboard, delete_grafana_token, get_config, get_latest_alerts, get_latest_metrics,
+    has_grafana_token, hide_workload, inspect_kubeconfig, k8s_login, list_namespaces,
+    open_pod_logs, open_ssh_terminal, open_url, pick_kubeconfig, pick_ssh_key, quit_app,
+    remove_server, resize_window, save_settings, set_grafana_token, show_workload,
+    unwatch_namespace,
 };
 use config::ConfigStore;
 use grafana::TokenEpoch;
-use poller::{Poller, PollerHandles};
+use poller::{Poller, PollerHandles, RetryNow};
 use tray::setup_tray_and_window;
 
 /// Run the Observer Ward application.
@@ -50,6 +51,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let is_window_visible = Arc::new(AtomicBool::new(false));
     let poll_wake = Arc::new(Notify::new());
     let token_epoch = Arc::new(TokenEpoch::default());
+    let retry = Arc::new(RetryNow::default());
     let latest_metrics = Arc::new(Mutex::new(None));
     let latest_alerts = Arc::new(Mutex::new(None));
 
@@ -64,6 +66,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .manage(Arc::clone(&config))
         .manage(WakeState(Arc::clone(&poll_wake)))
         .manage(TokenEpochState(Arc::clone(&token_epoch)))
+        .manage(RetryState(Arc::clone(&retry)))
         .manage(LatestMetrics(Arc::clone(&latest_metrics)))
         .manage(LatestAlerts(Arc::clone(&latest_alerts)))
         .invoke_handler(tauri::generate_handler![
@@ -74,6 +77,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             pick_ssh_key,
             inspect_kubeconfig,
             list_namespaces,
+            k8s_login,
             remove_server,
             hide_workload,
             show_workload,
@@ -102,6 +106,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 is_visible: is_window_visible,
                 wake: poll_wake,
                 token_epoch,
+                retry,
                 latest_metrics,
                 latest_alerts,
             });

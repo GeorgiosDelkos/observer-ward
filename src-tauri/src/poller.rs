@@ -29,6 +29,13 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKOFF_THRESHOLD: u32 = 3;
 const BACKOFF_DURATION: Duration = Duration::from_mins(2);
 
+/// How long a cluster that needs a login is left alone unless a login
+/// lifts it. Arbitrary: long enough that an ignored expired session starts
+/// a browser sign-in only every so often, short enough that a transient
+/// failure (VPN down, a slow API server timing out a plugin cluster)
+/// recovers by itself.
+const LOGIN_HOLD: Duration = Duration::from_mins(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackoffDecision {
     Ready,
@@ -72,24 +79,43 @@ struct FailureState {
     server: ServerConfig,
     count: u32,
     last_attempt: Instant,
-    /// Kept so servers held in backoff still report why they are offline.
-    last_error: String,
+    /// The last offline report, so servers held in backoff still report
+    /// why they are offline and whether a login may help.
+    last_report: ServerReport,
 }
 
 impl FailureState {
-    fn new(server: ServerConfig) -> Self {
+    fn new(server: ServerConfig, report: ServerReport) -> Self {
         Self {
             server,
-            count: 0,
+            count: 1,
             last_attempt: Instant::now(),
-            last_error: String::new(),
+            last_report: report,
         }
     }
 
-    fn record(&mut self, error: String) {
+    fn record(&mut self, report: ServerReport) {
         self.count = self.count.saturating_add(1);
         self.last_attempt = Instant::now();
-        self.last_error = error;
+        self.last_report = report;
+    }
+}
+
+/// Servers to contact on the next poll even when held in backoff, because
+/// a login just renewed their credentials. Shared by the login command,
+/// which adds, and the poller, which drains.
+#[derive(Debug, Default)]
+pub(crate) struct RetryNow(Mutex<HashSet<ServerName>>);
+
+impl RetryNow {
+    pub(crate) fn request(&self, name: ServerName) {
+        // The set stays valid whatever panicked while it was held.
+        let mut names = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        names.insert(name);
+    }
+
+    fn take(&self) -> HashSet<ServerName> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -132,36 +158,46 @@ impl Backend {
         match self {
             Backend::Ssh(backend) => ServerReport::Ssh {
                 name,
-                health: health(backend.collect().await),
+                health: match backend.collect().await {
+                    Ok(metrics) => Health::Online { metrics },
+                    Err(e) => Health::Offline {
+                        error: error_chain(&e),
+                        needs_login: false,
+                    },
+                },
             },
             Backend::K8s(backend) => ServerReport::K8s {
                 name,
-                health: health(backend.collect().await),
+                health: match backend.collect().await {
+                    Ok(metrics) => Health::Online { metrics },
+                    Err(e) => Health::Offline {
+                        error: error_chain(&e),
+                        needs_login: e.needs_login(),
+                    },
+                },
             },
         }
     }
 }
 
-fn health<T, E: std::error::Error>(result: Result<T, E>) -> Health<T> {
-    match result {
-        Ok(metrics) => Health::Online { metrics },
-        Err(e) => Health::Offline {
-            error: error_chain(&e),
-        },
-    }
-}
-
-/// An offline report of the right kind for `server`.
+/// An offline report of the right kind for `server`, for a failure no
+/// login can fix (a timeout, a panicked task).
 fn offline_report(server: &ServerConfig, error: String) -> ServerReport {
     let name = server.name().clone();
     match server {
         ServerConfig::Ssh(_) => ServerReport::Ssh {
             name,
-            health: Health::Offline { error },
+            health: Health::Offline {
+                error,
+                needs_login: false,
+            },
         },
         ServerConfig::K8s(_) => ServerReport::K8s {
             name,
-            health: Health::Offline { error },
+            health: Health::Offline {
+                error,
+                needs_login: false,
+            },
         },
     }
 }
@@ -169,11 +205,11 @@ fn offline_report(server: &ServerConfig, error: String) -> ServerReport {
 fn offline_error(report: &ServerReport) -> Option<&str> {
     match report {
         ServerReport::Ssh {
-            health: Health::Offline { error },
+            health: Health::Offline { error, .. },
             ..
         }
         | ServerReport::K8s {
-            health: Health::Offline { error },
+            health: Health::Offline { error, .. },
             ..
         } => Some(error),
         ServerReport::Ssh {
@@ -216,8 +252,8 @@ impl ServerPool {
         let mut task_servers: HashMap<Id, &ServerConfig> = HashMap::new();
 
         for server in servers {
-            if let Some(last_error) = self.backoff_error(server) {
-                reports.push(offline_report(server, last_error));
+            if let Some(last_report) = self.backoff_report(server) {
+                reports.push(last_report);
                 continue;
             }
             let backend = self.take_backend(server);
@@ -254,19 +290,32 @@ impl ServerPool {
         reports
     }
 
-    /// The last error if `server` is in backoff. An expired backoff resets
-    /// the counter for a fresh set of attempts, and so does any change to
-    /// the server's connection: a corrected entry (removed and re-added
-    /// under the same name) must be contacted right away.
-    fn backoff_error(&mut self, server: &ServerConfig) -> Option<String> {
+    /// Contact every server `retry` names on this poll, past any backoff.
+    fn retry_now(&mut self, retry: &RetryNow) {
+        for name in retry.take() {
+            self.failures.remove(&name);
+        }
+    }
+
+    /// The last offline report if `server` is in backoff. An expired
+    /// backoff resets the counter for a fresh set of attempts, and so does
+    /// any change to the server's connection: a corrected entry (removed
+    /// and re-added under the same name) must be contacted right away.
+    fn backoff_report(&mut self, server: &ServerConfig) -> Option<ServerReport> {
         let state = self.failures.get_mut(server.name())?;
         if !state.server.same_connection(server) {
             self.failures.remove(server.name());
             return None;
         }
+        // A login is the likely fix, and polling again would run the
+        // credential plugin again, which may start another browser sign-in.
+        // `k8s_login` lifts this early through `retry_now`.
+        if needs_login(&state.last_report) && state.last_attempt.elapsed() < LOGIN_HOLD {
+            return Some(state.last_report.clone());
+        }
         match backoff_decision(state.count, state.last_attempt.elapsed()) {
             BackoffDecision::Ready => None,
-            BackoffDecision::Hold => Some(state.last_error.clone()),
+            BackoffDecision::Hold => Some(state.last_report.clone()),
             BackoffDecision::Expired => {
                 state.count = 0;
                 None
@@ -294,10 +343,12 @@ impl ServerPool {
             }
             Some(error) => {
                 tracing::warn!("failed to collect metrics for {}: {error}", server.name());
-                self.failures
-                    .entry(server.name().clone())
-                    .or_insert_with(|| FailureState::new(server.clone()))
-                    .record(error.to_string());
+                if let Some(state) = self.failures.get_mut(server.name()) {
+                    state.record(report.clone());
+                } else {
+                    let state = FailureState::new(server.clone(), report.clone());
+                    self.failures.insert(server.name().clone(), state);
+                }
             }
         }
     }
@@ -317,10 +368,44 @@ fn order_by_config(reports: &mut [ServerReport], servers: &[ServerConfig]) {
 async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput {
     let name = server.name().clone();
     let Ok(report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
-        let error = format!("timed out collecting metrics for {}", server.name());
-        return (None, offline_report(&server, error));
+        return (None, timeout_report(&server, &backend));
     };
     (Some(backend), report)
+}
+
+/// The report for a poll that ran out of time. A credential plugin waiting
+/// for a browser sign-in holds the poll this way: kubectl-bao (see
+/// `k8s::exec_auth`) does not read `spec.interactive`, so it signs in even
+/// when polled. Such a cluster offers a login and is held for
+/// [`LOGIN_HOLD`], so it is not polled into another sign-in meanwhile; for
+/// an unreachable cluster the login is a quick no-op followed by a retry.
+fn timeout_report(server: &ServerConfig, backend: &Backend) -> ServerReport {
+    let error = format!("timed out collecting metrics for {}", server.name());
+    match backend {
+        Backend::K8s(k8s) if k8s.uses_credential_plugin() => ServerReport::K8s {
+            name: server.name().clone(),
+            health: Health::Offline {
+                error: format!("{error}; its credential plugin may be waiting for a sign-in"),
+                needs_login: true,
+            },
+        },
+        Backend::K8s(_) | Backend::Ssh(_) => offline_report(server, error),
+    }
+}
+
+/// Whether `report` asks for a login, which holds the cluster for
+/// [`LOGIN_HOLD`] unless a login lifts it sooner.
+fn needs_login(report: &ServerReport) -> bool {
+    matches!(
+        report,
+        ServerReport::K8s {
+            health: Health::Offline {
+                needs_login: true,
+                ..
+            },
+            ..
+        }
+    )
 }
 
 /// Drop the pods each cluster in `config` hides, before the reports reach
@@ -453,6 +538,7 @@ pub(crate) struct PollerHandles {
     pub(crate) is_visible: Arc<AtomicBool>,
     pub(crate) wake: Arc<Notify>,
     pub(crate) token_epoch: Arc<TokenEpoch>,
+    pub(crate) retry: Arc<RetryNow>,
     pub(crate) latest_metrics: Arc<Mutex<Option<MetricsUpdate>>>,
     pub(crate) latest_alerts: Arc<Mutex<Option<AlertsUpdate>>>,
 }
@@ -462,6 +548,7 @@ pub(crate) struct Poller {
     config: Arc<ConfigStore>,
     is_visible: Arc<AtomicBool>,
     wake: Arc<Notify>,
+    retry: Arc<RetryNow>,
     servers: ServerPool,
     alerts: AlertSource,
     notifier: Notifier,
@@ -478,6 +565,7 @@ impl Poller {
             config: handles.config,
             is_visible: handles.is_visible,
             wake: handles.wake,
+            retry: handles.retry,
             servers: ServerPool::default(),
             alerts: AlertSource::new(handles.token_epoch),
             notifier: Notifier::default(),
@@ -502,6 +590,7 @@ impl Poller {
     async fn cycle(&mut self) -> Duration {
         let config = self.config.snapshot().await;
         self.servers.retain(&config.servers);
+        self.servers.retry_now(&self.retry);
         self.emit("poll-start", ());
 
         let (mut reports, alerts) = tokio::join!(
@@ -602,6 +691,10 @@ impl Poller {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use super::*;
     use crate::config::{K8sTarget, SshTarget, WatchedNamespace, WorkloadRef};
@@ -693,14 +786,68 @@ mod tests {
     }
 
     #[test]
-    fn failure_state_keeps_the_latest_error_for_backoff_rows() {
-        let mut state = FailureState::new(ssh_server("bastion", "h"));
+    fn failure_state_keeps_the_latest_report_for_backoff_rows() {
+        let server = ssh_server("bastion", "h");
+        let mut state = FailureState::new(server.clone(), offline("bastion"));
 
-        state.record("connection refused".to_string());
-        state.record("timed out collecting metrics for bastion".to_string());
+        let timeout = "timed out collecting metrics for bastion".to_string();
+        state.record(offline_report(&server, timeout));
 
         assert_eq!(state.count, 2);
-        assert_eq!(state.last_error, "timed out collecting metrics for bastion");
+        assert_eq!(
+            offline_error(&state.last_report),
+            Some("timed out collecting metrics for bastion")
+        );
+    }
+
+    #[test]
+    fn a_cluster_needing_login_is_held_until_a_retry_or_the_hold_ends() {
+        let mut pool = ServerPool::default();
+        let server = k8s_server("prod", []);
+        let expired = ServerReport::K8s {
+            name: "prod".into(),
+            health: Health::Offline {
+                error: "credential plugin failed: session expired".to_string(),
+                needs_login: true,
+            },
+        };
+        pool.record(&server, &expired);
+        // Long past any backoff: another poll would run the plugin again.
+        let state = pool.failures.get_mut("prod").expect("recorded");
+        state.last_attempt = Instant::now()
+            .checked_sub(BACKOFF_DURATION * 2)
+            .expect("the clock is past two backoffs");
+
+        assert!(matches!(
+            pool.backoff_report(&server),
+            Some(ServerReport::K8s {
+                health: Health::Offline {
+                    needs_login: true,
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let retry = RetryNow::default();
+        retry.request("other".into());
+        pool.retry_now(&retry);
+        assert!(
+            pool.backoff_report(&server).is_some(),
+            "only the named server"
+        );
+
+        retry.request("prod".into());
+        pool.retry_now(&retry);
+        assert!(pool.backoff_report(&server).is_none());
+
+        // Without a login, the hold ends by itself.
+        pool.record(&server, &expired);
+        let state = pool.failures.get_mut("prod").expect("recorded");
+        state.last_attempt = Instant::now()
+            .checked_sub(LOGIN_HOLD)
+            .expect("the clock is past one hold");
+        assert!(pool.backoff_report(&server).is_none(), "the hold expired");
     }
 
     fn ssh_server(name: &str, host: &str) -> ServerConfig {
@@ -721,13 +868,14 @@ mod tests {
         for _ in 0..BACKOFF_THRESHOLD {
             pool.record(&server, &offline("bastion"));
         }
+        let held = pool.backoff_report(&server);
         assert_eq!(
-            pool.backoff_error(&server).as_deref(),
+            held.as_ref().and_then(offline_error),
             Some("connection refused")
         );
 
         pool.record(&server, &host("bastion", usage(1.0, 1.0, 1.0)));
-        assert!(pool.backoff_error(&server).is_none());
+        assert!(pool.backoff_report(&server).is_none());
     }
 
     #[test]
@@ -740,8 +888,8 @@ mod tests {
 
         let fixed = ssh_server("bastion", "10.0.0.2");
 
-        assert!(pool.backoff_error(&fixed).is_none());
-        assert!(pool.backoff_error(&broken).is_none(), "state was reset");
+        assert!(pool.backoff_report(&fixed).is_none());
+        assert!(pool.backoff_report(&broken).is_none(), "state was reset");
     }
 
     /// A cluster watching `default`, with `hidden` hidden there.
@@ -755,6 +903,41 @@ mod tests {
                 hidden: hidden.into_iter().collect(),
             }],
         })
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_cluster_offers_login_only_when_a_plugin_signs_it_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = dir.path().join("plugin");
+        std::fs::write(&plugin, "#!/bin/sh\nexit 1\n").expect("write plugin");
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755))
+            .expect("make plugin executable");
+        let kubeconfig = dir.path().join("kubeconfig.yaml");
+        let yaml = format!(
+            "clusters:\n- name: c\n  cluster: {{server: \"https://127.0.0.1:1\"}}\n\
+             users:\n- name: u\n  user:\n    exec:\n      \
+             apiVersion: client.authentication.k8s.io/v1\n      command: \"{}\"\n\
+             contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n",
+            plugin.display()
+        );
+        std::fs::write(&kubeconfig, yaml).expect("write kubeconfig");
+        let ServerConfig::K8s(mut target) = k8s_server("prod", []) else {
+            unreachable!("k8s_server builds a cluster");
+        };
+        target.kubeconfig = Some(kubeconfig);
+        let server = ServerConfig::K8s(target);
+
+        let mut backend = Backend::new(&server);
+        // Fails at once; what matters is that the backend saw the plugin.
+        let _ = backend.collect("prod".into()).await;
+
+        assert!(needs_login(&timeout_report(&server, &backend)));
+        let fresh = Backend::new(&server);
+        assert!(!needs_login(&timeout_report(&server, &fresh)));
+        let host = ssh_server("bastion", "h");
+        assert!(!needs_login(&timeout_report(&host, &Backend::new(&host))));
     }
 
     /// The workload of the `pod` fixture named `name`.
@@ -775,7 +958,7 @@ mod tests {
 
         let hiding = k8s_server("prod", [pod_workload("api-1")]);
 
-        assert!(pool.backoff_error(&hiding).is_some());
+        assert!(pool.backoff_report(&hiding).is_some());
 
         let hidden_of = |backend: &Backend| match backend {
             Backend::K8s(k8s) => k8s.target().namespaces[0].hidden.clone(),
@@ -836,7 +1019,7 @@ mod tests {
         assert!(matches!(
             report,
             ServerReport::Ssh {
-                health: Health::Offline { ref error },
+                health: Health::Offline { ref error, needs_login: false },
                 ..
             } if error == "boom"
         ));

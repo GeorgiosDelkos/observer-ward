@@ -6,6 +6,7 @@ import { mountAdd, mountSettings } from "./js/forms.js";
 import {
   attention,
   errorOf,
+  hasCapacity,
   hiddenOf,
   ingestAlerts,
   ingestMetrics,
@@ -264,6 +265,7 @@ const actions = {
   },
   "open-url": (el) => invoke("open_url", { url: el.dataset.url }).catch(report),
   copy: (el) => copy(el.dataset.text),
+  login: (el) => login(el.dataset.cluster),
   logs: (el) => invoke("open_pod_logs", {
     server: el.dataset.cluster,
     namespace: el.dataset.namespace,
@@ -309,6 +311,21 @@ function flash(message) {
   toast.textContent = message;
   els.win.append(toast);
   setTimeout(() => toast.remove(), 3200);
+}
+
+/** Sign in through the cluster's credential plugin; the backend then polls it at once. */
+async function login(cluster) {
+  state.loggingIn.add(cluster);
+  render();
+  try {
+    await invoke("k8s_login", { server: cluster });
+    flash("Signed in");
+  } catch (err) {
+    report(err);
+  } finally {
+    state.loggingIn.delete(cluster);
+    render();
+  }
 }
 
 async function copy(text) {
@@ -367,9 +384,12 @@ let menuReturn = null;
 
 function clusterMenu(cluster) {
   const error = errorOf(cluster);
+  const metrics = metricsOf(cluster);
+  const totals = metrics !== null && hasCapacity(metrics);
   return [
     { label: "Copy kubectl context", run: () => copy(kubectlFor(cluster)) },
-    { label: "Copy metrics", run: () => copy(metricsSummary(cluster)), hidden: Boolean(error) },
+    // A cluster without node access has no totals to copy.
+    { label: "Copy metrics", run: () => copy(metricsSummary(cluster)), hidden: !totals },
     { label: "Copy error", run: () => copy(error), hidden: !error },
     { label: "Watch another namespace", run: () => go({ page: "add", cluster, back: "cluster" }) },
     { label: "Remove cluster…", danger: true, run: () => confirmRemove(cluster, "cluster") },

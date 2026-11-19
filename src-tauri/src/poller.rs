@@ -376,9 +376,9 @@ async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput 
 /// The report for a poll that ran out of time. A credential plugin waiting
 /// for a browser sign-in holds the poll this way: kubectl-bao (see
 /// `k8s::exec_auth`) does not read `spec.interactive`, so it signs in even
-/// when polled. Such a cluster offers a login, which also stops it being
-/// polled into another sign-in; for an unreachable cluster the login is a
-/// quick no-op followed by a retry.
+/// when polled. Such a cluster offers a login and is held for
+/// [`LOGIN_HOLD`], so it is not polled into another sign-in meanwhile; for
+/// an unreachable cluster the login is a quick no-op followed by a retry.
 fn timeout_report(server: &ServerConfig, backend: &Backend) -> ServerReport {
     let error = format!("timed out collecting metrics for {}", server.name());
     match backend {
@@ -393,7 +393,8 @@ fn timeout_report(server: &ServerConfig, backend: &Backend) -> ServerReport {
     }
 }
 
-/// Whether `report` is offline until a login.
+/// Whether `report` asks for a login, which holds the cluster for
+/// [`LOGIN_HOLD`] unless a login lifts it sooner.
 fn needs_login(report: &ServerReport) -> bool {
     matches!(
         report,

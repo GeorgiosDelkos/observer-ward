@@ -23,19 +23,20 @@
 /// plugins), and of the raw output bytes. kube wraps that failure in
 /// errors whose `Display` embeds it (`Error::Auth`, and `Error::Service`
 /// on a token refresh), so the rendering stops at the first link that
-/// contains its text.
+/// contains its text. Output kube could not parse is kept out the same
+/// way: the parser may quote it, and it would hold the token.
 pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let links = || std::iter::successors(Some(err), |link| link.source());
-    let plugin = links().find_map(plugin_failure);
+    let plugin = links().find_map(plugin_run);
 
     let mut rendered = String::new();
     for link in links() {
         let text = link.to_string();
-        if let Some((dump, stderr)) = &plugin
-            && text.contains(dump.as_str())
+        if let Some((message, detail)) = &plugin
+            && text.contains(message.as_str())
         {
             let failure = crate::k8s::K8sError::CredentialPlugin {
-                detail: crate::k8s::stderr_summary(stderr),
+                detail: detail.clone(),
             };
             push_link(&mut rendered, &failure.to_string());
             break;
@@ -54,15 +55,19 @@ fn push_link(rendered: &mut String, text: &str) {
     rendered.push_str(text);
 }
 
-/// kube's message for a failed credential plugin run, and what the plugin
-/// printed to stderr, when `link` is that failure.
-fn plugin_failure<'e>(link: &'e (dyn std::error::Error + 'static)) -> Option<(String, &'e [u8])> {
-    match link.downcast_ref::<kube::client::AuthError>()? {
-        failure @ kube::client::AuthError::AuthExecRun { out, .. } => {
-            Some((failure.to_string(), &out.stderr))
+/// kube's message for a credential plugin run that failed or printed
+/// something other than a credential, and what to show instead, when
+/// `link` is that run.
+fn plugin_run(link: &(dyn std::error::Error + 'static)) -> Option<(String, String)> {
+    let run = link.downcast_ref::<kube::client::AuthError>()?;
+    let detail = match run {
+        kube::client::AuthError::AuthExecRun { out, .. } => crate::k8s::stderr_summary(&out.stderr),
+        kube::client::AuthError::AuthExecParse(_) => {
+            "its output is not an ExecCredential".to_string()
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((run.to_string(), detail))
 }
 
 #[cfg(test)]

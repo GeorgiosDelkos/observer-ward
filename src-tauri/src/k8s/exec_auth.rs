@@ -445,6 +445,29 @@ contexts:
     }
 
     #[tokio::test]
+    async fn output_that_is_not_a_credential_is_never_quoted() {
+        // The parser may quote what it could not read, and a plugin's
+        // stdout holds the token.
+        let fixture = Fixture::new("printf '%s' '{\"status\": [hunter2'");
+
+        let err = connect_with(
+            Some(fixture.kubeconfig.clone()),
+            "ctx",
+            Some(&fixture.path()),
+        )
+        .await
+        .map(drop)
+        .expect_err("not an ExecCredential");
+
+        let rendered = error_chain(&err);
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(
+            rendered.ends_with("credential plugin failed: its output is not an ExecCredential"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn login_runs_the_plugin_interactively() {
         let fixture = ok_plugin();
 

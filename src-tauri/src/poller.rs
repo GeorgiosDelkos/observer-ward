@@ -300,6 +300,12 @@ impl ServerPool {
             self.failures.remove(server.name());
             return None;
         }
+        // Only a login helps, and polling again would run the credential
+        // plugin again, which may start another browser sign-in. `k8s_login`
+        // lifts this through `retry_now`.
+        if needs_login(&state.last_report) {
+            return Some(state.last_report.clone());
+        }
         match backoff_decision(state.count, state.last_attempt.elapsed()) {
             BackoffDecision::Ready => None,
             BackoffDecision::Hold => Some(state.last_report.clone()),
@@ -355,10 +361,43 @@ fn order_by_config(reports: &mut [ServerReport], servers: &[ServerConfig]) {
 async fn collect_task(server: ServerConfig, mut backend: Backend) -> TaskOutput {
     let name = server.name().clone();
     let Ok(report) = tokio::time::timeout(COLLECT_TIMEOUT, backend.collect(name)).await else {
-        let error = format!("timed out collecting metrics for {}", server.name());
-        return (None, offline_report(&server, error));
+        return (None, timeout_report(&server, &backend));
     };
     (Some(backend), report)
+}
+
+/// The report for a poll that ran out of time. A credential plugin waiting
+/// for a browser sign-in holds the poll this way: kubectl-bao (see
+/// `k8s::exec_auth`) does not read `spec.interactive`, so it signs in even
+/// when polled. Such a cluster offers a login, which also stops it being
+/// polled into another sign-in; for an unreachable cluster the login is a
+/// quick no-op followed by a retry.
+fn timeout_report(server: &ServerConfig, backend: &Backend) -> ServerReport {
+    let error = format!("timed out collecting metrics for {}", server.name());
+    match backend {
+        Backend::K8s(k8s) if k8s.uses_credential_plugin() => ServerReport::K8s {
+            name: server.name().clone(),
+            health: Health::Offline {
+                error: format!("{error}; its credential plugin may be waiting for a sign-in"),
+                needs_login: true,
+            },
+        },
+        Backend::K8s(_) | Backend::Ssh(_) => offline_report(server, error),
+    }
+}
+
+/// Whether `report` is offline until a login.
+fn needs_login(report: &ServerReport) -> bool {
+    matches!(
+        report,
+        ServerReport::K8s {
+            health: Health::Offline {
+                needs_login: true,
+                ..
+            },
+            ..
+        }
+    )
 }
 
 /// Drop the pods each cluster in `config` hides, before the reports reach
@@ -644,6 +683,10 @@ impl Poller {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "panicking on failure is standard in tests"
+)]
 mod tests {
     use super::*;
     use crate::config::{K8sTarget, SshTarget, WatchedNamespace, WorkloadRef};
@@ -750,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_keeps_a_cluster_offering_login_and_a_retry_lifts_it() {
+    fn a_cluster_needing_login_is_held_until_a_retry_names_it() {
         let mut pool = ServerPool::default();
         let server = k8s_server("prod", []);
         let expired = ServerReport::K8s {
@@ -760,9 +803,12 @@ mod tests {
                 needs_login: true,
             },
         };
-        for _ in 0..BACKOFF_THRESHOLD {
-            pool.record(&server, &expired);
-        }
+        pool.record(&server, &expired);
+        // Long past any backoff: another poll would run the plugin again.
+        let state = pool.failures.get_mut("prod").expect("recorded");
+        state.last_attempt = Instant::now()
+            .checked_sub(BACKOFF_DURATION * 2)
+            .expect("the clock is past two backoffs");
 
         assert!(matches!(
             pool.backoff_report(&server),
@@ -841,6 +887,41 @@ mod tests {
                 hidden: hidden.into_iter().collect(),
             }],
         })
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_cluster_offers_login_only_when_a_plugin_signs_it_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = dir.path().join("plugin");
+        std::fs::write(&plugin, "#!/bin/sh\nexit 1\n").expect("write plugin");
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755))
+            .expect("make plugin executable");
+        let kubeconfig = dir.path().join("kubeconfig.yaml");
+        let yaml = format!(
+            "clusters:\n- name: c\n  cluster: {{server: \"https://127.0.0.1:1\"}}\n\
+             users:\n- name: u\n  user:\n    exec:\n      \
+             apiVersion: client.authentication.k8s.io/v1\n      command: \"{}\"\n\
+             contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n",
+            plugin.display()
+        );
+        std::fs::write(&kubeconfig, yaml).expect("write kubeconfig");
+        let ServerConfig::K8s(mut target) = k8s_server("prod", []) else {
+            unreachable!("k8s_server builds a cluster");
+        };
+        target.kubeconfig = Some(kubeconfig);
+        let server = ServerConfig::K8s(target);
+
+        let mut backend = Backend::new(&server);
+        // Fails at once; what matters is that the backend saw the plugin.
+        let _ = backend.collect("prod".into()).await;
+
+        assert!(needs_login(&timeout_report(&server, &backend)));
+        let fresh = Backend::new(&server);
+        assert!(!needs_login(&timeout_report(&server, &fresh)));
+        let host = ssh_server("bastion", "h");
+        assert!(!needs_login(&timeout_report(&host, &Backend::new(&host))));
     }
 
     /// The workload of the `pod` fixture named `name`.

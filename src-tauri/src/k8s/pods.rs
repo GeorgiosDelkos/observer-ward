@@ -71,6 +71,7 @@ pub(super) fn assemble_pods(
                         );
                     })
                     .ok()
+                    .flatten()
             });
             Some(pod_card(name, spec, workload, usage, ctx))
         })
@@ -132,13 +133,13 @@ fn pod_card(
 }
 
 /// Usage of one pod from its metrics-server sample, as a share of its
-/// [`pod_ceiling`].
+/// [`pod_ceiling`]; `None` when it has none.
 fn sample_usage(
     name: &str,
     sample: &PodMetricsSample,
     spec: &Pod,
     ctx: &PodContext<'_>,
-) -> Result<PodUsage, K8sError> {
+) -> Result<Option<PodUsage>, K8sError> {
     let mut used = Resources::default();
     for container in &sample.containers {
         used.add(Resources {
@@ -147,67 +148,71 @@ fn sample_usage(
         });
     }
 
-    let ceiling = pod_ceiling(spec, ctx.nodes);
+    let Some(ceiling) = pod_ceiling(spec, ctx.nodes) else {
+        return Ok(None);
+    };
     let disk = ctx.pvc.get(name);
 
-    Ok(PodUsage {
+    Ok(Some(PodUsage {
         usage: Usage {
             disk_percent: disk.map_or(0.0, Capacity::percent),
             ..used.share_of(&ceiling.resources())
         },
         used,
         ceiling,
-    })
+    }))
 }
 
 /// What `pod`'s usage is measured against, per resource: its limit, else
-/// its node's allocatable.
+/// its node's allocatable. `None` when a resource has no limit and no node
+/// reports allocatable (credentials that may not list nodes): a share of
+/// zero would read as an idle pod.
 ///
 /// Requests are never the ceiling. A request only reserves room on the
 /// node; a pod without a limit may run past it, so usage against a request
 /// reads over 100% for a pod that is merely busy.
-fn pod_ceiling(pod: &Pod, nodes: &[NodeMetrics]) -> Ceiling {
+fn pod_ceiling(pod: &Pod, nodes: &[NodeMetrics]) -> Option<Ceiling> {
     let limits = pod_limits(pod);
     // The node is looked up only for a resource without a limit.
     let node = || node_allocatable(pod, nodes);
-    Ceiling {
-        cpu: limits.cpu_millicores.map_or_else(
-            || {
-                let (node, source) = node();
-                Bound {
-                    amount: node.cpu_millicores,
-                    source,
-                }
-            },
-            Bound::limit,
-        ),
-        memory: limits.memory_bytes.map_or_else(
-            || {
-                let (node, source) = node();
-                Bound {
-                    amount: node.memory_bytes,
-                    source,
-                }
-            },
-            Bound::limit,
-        ),
-    }
+    let cpu = if let Some(limit) = limits.cpu_millicores {
+        Bound::limit(limit)
+    } else {
+        let (node, source) = node()?;
+        Bound {
+            amount: node.cpu_millicores,
+            source,
+        }
+    };
+    let memory = if let Some(limit) = limits.memory_bytes {
+        Bound::limit(limit)
+    } else {
+        let (node, source) = node()?;
+        Bound {
+            amount: node.memory_bytes,
+            source,
+        }
+    };
+    Some(Ceiling { cpu, memory })
 }
 
 /// Allocatable of the node `pod` runs on, else of the whole cluster: a
 /// node missing from this poll's listing, or with a malformed allocatable
 /// (logged by `node_metrics`), must not cost the pod its usage. The
 /// cluster is a ceiling the pod cannot reach, so the fallback understates
-/// usage and never raises a false warning.
-fn node_allocatable(pod: &Pod, nodes: &[NodeMetrics]) -> (Resources, CeilingSource) {
-    pod.spec
+/// usage and never raises a false warning. `None` when no node reports
+/// allocatable.
+fn node_allocatable(pod: &Pod, nodes: &[NodeMetrics]) -> Option<(Resources, CeilingSource)> {
+    let on_node = pod
+        .spec
         .as_ref()
         .and_then(|s| s.node_name.as_deref())
-        .and_then(|node| nodes.iter().find(|n| n.name == node)?.allocatable)
-        .map_or_else(
-            || (node_totals(nodes).allocatable, CeilingSource::Cluster),
-            |node| (node, CeilingSource::Node),
-        )
+        .and_then(|node| nodes.iter().find(|n| n.name == node)?.allocatable);
+    if let Some(node) = on_node {
+        return Some((node, CeilingSource::Node));
+    }
+    let cluster = node_totals(nodes).allocatable;
+    (cluster != Resources::default()).then_some((cluster, CeilingSource::Cluster))
 }
 
 /// Kind of a pod without a controller, which is its own workload.
@@ -876,7 +881,8 @@ mod tests {
             &spec,
             &maps.ctx(),
         )
-        .expect("usage");
+        .expect("usage")
+        .expect("a ceiling");
 
         assert_f64_near(usage.usage.cpu_percent, 10.0, 0.01);
         assert_f64_near(usage.usage.memory_percent, 25.0, 0.01);
@@ -921,13 +927,48 @@ mod tests {
             on_node(spec.clone(), "node-b"),
             on_node(spec, "gone"),
         ] {
-            let usage = sample_usage("worker", &sampled, &spec, &maps.ctx()).expect("usage");
+            let usage = sample_usage("worker", &sampled, &spec, &maps.ctx())
+                .expect("usage")
+                .expect("a ceiling");
             assert_f64_near(usage.usage.cpu_percent, 40.0, 0.01);
             assert_f64_near(usage.usage.memory_percent, 6.25, 0.01);
             assert_eq!(usage.used.memory_bytes, 8 * GI);
             assert_eq!(usage.ceiling.cpu, Bound::limit(4000.0));
             assert_eq!(usage.ceiling.memory.source, CeilingSource::Cluster);
         }
+    }
+
+    #[test]
+    fn without_node_access_only_a_fully_limited_pod_has_usage() {
+        // Credentials that may not list nodes: a cluster ceiling of zero
+        // made every pod without a limit read 0%, an idle pod.
+        let mut maps = Maps::empty();
+        maps.nodes.clear();
+        let sampled = sample("worker", "1600m", "8Gi");
+        let half_limited = make_pod_with_resources(
+            "worker",
+            &[ContainerRes {
+                cpu_limit: Some("4"),
+                ..NO_CAPS
+            }],
+        );
+        let limited = make_pod_with_resources(
+            "worker",
+            &[ContainerRes {
+                cpu_limit: Some("4"),
+                mem_limit: Some("16Gi"),
+                ..NO_CAPS
+            }],
+        );
+
+        let usage = sample_usage("worker", &sampled, &half_limited, &maps.ctx()).expect("usage");
+        assert_eq!(usage, None);
+
+        let usage = sample_usage("worker", &sampled, &limited, &maps.ctx())
+            .expect("usage")
+            .expect("both resources have limits");
+        assert_f64_near(usage.usage.cpu_percent, 40.0, 0.01);
+        assert_f64_near(usage.usage.memory_percent, 50.0, 0.01);
     }
 
     #[test]
@@ -951,7 +992,8 @@ mod tests {
             &spec,
             &maps.ctx(),
         )
-        .expect("usage");
+        .expect("usage")
+        .expect("a ceiling");
 
         assert_f64_near(usage.usage.cpu_percent, 9.0, 0.01);
         assert_f64_near(usage.usage.memory_percent, 6.25, 0.01);

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use kube::Client;
 use kube::api::{Api, ListParams};
+use kube::config::Kubeconfig;
 use tokio::task::{JoinError, JoinSet};
 
 use crate::config::K8sTarget;
@@ -34,7 +35,7 @@ mod requests;
 mod stats;
 
 pub(crate) use error::K8sError;
-pub(crate) use exec_auth::login;
+pub(crate) use exec_auth::{login, stderr_summary};
 pub(crate) use kubeconfig::{KubeconfigSummary, inspect, validate_server};
 
 use events::fetch_pod_events;
@@ -101,6 +102,10 @@ pub(crate) struct K8sBackend {
     /// else required, it is what notices expired credentials or an
     /// unreachable cluster, since failed namespace listings only degrade.
     nodes_forbidden: bool,
+    /// The context's user runs a kubeconfig exec credential plugin. Set
+    /// when connecting, before the plugin first runs, so a poll that times
+    /// out while the plugin waits can still be told apart.
+    credential_plugin: bool,
 }
 
 /// What a backend remembers about one watched namespace between polls.
@@ -130,6 +135,7 @@ impl K8sBackend {
             namespaces: HashMap::new(),
             requests_forbidden: false,
             nodes_forbidden: false,
+            credential_plugin: false,
         }
     }
 
@@ -144,15 +150,21 @@ impl K8sBackend {
         &self.target
     }
 
+    /// Whether the cluster's credentials come from an exec plugin, which may
+    /// be waiting for a sign-in when a poll times out.
+    pub(crate) fn uses_credential_plugin(&self) -> bool {
+        self.credential_plugin
+    }
+
     /// Collect node reports, cluster totals and pod cards. Any failure
     /// drops the client so the next poll rebuilds it from the kubeconfig
     /// (picking up refreshed credentials).
     ///
     /// # Errors
     ///
-    /// [`K8sError`] if the client cannot be built or a required API call
-    /// (nodes, node metrics) fails. Pod, event, Job and request listing
-    /// failures only degrade the result.
+    /// [`K8sError`] if the client cannot be built, listing nodes fails
+    /// other than by a refusal, or listing node metrics fails. Pod, event,
+    /// Job and request listing failures only degrade the result.
     pub(crate) async fn collect(&mut self) -> Result<ClusterMetrics, K8sError> {
         let client = if let Some(client) = &self.client {
             client.clone()
@@ -163,7 +175,9 @@ impl K8sBackend {
             for state in self.namespaces.values_mut() {
                 state.jobs_forbidden = false;
             }
-            connect(self.target.kubeconfig.clone(), &self.target.context).await?
+            let kubeconfig = load_kubeconfig(self.target.kubeconfig.clone()).await?;
+            self.credential_plugin = exec_auth::uses_plugin(&kubeconfig, &self.target.context);
+            build_client(kubeconfig, &self.target.context).await?
         };
         let result = self
             .collect_with(&client)
@@ -429,24 +443,46 @@ impl K8sBackend {
 /// default one when `None`). Exec credential plugins run non-interactively
 /// with the login-shell PATH (see `exec_auth`).
 async fn connect(path: Option<PathBuf>, context: &str) -> Result<Client, K8sError> {
-    let login_path = exec_auth::login_path().await.map(str::to_string);
-    connect_with(path, context, login_path).await
+    let kubeconfig = load_kubeconfig(path).await?;
+    build_client(kubeconfig, context).await
 }
 
 /// [`connect`], with `login_path` as the PATH of exec plugins.
+#[cfg(test)]
 async fn connect_with(
     path: Option<PathBuf>,
     context: &str,
-    login_path: Option<String>,
+    login_path: Option<&str>,
 ) -> Result<Client, K8sError> {
-    let kubeconfig = tokio::task::spawn_blocking(move || {
-        let mut kubeconfig = kubeconfig::load(path.as_deref())?;
-        exec_auth::prepare_for_polling(&mut kubeconfig, login_path.as_deref());
-        Ok::<_, K8sError>(kubeconfig)
-    })
-    .await
-    .map_err(K8sError::KubeconfigTask)??;
+    let kubeconfig = load_kubeconfig(path).await?;
+    build_client_with(kubeconfig, context, login_path).await
+}
 
+/// The kubeconfig at `path`, or the default one when `None`.
+async fn load_kubeconfig(path: Option<PathBuf>) -> Result<Kubeconfig, K8sError> {
+    tokio::task::spawn_blocking(move || kubeconfig::load(path.as_deref()))
+        .await
+        .map_err(K8sError::KubeconfigTask)?
+}
+
+/// Build a client for `context`. The login shell runs for PATH only when
+/// the kubeconfig has an exec plugin.
+async fn build_client(kubeconfig: Kubeconfig, context: &str) -> Result<Client, K8sError> {
+    let login_path = if exec_auth::has_plugins(&kubeconfig) {
+        exec_auth::login_path().await
+    } else {
+        None
+    };
+    build_client_with(kubeconfig, context, login_path).await
+}
+
+/// [`build_client`], with `login_path` as the PATH of exec plugins.
+async fn build_client_with(
+    mut kubeconfig: Kubeconfig,
+    context: &str,
+    login_path: Option<&str>,
+) -> Result<Client, K8sError> {
+    exec_auth::prepare_for_polling(&mut kubeconfig, login_path);
     let mut config = kubeconfig::build_config(kubeconfig, context).await?;
     config.connect_timeout = Some(KUBE_CONNECT_TIMEOUT);
     config.read_timeout = Some(KUBE_READ_TIMEOUT);
@@ -657,10 +693,10 @@ current-context: "local"
         connect(Some(path), "local").await.expect("client builds");
     }
 
-    /// A plain-HTTP stand-in for an API server that refuses to list nodes,
-    /// as for a namespace-scoped account, and answers every other list with
-    /// no items. Returns its URL.
-    fn serve_namespace_scoped_api() -> String {
+    /// A plain-HTTP stand-in for an API server that answers the node list
+    /// with `nodes` (an HTTP status line), lists namespaces `b` and `a`, and
+    /// answers every other list with no items. Returns its URL.
+    fn serve_api(nodes: &'static str) -> String {
         use std::io::{BufRead, BufReader, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub API");
@@ -677,16 +713,21 @@ current-context: "local"
                 while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
                     header.clear();
                 }
+                // kube reads the failure's code from the body, not the status line.
                 let (status, body) = if request_line.contains(" /api/v1/nodes") {
-                    (
-                        "403 Forbidden",
-                        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","reason":"Forbidden","code":403,"message":"nodes is forbidden"}"#,
-                    )
+                    let code = &nodes[..3];
+                    let body = format!(
+                        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure","code":{code},"message":"nodes refused"}}"#
+                    );
+                    (nodes, body)
+                } else if request_line.contains(" /api/v1/namespaces?")
+                    || request_line.contains(" /api/v1/namespaces ")
+                {
+                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[{"metadata":{"name":"b"}},{"metadata":{"name":"a"}}]}"#;
+                    ("200 OK", body.to_string())
                 } else {
-                    (
-                        "200 OK",
-                        r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[]}"#,
-                    )
+                    let body = r#"{"kind":"List","apiVersion":"v1","metadata":{},"items":[]}"#;
+                    ("200 OK", body.to_string())
                 };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
@@ -701,9 +742,9 @@ current-context: "local"
 
     #[tokio::test]
     async fn expired_credentials_take_a_cluster_without_node_access_offline() {
-        // Review finding: with nodes forbidden every other call only
-        // degrades, so caching the refusal left an expired session online
-        // with stale pods, never offering a login.
+        // With nodes forbidden every other call only degrades, so caching
+        // the refusal would leave an expired session online with stale
+        // pods, never offering a login.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -727,7 +768,7 @@ current-context: "local"
              server: \"{}\"\nusers:\n- name: u\n  user:\n    exec:\n      \
              apiVersion: client.authentication.k8s.io/v1\n      command: \"{}\"\n\
              contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n",
-            serve_namespace_scoped_api(),
+            serve_api("403 Forbidden"),
             plugin.display()
         );
         std::fs::write(&kubeconfig, yaml).expect("write kubeconfig");
@@ -735,12 +776,81 @@ current-context: "local"
         backend.target.kubeconfig = Some(kubeconfig);
 
         let metrics = backend.collect().await.expect("namespaces only");
+        assert!(backend.uses_credential_plugin());
         assert!(metrics.capacity.is_none());
         assert_eq!(metrics.namespaces[0].pods.as_deref(), Some(&[][..]));
 
         std::fs::write(&expired, "").expect("expire the session");
         let err = backend.collect().await.expect_err("credentials expired");
         assert!(err.needs_login(), "{}", crate::error::error_chain(&err));
+    }
+
+    /// A kubeconfig in `dir` whose context `ctx` reaches `server` with a
+    /// static token.
+    fn token_kubeconfig(dir: &tempfile::TempDir, server: &str) -> PathBuf {
+        let path = dir.path().join("kubeconfig.yaml");
+        let yaml = format!(
+            "clusters:\n- name: c\n  cluster: {{server: \"{server}\"}}\n\
+             users:\n- name: u\n  user: {{token: t}}\n\
+             contexts:\n- name: ctx\n  context: {{cluster: c, user: u}}\n"
+        );
+        std::fs::write(&path, yaml).expect("write kubeconfig");
+        path
+    }
+
+    #[tokio::test]
+    async fn a_node_list_failure_other_than_a_refusal_takes_the_cluster_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = backend();
+        backend.target.kubeconfig = Some(token_kubeconfig(
+            &dir,
+            &serve_api("500 Internal Server Error"),
+        ));
+
+        let err = backend.collect().await.expect_err("nodes failed");
+
+        assert!(matches!(err, K8sError::ListNodes(_)), "{err:?}");
+        assert!(!backend.uses_credential_plugin());
+    }
+
+    #[tokio::test]
+    async fn namespaces_are_listed_sorted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kubeconfig = token_kubeconfig(&dir, &serve_api("403 Forbidden"));
+
+        let names = list_namespaces(Some(kubeconfig), "ctx")
+            .await
+            .expect("namespaces");
+
+        assert_eq!(names, ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn namespace_reports_keep_the_state_of_watched_namespaces_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kubeconfig = token_kubeconfig(&dir, "https://127.0.0.1:1");
+        let client = connect(Some(kubeconfig), "ctx")
+            .await
+            .expect("client builds");
+        let mut backend = backend();
+        for name in ["default", "unwatched"] {
+            let state = backend.namespaces.entry(name.to_string()).or_default();
+            state.jobs_forbidden = true;
+        }
+        let listing = NamespaceListing {
+            name: "default".to_string(),
+            pods: Ok((Vec::new(), Vec::new())),
+            events: HashMap::new(),
+        };
+
+        let reports = backend
+            .namespace_reports(&client, vec![listing], &[], &[])
+            .await;
+
+        assert_eq!(reports.len(), 1);
+        let kept: Vec<&String> = backend.namespaces.keys().collect();
+        assert_eq!(kept, ["default"]);
+        assert!(backend.namespaces["default"].jobs_forbidden, "state kept");
     }
 
     fn backend() -> K8sBackend {

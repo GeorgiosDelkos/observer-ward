@@ -16,10 +16,23 @@
 /// Some dependencies (kube's `KubeconfigError`, for one) both embed their
 /// cause in `Display` and return it from `source()`. A cause whose text the
 /// rendering already ends with is skipped so it is not printed twice.
-pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
+///
+/// A failed kubeconfig credential plugin is rendered as what it printed to
+/// stderr: kube's own message for it is the `Debug` print of the command,
+/// with every environment variable set on it (credentials, for some
+/// plugins), and of the raw output bytes.
+pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(stderr) = plugin_stderr(err) {
+        return plugin_failure(stderr);
+    }
     let mut rendered = err.to_string();
     let mut cause = err.source();
     while let Some(source) = cause {
+        if let Some(stderr) = plugin_stderr(source) {
+            rendered.push_str(": ");
+            rendered.push_str(&plugin_failure(stderr));
+            break;
+        }
         let text = source.to_string();
         if !rendered.ends_with(&text) {
             rendered.push_str(": ");
@@ -28,6 +41,27 @@ pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
         cause = source.source();
     }
     rendered
+}
+
+/// What a failed credential plugin printed to stderr, when `err` is that
+/// failure: kube's `AuthError::AuthExecRun`, or the `kube::Error::Auth`
+/// around it, whose `Display` embeds the same text.
+fn plugin_stderr<'e>(err: &'e (dyn std::error::Error + 'static)) -> Option<&'e [u8]> {
+    let auth = match err.downcast_ref::<kube::Error>() {
+        Some(kube::Error::Auth(auth)) => auth,
+        _ => err.downcast_ref::<kube::client::AuthError>()?,
+    };
+    match auth {
+        kube::client::AuthError::AuthExecRun { out, .. } => Some(&out.stderr),
+        _ => None,
+    }
+}
+
+fn plugin_failure(stderr: &[u8]) -> String {
+    format!(
+        "credential plugin failed: {}",
+        crate::k8s::stderr_summary(stderr)
+    )
 }
 
 #[cfg(test)]
@@ -52,6 +86,32 @@ mod tests {
         assert_eq!(
             error_chain(&Top(Embedding(Root))),
             "loading config: parse failed: root cause"
+        );
+    }
+
+    #[test]
+    fn renders_a_failed_credential_plugin_without_its_environment() {
+        use std::os::unix::process::ExitStatusExt;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("failed to list pods")]
+        struct ListPods(#[source] kube::Error);
+
+        // kube renders this as the Debug print of the command, env included.
+        let failed = kube::client::AuthError::AuthExecRun {
+            cmd: "AWS_SECRET_ACCESS_KEY=\"hunter2\" \"aws-iam-authenticator\"".to_string(),
+            out: Box::new(std::process::Output {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: b"{\"token\":\"hunter3\"}".to_vec(),
+                stderr: b"session expired\n".to_vec(),
+            }),
+        };
+
+        let rendered = error_chain(&ListPods(kube::Error::Auth(failed)));
+
+        assert_eq!(
+            rendered,
+            "failed to list pods: credential plugin failed: session expired"
         );
     }
 

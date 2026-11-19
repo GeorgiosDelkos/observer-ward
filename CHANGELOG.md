@@ -18,8 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The pod sheet shows what each usage bar is measured against, for example `1.6c of 16.0c · node` (pod `usage.ceiling.cpu` and `.memory`, each `{ amount, source }` with source `limit`, `node` or `cluster`)
 - Pod-level resources (`spec.resources`, Kubernetes 1.34) count as the pod's limits and requests
 - Kubeconfig exec credential plugins (kubectl-bao for OpenBao, aws, gke-gcloud-auth-plugin) work when the app starts from Finder or at login: they get the login shell's PATH, unless the kubeconfig sets one
-- `k8s_login` command and a Log in button on a cluster whose credential plugin failed: it runs the plugin interactively (an OpenBao or OIDC sign-in in the browser), then polls the cluster at once, past any backoff. An offline report carries `needs_login`
-- A cluster whose credentials may not list nodes (a namespace-scoped account) shows its watched namespaces instead of going offline; its `metrics-update` payload then has no totals, `disk`, `net`, `requested` or `nodes`
+- `k8s_login` command and a Log in button on a cluster whose credential plugin failed: it runs the plugin interactively (an OpenBao or OIDC sign-in in the browser), then polls the cluster at once, past any backoff. An offline report carries `needs_login`; such a cluster is not polled again until the login, so a plugin that ignores `spec.interactive` (kubectl-bao today) starts at most one browser sign-in per expiry. A poll that times out on a cluster with a credential plugin also offers the login
+- A cluster whose credentials may not list nodes (a namespace-scoped account) shows its watched namespaces instead of going offline; its `metrics-update` payload then has no totals, `disk`, `net`, `requested` or `nodes`, and a pod without a limit has no usage rather than 0%
 
 ### Changed
 

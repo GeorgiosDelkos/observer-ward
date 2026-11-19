@@ -491,7 +491,8 @@ export function namespacePage(nav) {
   const ns = metrics?.namespaces.find((n) => n.name === nav.namespace);
   const error = errorOf(nav.cluster);
   if (error) {
-    return `<div class="card"><p class="err big">${escapeHtml(error)}</p></div>`;
+    const login = needsLogin(nav.cluster) ? `<div class="actions pad">${loginButton(nav.cluster)}</div>` : "";
+    return `<div class="card"><p class="err big">${escapeHtml(error)}</p>${login}</div>`;
   }
   if (!ns) {
     return `<div class="card"><p class="wait">Waiting for the first poll…</p></div>`;

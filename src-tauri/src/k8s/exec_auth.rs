@@ -20,12 +20,14 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use kube::client::AuthError;
-use kube::config::{ExecConfig, ExecInteractiveMode, Kubeconfig};
+use kube::config::{
+    Context, ExecAuthCluster, ExecConfig, ExecInteractiveMode, Kubeconfig, KubeconfigError,
+};
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
@@ -43,26 +45,33 @@ const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 /// lines of explanation fit; a dumped stack trace does not flood the card.
 const STDERR_LIMIT: usize = 400;
 
-/// Printed before PATH, so lines that rc files print first (greetings, prompt themes)
-/// are skipped.
-const PATH_MARKER: &str = "__observer_ward_path__=";
+/// Printed around PATH, so whatever rc files print before it (greetings, prompt
+/// themes) or after it (logout scripts) is skipped.
+const PATH_MARKER: &str = "__observer_ward_path__";
 
 /// The user's login-shell PATH, read once per app run. `None` when the shell could not
-/// be run; plugins then get the app's own PATH, and the next call tries again, so one
-/// slow start (rc files at login, a busy disk) does not last the whole run.
+/// be run; plugins then get the app's own PATH until the app restarts.
+///
+/// A failure is kept rather than retried: concurrent connects wait on one read, so
+/// retrying a shell that keeps timing out would cost every reconnecting cluster
+/// [`LOGIN_SHELL_TIMEOUT`] in turn, pushing later ones past the poll timeout.
 pub(super) async fn login_path() -> Option<&'static str> {
-    static LOGIN_PATH: OnceCell<String> = OnceCell::const_new();
-    let path = LOGIN_PATH.get_or_try_init(|| async { read_login_path().await.ok_or(()) });
-    path.await.ok().map(String::as_str)
+    static LOGIN_PATH: OnceCell<Option<String>> = OnceCell::const_new();
+    LOGIN_PATH.get_or_init(read_login_path).await.as_deref()
 }
 
-/// Run `$SHELL` as an interactive login shell and read its PATH. Interactive as well as
-/// login, because zsh users commonly set PATH in `~/.zshrc`, which only interactive
-/// shells read. Assumes a POSIX-like shell (zsh, bash): fish joins `"$PATH"` with spaces.
+/// The PATH of `$SHELL` (zsh when unset), as [`read_shell_path`] reads it.
 async fn read_login_path() -> Option<String> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let script = format!("printf '%s%s' '{PATH_MARKER}' \"$PATH\"");
-    let mut command = Command::new(&shell);
+    read_shell_path(shell.as_ref()).await
+}
+
+/// Run `shell` as an interactive login shell and read its PATH. Interactive as well as
+/// login, because zsh users commonly set PATH in `~/.zshrc`, which only interactive
+/// shells read. Assumes a POSIX-like shell (zsh, bash): fish joins `"$PATH"` with spaces.
+async fn read_shell_path(shell: &Path) -> Option<String> {
+    let script = format!("printf '%s%s%s' '{PATH_MARKER}' \"$PATH\" '{PATH_MARKER}'");
+    let mut command = Command::new(shell);
     command
         .args(["-l", "-i", "-c", &script])
         .stdin(Stdio::null())
@@ -84,8 +93,23 @@ async fn read_login_path() -> Option<String> {
         }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let path = stdout.rsplit_once(PATH_MARKER)?.1;
+    let path = stdout.split(PATH_MARKER).nth(1)?;
     (!path.is_empty()).then(|| path.to_string())
+}
+
+/// Whether any user in `kubeconfig` runs an exec plugin.
+pub(super) fn has_plugins(kubeconfig: &Kubeconfig) -> bool {
+    kubeconfig.auth_infos.iter().any(|named| {
+        named
+            .auth_info
+            .as_ref()
+            .is_some_and(|auth| auth.exec.is_some())
+    })
+}
+
+/// Whether the user that `context` names runs an exec plugin.
+pub(super) fn uses_plugin(kubeconfig: &Kubeconfig, context: &str) -> bool {
+    plugin_config(kubeconfig, context).is_some()
 }
 
 /// Make every exec plugin in `kubeconfig` fit for a background poll: non-interactive,
@@ -135,7 +159,7 @@ pub(super) fn plugin_failure(error: K8sError) -> K8sError {
 }
 
 /// What the plugin printed to stderr, trimmed and cut to [`STDERR_LIMIT`] characters.
-fn stderr_summary(stderr: &[u8]) -> String {
+pub(crate) fn stderr_summary(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let text = text.trim();
     if text.is_empty() {
@@ -189,30 +213,57 @@ async fn login_with(
     Ok(())
 }
 
-/// The exec plugin of the user that `context` names.
-fn plugin_of(kubeconfig: &Kubeconfig, context: &str) -> Result<ExecConfig, K8sError> {
-    let user = kubeconfig
+/// The context named `context`.
+fn context_of<'k>(kubeconfig: &'k Kubeconfig, context: &str) -> Option<&'k Context> {
+    let named = kubeconfig
         .contexts
         .iter()
-        .find(|named| named.name == context)
-        .and_then(|named| named.context.as_ref()?.user.as_deref());
-    user.and_then(|user| {
-        kubeconfig
-            .auth_infos
-            .iter()
-            .find(|named| named.name == user)
-    })
-    .and_then(|named| named.auth_info.as_ref()?.exec.clone())
-    .ok_or_else(|| K8sError::NoCredentialPlugin {
-        context: context.to_string(),
-    })
+        .find(|named| named.name == context)?;
+    named.context.as_ref()
 }
 
-/// The plugin as kubectl would run it from a terminal, with `KUBERNETES_EXEC_INFO`
-/// saying a user is present. stdout is captured and dropped: it holds the token.
-///
-/// `provideClusterInfo` is not honoured: `spec.cluster` would need the cluster resolved
-/// from the kubeconfig, and kubectl-bao does not read it. kube honours it in polls.
+/// The exec plugin of the user that `context` names, as the kubeconfig has it.
+fn plugin_config<'k>(kubeconfig: &'k Kubeconfig, context: &str) -> Option<&'k ExecConfig> {
+    let user = context_of(kubeconfig, context)?.user.as_deref()?;
+    let named = kubeconfig
+        .auth_infos
+        .iter()
+        .find(|named| named.name == user)?;
+    named.auth_info.as_ref()?.exec.as_ref()
+}
+
+/// The exec plugin of the user that `context` names, with the context's cluster when
+/// the plugin asks for it (`provideClusterInfo`), as kube fills it in for polls.
+fn plugin_of(kubeconfig: &Kubeconfig, context: &str) -> Result<ExecConfig, K8sError> {
+    let mut exec = plugin_config(kubeconfig, context).cloned().ok_or_else(|| {
+        K8sError::NoCredentialPlugin {
+            context: context.to_string(),
+        }
+    })?;
+    if exec.provide_cluster_info {
+        let cluster = context_of(kubeconfig, context)
+            .and_then(|ctx| {
+                let named = kubeconfig
+                    .clusters
+                    .iter()
+                    .find(|named| named.name == ctx.cluster)?;
+                named.cluster.as_ref()
+            })
+            .ok_or_else(|| KubeconfigError::LoadClusterOfContext(context.to_string()))
+            .and_then(ExecAuthCluster::try_from)
+            .map_err(|source| K8sError::BuildConfig {
+                context: context.to_string(),
+                source: Box::new(source),
+            })?;
+        exec.cluster = Some(cluster);
+    }
+    Ok(exec)
+}
+
+/// The plugin with `KUBERNETES_EXEC_INFO` saying a user is present, so it may sign in
+/// through the browser, and carrying the cluster when [`plugin_of`] resolved one. stdin
+/// is empty and stderr is captured for the error; stdout is captured and dropped: it
+/// holds the token.
 fn interactive_command(mut exec: ExecConfig, path: Option<&str>) -> Result<Command, K8sError> {
     if let Some(path) = path {
         set_path(&mut exec, path);
@@ -220,10 +271,14 @@ fn interactive_command(mut exec: ExecConfig, path: Option<&str>) -> Result<Comma
     let Some(program) = &exec.command else {
         return Err(K8sError::NoPluginCommand);
     };
+    let mut spec = serde_json::json!({ "interactive": true });
+    if let Some(cluster) = &exec.cluster {
+        spec["cluster"] = serde_json::json!(cluster);
+    }
     let exec_info = serde_json::json!({
         "apiVersion": exec.api_version,
         "kind": "ExecCredential",
-        "spec": { "interactive": true },
+        "spec": spec,
     });
 
     let mut command = Command::new(program);
@@ -327,11 +382,25 @@ users:
 - name: static
   user:
     token: "not-a-real-token"
+- name: commandless
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+- name: gke
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: fake-plugin
+      provideClusterInfo: true
 contexts:
 - name: ctx
   context: {cluster: c, user: bao}
 - name: plain
   context: {cluster: c, user: static}
+- name: broken
+  context: {cluster: c, user: commandless}
+- name: clustered
+  context: {cluster: c, user: gke}
 "#;
 
     fn ok_plugin() -> Fixture {
@@ -351,7 +420,7 @@ contexts:
         connect_with(
             Some(fixture.kubeconfig.clone()),
             "ctx",
-            Some(fixture.path()),
+            Some(&fixture.path()),
         )
         .await
         .expect("the plugin is found and its credential accepted");
@@ -368,7 +437,7 @@ contexts:
         let err = connect_with(
             Some(fixture.kubeconfig.clone()),
             "ctx",
-            Some(fixture.path()),
+            Some(&fixture.path()),
         )
         .await
         .map(drop)
@@ -397,11 +466,36 @@ contexts:
 
         let (info, path) = fixture.record();
         assert_eq!(info["spec"]["interactive"], true, "{info}");
+        assert!(
+            info["spec"].get("cluster").is_none(),
+            "not asked for: {info}"
+        );
         assert_eq!(
             info["apiVersion"], "client.authentication.k8s.io/v1",
             "{info}"
         );
         assert_eq!(path, fixture.path());
+    }
+
+    #[tokio::test]
+    async fn login_gives_the_cluster_to_a_plugin_that_asks_for_it() {
+        // gke-gcloud-auth-plugin and others read the server from the exec
+        // info; kube fills it in for polls, so login must too.
+        let fixture = ok_plugin();
+
+        login_with(
+            Some(fixture.kubeconfig.clone()),
+            "clustered".to_string(),
+            Some(&fixture.path()),
+        )
+        .await
+        .expect("login succeeds");
+
+        let (info, _) = fixture.record();
+        assert_eq!(
+            info["spec"]["cluster"]["server"], "https://127.0.0.1:1",
+            "{info}"
+        );
     }
 
     #[tokio::test]
@@ -428,10 +522,57 @@ contexts:
         let err = login_with(Some(fixture.kubeconfig.clone()), "plain".to_string(), None)
             .await
             .expect_err("a static token has no plugin");
+        assert!(!err.needs_login(), "logging in cannot fix this");
         assert_eq!(
             err.to_string(),
             "context plain has no credential plugin to log in with"
         );
+
+        let err = login_with(Some(fixture.kubeconfig.clone()), "broken".to_string(), None)
+            .await
+            .expect_err("a plugin without a command cannot run");
+        assert_eq!(err.to_string(), "credential plugin has no command");
+    }
+
+    #[tokio::test]
+    async fn the_login_path_is_read_past_whatever_rc_files_print() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Stands in for zsh: run with `-l -i -c <script>`, it prints around
+        // the script as rc and logout files do, and runs it with `path`.
+        let shell_with = |path: &str| {
+            let shell = dir.path().join(format!("shell-{}", path.len()));
+            let script = format!(
+                "#!/bin/sh\necho 'Welcome back'\nPATH='{path}' /bin/sh -c \"$4\"\necho 'Bye'\n"
+            );
+            std::fs::write(&shell, script).expect("write shell");
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                .expect("make shell executable");
+            shell
+        };
+
+        let path = super::read_shell_path(&shell_with("/opt/homebrew/bin:/usr/bin:/bin")).await;
+        assert_eq!(path.as_deref(), Some("/opt/homebrew/bin:/usr/bin:/bin"));
+
+        let empty = super::read_shell_path(&shell_with("")).await;
+        assert_eq!(empty, None, "an empty PATH is no PATH");
+        let missing = dir.path().join("no-such-shell");
+        assert_eq!(super::read_shell_path(&missing).await, None);
+    }
+
+    #[test]
+    fn plugins_are_found_per_kubeconfig_and_per_context() {
+        let fixture = ok_plugin();
+        let kubeconfig = crate::k8s::kubeconfig::load(Some(&fixture.kubeconfig)).expect("load");
+
+        assert!(super::has_plugins(&kubeconfig));
+        assert!(super::uses_plugin(&kubeconfig, "ctx"));
+        assert!(!super::uses_plugin(&kubeconfig, "plain"), "a static token");
+
+        let mut tokens_only = kubeconfig;
+        tokens_only
+            .auth_infos
+            .retain(|named| named.name == "static");
+        assert!(!super::has_plugins(&tokens_only));
     }
 
     #[test]
